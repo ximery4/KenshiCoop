@@ -2084,7 +2084,20 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         // item already left it (the two players looted the same unit within the removal
         // settle window). Fabricating the shortfall would mint a second copy, so the
         // shortfall is refused instead and the author rolls its optimistic move back.
-        if (moved < (int)p.quantity && sAuth != localId) {
+        // FORK (inventory phase, session 2026-10-30): a WORLD container we merely census
+        // (mine node, campfire, corpse) is not a truth we hold - the player who WORKS it
+        // produces its yield in their own sim, so our census copy is empty when they take
+        // from it. Refusing there rolled back every first take (host log: 9 ROLLBACK,
+        // client log: 5, one per reported loss). With nothing of the item in our copy
+        // (moved == 0) there is no unit to double-mint, so accept and fabricate it.
+        // Squad bags and containers (ownHands_/ownedContainers_) keep the #40 refusal.
+        // KENSHICOOP_XFER_CENSUS_FAB=0 restores the upstream behaviour.
+        static int censusFab = -1;
+        if (censusFab < 0) { const char* e = getenv("KENSHICOOP_XFER_CENSUS_FAB"); censusFab = (e && e[0] == '0') ? 0 : 1; }
+        bool srcCensusOnly = censusFab && moved == 0 &&
+                             censusContainers_.count(sk) != 0 &&
+                             ownedContainers_.count(sk) == 0 && ownHands_.count(sk) == 0;
+        if (moved < (int)p.quantity && (sAuth != localId || srcCensusOnly)) {
             // Our src copy is short (desync) - fabricate the shortfall into dst so the
             // trade still lands. Non-gear always did this; gear joined once spike 451
             // made weapon fabrication work (armour always could). Dupe safety: the
@@ -2142,9 +2155,11 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                              : XFER_ACK_PARTIAL);
         net.queueInvXferAck(ack);
         char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u",
+            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u sAuth=%d cens=%d own=%d",
             p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity,
-            moved, fab, (unsigned)ack.verdict);
+            moved, fab, (unsigned)ack.verdict, (int)sAuth,
+            (int)(censusContainers_.count(sk) != 0),
+            (int)(ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0));
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
