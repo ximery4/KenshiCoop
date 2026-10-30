@@ -314,8 +314,25 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v65: trader lock + shop hand-over)",
-             (int)PROTOCOL_VERSION, 65);
+    CHECK_EQ("PROTOCOL_VERSION (fork 165: v65 + trader identity in TradeHeader)",
+             (int)PROTOCOL_VERSION, 165);
+    CHECK("TRADE_FLAG_DESC distinct from STOCK/TRUNCATED",
+          TRADE_FLAG_DESC != TRADE_FLAG_STOCK && TRADE_FLAG_DESC != TRADE_FLAG_TRUNCATED);
+    {
+        // FORK 165: the trader description must survive the byte copy NetLink does.
+        TradeHeader th; memset(&th, 0, sizeof(th));
+        th.type = (u8)PKT_TRADE; th.flags = TRADE_FLAG_DESC; th.tIndex = 39; th.tSerial = 7;
+        strncpy(th.tSid, "1234-gamedata.base", sizeof(th.tSid) - 1);
+        strncpy(th.tFac, "204-gamedata.base", sizeof(th.tFac) - 1);
+        th.tx = -51182.5f; th.ty = 1579.75f; th.tz = 2696.25f;
+        unsigned char wire[sizeof(TradeHeader)];
+        memcpy(wire, &th, sizeof(th));
+        TradeHeader back; memcpy(&back, wire, sizeof(back));
+        CHECK("TradeHeader desc sid round-trips", strcmp(back.tSid, "1234-gamedata.base") == 0);
+        CHECK("TradeHeader desc fac round-trips", strcmp(back.tFac, "204-gamedata.base") == 0);
+        CHECK("TradeHeader desc pos round-trips", back.tx == th.tx && back.ty == th.ty && back.tz == th.tz);
+        CHECK("TradeHeader keeps hand fields", back.tIndex == 39 && back.tSerial == 7);
+    }
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
