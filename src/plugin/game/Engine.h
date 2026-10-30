@@ -788,6 +788,10 @@ int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
                              const char* sid, unsigned int typeCat, int qty,
                              int qualityBucket, const char* manufacturer,
                              const char* material, unsigned char level = GRADE_NA);
+// FORK diagnostic: why the last addItemsToContainerBySid returned 0 (0 = it did not fail,
+// 1 = bad args, 2 = container hand did not resolve, 3 = no Inventory on it, 4 = the
+// template/item creation itself failed). Lets [xfer] APPLY say why fab=0.
+int lastAddItemsFailReason();
 // SEH-guarded (protocol 60): remove and destroy up to `qty` units of (sid,
 // typeCat) from the container at cHand, loose stacks first. Returns the number
 // removed.

@@ -1305,17 +1305,22 @@ int readGearGradeBySid(GameWorld* gw, const unsigned int cHand[5], const char* s
     return 0;
 }
 
+static int g_addFailReason = 0;
+int lastAddItemsFailReason() { return g_addFailReason; }
+
 int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
                              const char* sid, unsigned int typeCat, int qty,
                              int qualityBucket, const char* manufacturer,
                              const char* material, unsigned char level) {
-    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    g_addFailReason = 0;
+    if (!gw || !sid || !sid[0] || qty <= 0) { g_addFailReason = 1; return 0; }
     RootObject* ro = resolveObjectByHand(cHand);
-    if (!ro) return 0;
+    if (!ro) { g_addFailReason = 2; return 0; }
     Inventory* inv = invOf(ro);
-    if (!inv) return 0;
+    if (!inv) { g_addFailReason = 3; return 0; }
     bool ok = createItemAndAdd(gw, inv, sid, typeCat, qty, qualityBucket,
                                /*equip=*/false, manufacturer, material, level);
+    if (!ok) g_addFailReason = 4;
     return ok ? qty : 0;
 }
 
