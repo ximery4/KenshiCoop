@@ -2079,6 +2079,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
                                                       p.itemType, (int)p.quantity);
         int fab = 0;
+        int fabWhy = -1; // FORK: -1 not attempted, 0 ok, 1-4 engine fail reason, 5 skipped
         // Upstream #40 race: when WE author the source (a corpse or chest we census,
         // our own bag), our copy is the truth, not a desync - a short source means the
         // item already left it (the two players looted the same unit within the removal
@@ -2110,10 +2111,14 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
             // resolves. A short container transfer stays short and reconcile corrects it.
             static int gearFab = -1;
             if (gearFab < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); gearFab = (e && e[0] == '0') ? 0 : 1; }
-            if ((!isGearType(p.itemType) || gearFab) && !engine::isContainerItemType(p.itemType))
+            if ((!isGearType(p.itemType) || gearFab) && !engine::isContainerItemType(p.itemType)) {
                 fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
                                                        (int)p.quantity - moved, (int)p.quality,
                                                        p.manufacturer, p.material, p.level);
+                fabWhy = fab > 0 ? 0 : engine::lastAddItemsFailReason();
+            } else {
+                fabWhy = 5; // skipped: gear fab disabled or container item
+            }
         }
         XKey key(std::string(p.stringID), p.itemType);
         // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its
@@ -2155,11 +2160,11 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                              : XFER_ACK_PARTIAL);
         net.queueInvXferAck(ack);
         char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u sAuth=%d cens=%d own=%d",
+            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u sAuth=%d cens=%d own=%d why=%d",
             p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity,
             moved, fab, (unsigned)ack.verdict, (int)sAuth,
             (int)(censusContainers_.count(sk) != 0),
-            (int)(ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0));
+            (int)(ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0), fabWhy);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
