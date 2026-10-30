@@ -1,0 +1,170 @@
+// EngineProbe.h - narrow PUBLIC engine surface: raw-RVA diagnostic probes
+// (spike 401 research tech-tree store, spike 451 weapon-mint recipe trace, spike
+// 402 native-snapshot round-trip). Carved out of Engine.h (Phase 5a domain split,
+// 2026-07-19) so the probe scenarios (ScenarioProbes.cpp via ScenarioSupport.h)
+// include the spike levers and the shipping replication surface stops seeing them.
+//
+// These are DIAGNOSTIC levers: several are unmapped-store spikes gated behind
+// probe scenarios / env vars, not part of the steady-state sync path.
+//
+// PUBLIC header: SEH-guarded facade only, no <kenshi/...> internal headers
+// (those live in the adapter, EngineInternal.h). Forward declarations only.
+
+#ifndef KENSHICOOP_ENGINE_PROBE_H
+#define KENSHICOOP_ENGINE_PROBE_H
+
+class GameWorld;
+class Character;
+
+namespace coop {
+namespace engine {
+
+// ---- Weapon-mint fabrication probes (spike 451) -----------------------------
+
+// DIAGNOSTIC: probe whether the engine factory can instantiate WEAPON base templates at
+// all (createItem returns null for the save weapon even with manufacturer+material). Tries
+// the first `maxTry` weapon templates with no/man/man+mat and logs [wpndiag] success
+// counts. Trials are added to cHand's inventory and immediately destroyed.
+void diagWeaponCreate(GameWorld* gw, const unsigned int cHand[5], int maxTry);
+
+// Spike 451 (weapon fabrication recipe): detour BOTH RootObjectFactory::createItem
+// overloads + copyItem and log every WEAPON-template call the ENGINE itself makes -
+// full args, caller RVA and result ("[mkspy] ..." lines) - so the plugin can mimic
+// the engine's own weapon-mint recipe (our 6-arg call returns null for every weapon
+// template; diagWeaponCreate measured 0/24). The last SUCCESSFUL engine weapon mint's
+// args are captured for probeReplayWeaponMint. Install once (host side).
+bool installCreateItemTraceHook();
+// Replay the last captured engine weapon mint from PLUGIN context: same GameData
+// pointers/level/faction, a fresh blank hand, tryAddItem into cHand's inventory.
+// Returns 1 created+added / 0 nothing captured or create returned null / -1 fault.
+int probeReplayWeaponMint(GameWorld* gw, const unsigned int cHand[5]);
+// Phase-2 persistence check: fabricate ONE weapon LOOSE through the normal wire
+// path (createItemAndAdd, spike-451 recipe, first WEAPON template + fallback
+// manufacturer) into cHand's inventory, writing the template sid to outSid so the
+// caller can equip it later (reequipLooseItem) and re-census for persistence.
+// Returns 1 on success.
+int probeFabricateWeaponLoose(GameWorld* gw, const unsigned int cHand[5],
+                              char* outSid, unsigned int outLen);
+// SEH-guarded (weapon_loot): deterministically pick a NOVEL weapon template - the
+// first WEAPON GameData (enumeration order is gamedata-stable, so both clients pick
+// the same one) that is not FISTS and whose sid is not currently in cHand's
+// container. Fabricating it simulates a mid-session weapon acquisition (loot /
+// vendor buy) of a weapon that exists in NO shared-save inventory. Returns 1 and
+// writes the sid on success.
+int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
+                         char* outSid, unsigned int outLen);
+
+// SEH-guarded (trade_peer grade gate): the same deterministic novel pick for ARMOUR,
+// excluding BOTH containers' current contents. Two containers because the grade gate drags
+// the piece from one to the other and reads it back by (sid, itemType): a copy already
+// sitting in either tab would make that read ambiguous. Returns 1 and writes the sid.
+int commonNovelArmourSid(GameWorld* gw, const unsigned int cHandA[5],
+                         const unsigned int cHandB[5],
+                         char* outSid, unsigned int outLen);
+
+// SEH-guarded (trade_peer grade gate): mint ONE piece of gear at an explicit craft LEVEL
+// straight through the engine factory (levelOverride = level) and add it to cHand's
+// inventory. Deliberately NOT the sync's createItemAndAdd and deliberately NOT subject to
+// KENSHICOOP_GEAR_LEVEL: this is the REFERENCE item a grade test compares against, so it
+// has to be graded correctly even in the run that has the fix turned off - otherwise the
+// peer's copy would match a reference that was equally wrong and the gate would pass
+// vacuously. Quality is NOT patched afterwards: whatever the engine derives from the level
+// is what the wire should carry, and the test wants to observe that rather than fake it.
+// *outLevel / *outQual receive getLevel() and quality*100 of the minted item, so a caller
+// can assert the engine honoured the override at all. Returns 1 minted+added / 0 failure.
+int mintGradedGearForTest(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                          unsigned int typeCat, int level,
+                          int* outLevel, int* outQual);
+
+// NOTE: the spike-401 research tech-tree store surface stays in Engine.h for now
+// - three of those entry points (researchEnumKnown / researchQueryBySid /
+// researchStartBySid) are load-bearing protocol-38 SYNC calls, so the block is
+// interleaved sync+probe and migrates in a later Phase 5 increment.
+
+// ---- Native-snapshot round-trip probe (spike 402) ---------------------------
+
+// Spike 402: serialize the local leader through Kenshi's native
+// RootObjectContainer -> GameSaveState -> GameDataContainer pipeline into an
+// isolated temporary container, save it as a micro-save, then load it into a
+// second isolated container. Does NOT apply the snapshot to the live object.
+// Returns 1 round-trip ok / 0 unavailable or empty / -1 native save/load failed.
+int probeNativeSnapshot(GameWorld* gw);
+
+// ---- Crafting-bench job levers (bench_yield_join, 2026-10-20) ---------------
+// A crafting bench (BCTYPE_CRAFTING) is only workable with a crafting job
+// queued: with an empty queue the engine reports PRODUCTION_IMPOSSIBLE and an
+// ordered worker never takes the operate task (b5_bench: task=65535 throughout).
+// These levers give a placed bench the job the crafting UI would queue, read the
+// queue back, and log every item a bench finishes on this client.
+struct CraftRead {
+    int   queued;     // hasCraftingQueued() (0/1)
+    int   nCraft;     // jobs in the queue
+    int   repeat;     // the bench's repeat flag
+    float progress;   // job 0 progress01 (-1 = no job)
+    float rate;       // job 0 rate
+    float endTime;    // job 0 endTime
+    int   err;        // job 0 lastErrorCode (CraftingItem::ErrorCode; -1 = no job)
+    char  sid[48];    // job 0 item template sid ("" = no job)
+};
+// SEH-guarded: queue one crafting job on the bench at bHand, with the repeat
+// flag set so it keeps crafting. The job is the first entry of the bench's own
+// getAvailableCrafts() list whose item sid is preferSid (else entry 0) - the
+// list the crafting UI offers; when that list is empty (the item is not known
+// to this client), the preferSid item template (typeCat) is queued directly
+// with no material spec. Writes the queued item sid to outSid. Returns 1 queued
+// from the list, 2 queued from the fallback, 0 nothing queued, -1 fault.
+int probeQueueCraft(GameWorld* gw, const unsigned int bHand[5], const char* preferSid,
+                    unsigned int typeCat, char* outSid, unsigned int outLen);
+// SEH-guarded read of the bench's queue. False when bHand is not a live bench.
+bool probeReadCraft(const unsigned int bHand[5], CraftRead* out);
+// Detour CraftingBuilding::addFinishedCraftItem (observe only, then call the
+// original) to log "[craftspy] DONE mach=.. item='..' who=.. n=.." for every
+// item a bench finishes HERE - the per-sim mint count the yield oracle uses on
+// benches. First call also logs the live bytes of the bench's work functions
+// ("[craftspy] code ...") for offline disassembly. Idempotent.
+bool installCraftDoneTrace();
+
+// ---- bandit_chase scene levers ------------------------------------------------
+// A roaming hostile pack built from REAL game data rather than the leader's own
+// template, so the bodies the harness counts are what a player meets in the
+// world: a CHARACTER template and a FACTION looked up by display name (ASCII
+// case-insensitive, first match). Both clients resolve the same names to the
+// same records when their data matches, which is what lets each side count the
+// pack by template on its own.
+//
+// SEH-guarded: the CHARACTER template named charName, its stringID written to
+// outSid. False when no such template is loaded.
+bool chaseTemplateSid(GameWorld* gw, const char* charName, char* outSid, unsigned int len);
+// SEH-guarded: spawn 'count' characters of template charName in faction facName
+// on a small ring around (x,y,z), AI intact (NOT detached from their platoon),
+// and pin the player faction and the pack's faction at 'relation' both ways.
+// Fills outHands (readObjectHand layout) up to 'count'; returns the number
+// spawned. Their hands are runtime hands of THIS client only.
+unsigned int spawnNamedPack(GameWorld* gw, const char* charName, const char* facName,
+                            unsigned int count, float x, float y, float z,
+                            float relation, unsigned int (*outHands)[5]);
+// SEH-guarded: pin the player faction and facName's faction at 'relation' both
+// ways on THIS client - the side that did not spawn the pack needs the same
+// hostility for its own copies to behave alike. False when the faction is not
+// live here.
+bool pinChaseRelation(GameWorld* gw, const char* facName, float relation);
+// One world (non-player-squad) body of a given template near a point.
+struct ChaseBody {
+    Character*   c;
+    unsigned int hand[5];   // readObjectHand layout
+    float        x, y, z;
+    float        dist;      // to the query point, 3-D
+    int          visible;   // RootObject::getVisible
+    int          dead;
+    int          down;
+};
+// SEH-guarded: every non-player-squad character whose template stringID is sid
+// within 'radius' of (x,y,z), hidden ones included (a suppressed twin is still
+// a body in the world). Returns the count written to out (<= maxOut).
+unsigned int listChaseBodies(GameWorld* gw, const char* sid, float x, float y, float z,
+                             float radius, ChaseBody* out, unsigned int maxOut);
+
+} // namespace engine
+} // namespace coop
+
+#endif // KENSHICOOP_ENGINE_PROBE_H

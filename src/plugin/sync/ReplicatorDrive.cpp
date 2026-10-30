@@ -1,0 +1,3021 @@
+// ReplicatorDrive.cpp - the join-side DRIVE path (monolith split from
+// Replicator.cpp, 2026-07-12): applyTargets (the per-frame walk/park/combat/
+// carry/furniture/stealth drive of every peer-authoritative body, incl. the
+// interp buffer consumption and hard-snap gates), applyRest (rest placement +
+// pose reproduction), sweepCarries (carry/furniture self-heal teardown) and
+// logHardSnap (throttled snap evidence).
+//
+// Shared hubs: owns targets_ consumption and drivenChars_/drivenSeen_/
+// canonicalOf_ stamping (pruned on drivenSeen_'s horizon; pointers compared,
+// never dereferenced after prune); writes suppressed_, life_ via lifeSet.
+// Must NOT: change any log string - log phrasing is the API consumed by the
+// PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
+
+#include "ReplicatorUtil.h"
+#include "../devtools/DevTools.h"   // DevRegime tags on the drive record
+
+namespace coop {
+
+void Replicator::logHardSnap(Character* c, const EntityState& out, const char* kind,
+                             float gap, float srcVel, float gate, bool hadDest) {
+    // Throttle to ~4 lines/s so a snap storm (the thing under investigation)
+    // stays legible; skipped lines are accounted for in the next one.
+    static unsigned long tick = 0;      // main-thread only
+    static unsigned long skipped = 0;
+    unsigned long now = nowMs();
+    if (tick != 0 && (now - tick) < 250) { ++skipped; return; }
+    tick = now;
+    char nm[48];
+    engine::charName(c, nm, sizeof(nm));
+    char b[240];
+    _snprintf(b, sizeof(b) - 1,
+              "[snap] %s hand=%u,%u name='%s' gap=%.1f gate=%.1f srcVel=%.1f "
+              "cSpeed=%.1f mult=%.2f slew=%.2f dest=%d skipped=%lu",
+              kind, out.hIndex, out.hSerial, nm, gap, gate, srcVel, out.cSpeed,
+              speedLastSet_, timeSlew_, hadDest ? 1 : 0, skipped);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    skipped = 0;
+}
+
+bool Replicator::ownsLocalBody(Character* c, unsigned int lh[5]) const {
+    if (!c || !engine::readObjectHand(reinterpret_cast<RootObject*>(c), lh)) {
+        memset(lh, 0, 5 * sizeof(unsigned int));
+        return false;
+    }
+    Key lk; lk.t = lh[0]; lk.c = lh[1]; lk.cs = lh[2]; lk.i = lh[3]; lk.s = lh[4];
+    return pinOwned_.count(lk) != 0 || ownHands_.count(lk) != 0;
+}
+
+Character* Replicator::bodyForKey(const Key& k, bool* viaProxy, bool* staleProxy) const {
+    if (viaProxy) *viaProxy = false;
+    if (staleProxy) *staleProxy = false;
+    Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (c || !(spawnSync_ || recruitSync_)) return c;
+    std::map<Key, Character*>::const_iterator pit = proxyByKey_.find(k);
+    if (pit == proxyByKey_.end()) return 0;
+    unsigned int lh[5];
+    if (!pit->second || !engine::readHand(pit->second, lh)) {
+        if (staleProxy) *staleProxy = true;
+        return 0;
+    }
+    if (viaProxy) *viaProxy = true;
+    return pit->second;
+}
+
+void Replicator::applyTargets(GameWorld* gw) {
+    (void)gw;
+    unsigned long now = nowMs();
+    // Rebuild the AI-suspend set from scratch each tick: only NPCs we drive this
+    // tick stay suspended; anything we stop driving (stale/suppressed) is dropped
+    // here so its AI resumes. Safe to rebuild now - the periodicUpdate detour only
+    // reads the set during the engine tick, which already ran this frame.
+    if (aiSuspend_) engine::clearAiSuspend();
+    // Damage-guard set rebuilds the same way: every body we DRIVE this tick (all
+    // are non-owned - owned hands are skipped below) is protected from local melee
+    // damage, so the join's cosmetic fights cannot diverge the local-only medical
+    // model. A body we stop driving drops out and takes local damage again.
+    if (dmgGuard_) engine::clearDamageGuard();
+    // Join-dealt damage report (protocol 45, JOIN only): keep the engine-side
+    // accumulator armed and refresh the ATTACKER set (the bodies THIS client
+    // controls) each tick, mirroring the guard-set rebuild. A guarded swing BY
+    // one of these bodies ON a driven copy is captured for publishCombatHits;
+    // the set rebuild handles recruit/roster churn. On the host reportCombat_ is
+    // false, so the accumulator stays disabled (host swings land natively on
+    // the NPCs it owns). Only OWNED bodies (ownHands_) count: the player-squad
+    // list also holds our driven copies of the other players' characters, and
+    // their cosmetic swings would be reported on top of their owners' own
+    // reports - the same wound applied twice.
+    if (reportCombat_) {
+        engine::setCombatReport(true);
+        engine::clearReportAttackers();
+        Character* pcs[64];
+        unsigned int np = engine::listPlayerChars(gw, pcs, 64);
+        for (unsigned int i = 0; i < np; ++i) {
+            unsigned int h[5];
+            if (!engine::readObjectHand(reinterpret_cast<RootObject*>(pcs[i]), h))
+                continue;
+            Key pk; pk.t = h[0]; pk.c = h[1]; pk.cs = h[2]; pk.i = h[3]; pk.s = h[4];
+            if (ownHands_.find(pk) == ownHands_.end()) continue;
+            engine::addReportAttacker(pcs[i]);
+        }
+    }
+    // Driven-body pointer set rebuilds per tick too: enforceHostAuthority uses it
+    // to recognise a streamed body whose LOCAL hand key changed (combat detach
+    // re-containers world NPCs) so it never hides a body we are driving.
+    drivenChars_.clear();
+    starveHeldNow_ = 0; // per-tick starved-hold census (stat line)
+    // Own-squad positions, for scoping the smoothness/march oracles to the
+    // historical near-bubble population (Phase 2). The mid tier drives bodies
+    // far outside it, where Kenshi throttles offscreen character updates -
+    // their stepwise rendering is an engine LOD fact, not an interp fault,
+    // and it buried the gates' real signal (run 111445: one boundary walker
+    // charged 341 zero-frames of 365 active).
+    static EntityState oracleSquad[16]; // main-thread only
+    unsigned int oracleSquadN = engine::captureSquad(gw, false, oracleSquad, 16);
+    for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
+        // Never drive a body WE own: we control + stream it locally, the peer drives
+        // its copy from our stream. The disjoint partition + no local loopback means
+        // our own hand shouldn't appear in targets_, but guard regardless (a stray
+        // self-owned sample would otherwise fight our own control every frame).
+        if (ownHands_.find(it->first) != ownHands_.end()) continue;
+        // Phase 1b (phantom "Squint" fix): also never drive/seed a hand we PIN
+        // owned. ownHands_ is rebuilt each publish from the LOCAL captured hand;
+        // a control-flip claim pins the OWNER's streamed hand (newK) owned too,
+        // and the host's last in-flight batches for newK arrive after the flip.
+        // Without this veto they seed unresolved (newK no longer resolves - the
+        // body moved to a new local index), REQ, and mint a phantom proxy that
+        // chases the real body (manual 2026-07-17: Squint following Adi).
+        if (pinOwned_.find(it->first) != pinOwned_.end()) continue;
+        // Nor a hand we just announced as having LEFT our squad. Both guards
+        // above go quiet the instant captureSquad drops the body, which is
+        // usually the instant it DIED - and driving it here would run the death
+        // veto below and un-kill a body the engine is already tearing down.
+        {
+            std::map<Key, unsigned long>::const_iterator xt = exitedOwn_.find(it->first);
+            if (xt != exitedOwn_.end() &&
+                (now - xt->second) <= (unsigned long)SQUAD_EXIT_GRACE_MS) continue;
+        }
+        Driven& d = it->second;
+        EntityState out;
+        if (!d.interp.sample(now, cfg_, &out)) {
+            // Stream stale: stop DRIVING the body - but a stall is not an
+            // authority transfer (architecture review 2026-07-10). Two guards
+            // used to drop here instantly, and they starve differently:
+            //   * DAMAGE guard - held for EVERY driven body for the bounded
+            //     window. Locally-simulated melee mutating the local-only
+            //     medical model during a WAN hiccup is the silent divergence
+            //     this fix exists for.
+            //   * AI suspend (the freeze) - held ONLY for squad-class bodies
+            //     (a peer's player characters: engine-inert when uncontrolled,
+            //     so the park is free, and a peer PC acting autonomously is
+            //     the worst face of the bug). World NPCs release to local AI
+            //     exactly as before: A/B 2026-07-10 showed freezing a stale
+            //     interest-boundary wanderer while the host copy keeps
+            //     patrolling degrades npc_sync tracking (ratio 0.64-0.73 vs
+            //     the 0.8 gate; hold-off passed) - the local AI on the shared
+            //     save shadows the host's patrol better than a freeze, and
+            //     host-authority suppression + census already police NPC
+            //     existence.
+            // After the hold (or with the knob at 0) everything releases as
+            // before; targets_ prunes at 30 s regardless.
+            d.haveActual = false; d.parked = false; d.fresh = false;
+            if (starveHoldMs_ > 0 && d.lastSeenMs != 0 &&
+                (now - d.lastSeenMs) <= cfg_.staleMs + starveHoldMs_ &&
+                d.interp.latest(&out, 0, 0, 0)) {
+                Character* c = engine::resolve(out);
+                if (!c && (spawnSync_ || recruitSync_)) {
+                    std::map<Key, Character*>::iterator pit =
+                        proxyByKey_.find(it->first);
+                    if (pit != proxyByKey_.end()) c = pit->second;
+                }
+                // Never park a body WE own (judged by its local hand): see
+                // ownsLocalBody at the main drive below.
+                unsigned int ohh[5] = { 0, 0, 0, 0, 0 };
+                if (c && ownsLocalBody(c, ohh)) c = 0;
+                if (c) {
+                    if (dmgGuard_) engine::addDamageGuard(c);
+                    if (engine::isLocalPlayerChar(gw, c)) {
+                        // Squad-class: full park. drivenChars_ membership also
+                        // keeps host-authority suppression off the body.
+                        drivenChars_.insert(c);
+                        canonicalOf_[c] = it->first;
+                        if (aiSuspend_) engine::addAiSuspend(c);
+                    }
+                    // World NPCs: damage guard only - AI, suppression and
+                    // census treat them exactly as the pre-hold release did.
+                    ++starveHeldNow_;
+                }
+            }
+            continue;
+        }
+        d.fresh = true;
+        switch (d.interp.lastMode()) {
+        case EntityInterp::SM_LERP:      ++interpLerp_;     break;
+        case EntityInterp::SM_SINGLE:    ++interpSingle_;   break;
+        case EntityInterp::SM_CLAMP_OLD: ++interpClampOld_; break;
+        case EntityInterp::SM_EXTRAP:    ++interpExtrap_;   break;
+        case EntityInterp::SM_SEG_SNAP:  ++interpSegSnap_;  break;
+        default: break;
+        }
+
+        // Protocol 21: a streamed hand with NO local body is a host RUNTIME
+        // spawn (roaming squad, dialog ambush - its hand exists only in the
+        // host's session). If a proxy was already minted for it, drive THAT
+        // body - this single translation point (bodyForKey) makes the proxy
+        // inherit the entire world-NPC path below (AI-suspend, damage guard,
+        // combat, down/death latches), and the combat branch resolves its
+        // TARGET through the same function.
+        // (Protocol 23 reuses the same translation point for RE-KEYED recruit
+        // bodies, so the lookup also runs when only recruit sync is on.)
+        bool viaProxy = false, staleProxy = false;
+        Character* c = bodyForKey(it->first, &viaProxy, &staleProxy);
+        // Phase 2 crash hardening: a minted proxy pointer can be freed by the
+        // engine in the window between the ~1 Hz syncSpawns liveness sweep and
+        // this 20 Hz drive (mint/zone churn on town/camp approach). bodyForKey
+        // proves the pointer is still live with a cheap SEH-guarded hand read
+        // BEFORE anything below dereferences it; a dead read means the body was
+        // reaped, so unbind and let the census/REQ machinery re-mint if the host
+        // still streams it. Only minted proxies need this - engine::resolve()
+        // returns bodies from the engine's own live lookup. targets_ is being
+        // iterated here, so we only touch the OTHER maps and let the 30 s
+        // targets_ prune (or a clean next-tick re-resolve) handle this key.
+        if (staleProxy) {
+            std::map<Key, Character*>::iterator sp = proxyByKey_.find(it->first);
+            char sb[160]; _snprintf(sb, sizeof(sb) - 1,
+                "[drive] STALE unbind hand=%u,%u,%u,%u,%u c=%p",
+                it->first.t, it->first.c, it->first.cs, it->first.i,
+                it->first.s, (void*)(sp != proxyByKey_.end() ? sp->second : 0));
+            sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+            proxyByKey_.erase(it->first);
+            spawnReq_.erase(it->first);   // allow a fresh REQ/mint cycle
+            lifeSet(it->first, LIFE_UNKNOWN, "drive-stale");
+            continue;
+        }
+        if (!c) {
+            // Unresolved-hand telemetry (Phase 0 diagnostics; logged even with
+            // spawnSync off - spawn_probe baselines this failure mode). Once
+            // per hand: these repeat every frame while the host fights an
+            // enemy the join can't see.
+            if (spawnLogged_.insert(it->first).second) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] unresolved hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f",
+                    it->first.t, it->first.c, it->first.cs, it->first.i,
+                    it->first.s, out.x, out.y, out.z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (spawnSync_) {
+                UnresolvedHand& u = unresolvedHands_[it->first];
+                u.x = out.x; u.y = out.y; u.z = out.z;
+                u.target = d.author;   // ask about it of whoever streams it
+            }
+            continue;
+        }
+        // Phase 0 crash breadcrumb (KENSHICOOP_DEBUG_DRIVE_TRAIL=1, OFF by
+        // default = zero cost): name the PROXY-driven body just before we drive
+        // it. CoopLog flushes every line, so the last flushed [drive] proxy line
+        // before a hard crash identifies the body we touched - the UAF-on-stale-
+        // proxy hypothesis (approach-town/camp mint churn). Native resolves are
+        // save-stable and excluded to keep the trail focused on minted bodies.
+        if (viaProxy) {
+            static int driveTrail = -1;
+            if (driveTrail < 0) {
+                const char* e = getenv("KENSHICOOP_DEBUG_DRIVE_TRAIL");
+                driveTrail = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (driveTrail) {
+                char tb[160]; _snprintf(tb, sizeof(tb) - 1,
+                    "[drive] proxy hand=%u,%u,%u,%u,%u c=%p",
+                    it->first.t, it->first.c, it->first.cs, it->first.i,
+                    it->first.s, (void*)c);
+                tb[sizeof(tb) - 1] = '\0'; coop::logLine(tb);
+            }
+        }
+        // The refusing half of the tie-break. The publish-side echo guards make
+        // a lower-priority player stop speaking for bodies a higher-priority one
+        // streams; this stops US LISTENING to lower-priority players about bodies
+        // we author. Without both halves the host still drove its own authored
+        // body from whatever the join had said about it while continuing to
+        // publish it, so the join followed the host, the host followed the join,
+        // and the same NPC wore a green DRV label on both screens (observed
+        // 2026-08-08, run 215534: one Holy Sentinel over two consecutive dumps).
+        //
+        // Asymmetric on purpose, and this is the whole reason it is safe. The
+        // symmetric version of this check - both sides refusing streams for
+        // cells they claim - was tried earlier the same day and reverted: a body
+        // straddling a boundary sits in "our" cell on BOTH clients at once, so
+        // both refused, both fell back to local AI, and the copies drifted apart
+        // with nothing left to pull them together (world-NPC position parity
+        // 0.751 -> 0.389, combat 0.51 -> 0.069). Generalised to N players as the
+        // same TOTAL ORDER the yield uses: we refuse a sample only from an author
+        // with a HIGHER id than ours (the host refuses everyone, nobody refuses
+        // the host), so of any two contenders exactly one refuses and the other
+        // follows it - a contested body converges on the lower id's copy instead
+        // of diverging. With two players this is the old host-only refusal.
+        //
+        // Judged on where OUR copy stands, not on the streamed position: the
+        // sample is interpolated and can extrapolate across a boundary, and the
+        // question being asked is about the body we are about to move.
+        // Proxies are exempt: a minted body exists only because its author
+        // streams it and has no local AI to fall back on, so refusing to drive
+        // one just strands it wherever it was minted.
+        //
+        // d.fresh is deliberately left ALONE. enforceHostAuthority builds its
+        // 'keep' set from it, and keep is what stops a body being suppressed -
+        // so clearing it here would have the host hide the very bodies it
+        // authors and is simulating (run 220905: 'Holy Sentinel' missing from
+        // 52 of the join's samples). Not driving a body and not knowing about it
+        // are different statements; only the first one is meant here.
+        if (cellAuth_ && localId_ != 0xFFFFFFFFu && d.author != AUTHOR_NONE &&
+            d.author > localId_ && !viaProxy && !engine::isLocalPlayerChar(gw, c)) {
+            float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+            if (engine::readPos(c, &hx, &hy, &hz) &&
+                weAuthor(gw, localId_, hx, hz)) {
+                ++hostDriveRefusals_;
+                d.dbgRegime = DR_REFUSED; d.dbgMs = now;
+                continue;
+            }
+        }
+        // Never drive a body WE own, judged by its LOCAL hand. The key vetoes at
+        // the top of the loop only see the wire key, and the old wire key of a
+        // body we just recruited still resolves to it while the peer's stream
+        // tail for it is in flight (recruit_join rj_before2: the host's NPC
+        // stream drove the join's own recruit for the whole leg, drv=1).
+        unsigned int lh[5] = { 0, 0, 0, 0, 0 };
+        if (ownsLocalBody(c, lh)) {
+            std::map<Key, unsigned long>::iterator ol = ownSkipLogMs_.find(it->first);
+            if (ol == ownSkipLogMs_.end() || (now - ol->second) >= 2000) {
+                ownSkipLogMs_[it->first] = now;
+                char ob[176]; _snprintf(ob, sizeof(ob) - 1,
+                    "[drive] SKIP-OWNED wire=%u,%u,%u,%u,%u local=%u,%u,%u,%u,%u",
+                    it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s,
+                    lh[0], lh[1], lh[2], lh[3], lh[4]);
+                ob[sizeof(ob) - 1] = '\0'; coop::logLine(ob);
+            }
+            continue;
+        }
+        drivenChars_.insert(c);
+        d.dbgRegime = DR_NONE; d.dbgMs = now;
+        drivenSeen_[c] = now; // recently-driven grace for the authority passes
+        canonicalOf_[c] = it->first; // capture translation (combat subjects)
+        debugMark(c, 0, "DRV");
+
+        // Say the translation out loud. A driven town NPC gets re-keyed the
+        // moment a fight starts (separateIntoMyOwnSquad moves it into a fresh
+        // local platoon and renumbers it), so every LOCAL enumeration - the
+        // scenario's captureNpcs sweep included - reports it under a hand the
+        // peer has never heard of. Nothing downstream could tell that from a
+        // despawn: combat_kill read "victim vanished 14 s before the KO event"
+        // as no post-event samples, for a run in which everything worked.
+        // (lh was read by the ownership veto just above.)
+        {
+            if ((lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) &&
+                (lh[3] != it->first.i || lh[4] != it->first.s ||
+                 lh[0] != it->first.t || lh[1] != it->first.c ||
+                 lh[2] != it->first.cs)) {
+                Key lk; lk.t = lh[0]; lk.c = lh[1]; lk.cs = lh[2];
+                lk.i = lh[3]; lk.s = lh[4];
+                std::map<Key, Key>::iterator rk = rekeyLogged_.find(it->first);
+                if (rk == rekeyLogged_.end() ||
+                    (rk->second < lk) || (lk < rk->second)) {
+                    rekeyLogged_[it->first] = lk;
+                    char rb[160]; _snprintf(rb, sizeof(rb) - 1,
+                        "[rekey] wire=%u,%u local=%u,%u localc=%u,%u",
+                        it->first.i, it->first.s, lk.i, lk.s, lk.c, lk.cs);
+                    rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                }
+            }
+        }
+
+        // Every driven body is damage-guarded (locally-simulated hits must not
+        // mutate the local-only medical model; outcomes arrive as host events).
+        if (dmgGuard_) engine::addDamageGuard(c);
+
+        // Owner-authoritative death veto (2026-07-15). The damage guard blocks
+        // NEW melee wounds, but a lethal frame in an unguarded window (stream
+        // stall past the starve-hold, above) or a non-melee source can still
+        // flip this copy's local medical.dead - and the medical model is
+        // local-only, so nothing reconciles it while the OWNER still reports the
+        // body alive (no BODY_DEAD in the stream, no latched EVT_DEATH). That is
+        // the "dead on one game, alive on the other" desync. Un-kill it: death
+        // may only take hold on the peer via the owner's reliable EVT_DEATH.
+        if (dmgGuard_ && !(out.bodyState & BODY_DEAD) && !d.deathLatched &&
+            (engine::readBodyState(c) & BODY_DEAD)) {
+            if (engine::vetoLocalDeath(c)) {
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[death] veto hand=%u,%u", out.hIndex, out.hSerial);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        float ax, ay, az;
+        bool haveActual = engine::readPos(c, &ax, &ay, &az);
+        bool hostMoving = (out.cMoving != 0) || (out.cSpeed > MOVE_EPS);
+        // Edge-detect the source teleport once per body per tick, before any of the
+        // carve-outs can `continue` past it (see Driven::prevInterpMode).
+        int  interpMode  = d.interp.lastMode();
+        bool teleportEdge = (interpMode == EntityInterp::SM_SEG_SNAP) &&
+                            (d.prevInterpMode != EntityInterp::SM_SEG_SNAP);
+        d.prevInterpMode = interpMode;
+        // A conscious bed pose (USE_BED / USE_BED_ORDER / SLEEP_ON_FLOOR) is a
+        // STATIONARY anchored pose, but a sleeper streams currentlyMoving=1 (the
+        // climb-in / in-bed idle sets the movement flag while cSpeed stays 0).
+        // For a DRIVEN SQUAD member genuinelyMoving == hostMoving, so that flag
+        // routes the sleeper down the walk/snap path - it gets position-snapped
+        // to the streamed transform instead of reproducing the bed pose via
+        // applyRest, so it STANDS on the bed instead of lying in it (manual
+        // 2026-07-17, ~4/5 tries; the 1/5 that worked caught cMoving==0). A
+        // bedded body is never walking: anchor it so the rest/pose path runs.
+        if (engine::taskIsBedPose((int)out.task)) hostMoving = false;
+
+        // Two drive regimes (see Engine::isLocalPlayerChar):
+        //   * SQUAD member - a player-controlled body, inert when uncontrolled, so
+        //     the engine obeys our move-order: true grounded walk-drive (Stage 3).
+        //   * world NPC - fully AI-simulated locally, so a move-order gets fought;
+        //     drive it kinematically (teleport wins as the last word) + mirror the
+        //     host locomotion so it still animates. Grounded engine-walk + real
+        //     sit/idle poses for NPCs arrive in Stage 5 (AI quiet-in-place).
+        bool isSquad = engine::isLocalPlayerChar(gw, c);
+
+        // Join-dealt authoritative damage (protocol 45). The guard suppressed our
+        // player-squad melee on this driven copy (cosmetic); drain the damage it
+        // WOULD have dealt and stage it under the copy's canonical hand for
+        // publishCombatHits to forward to the host (which owns the real body).
+        // World NPCs only - a squad copy is a peer PC (PvP, out of scope), but we
+        // still drain it so the engine-side accumulator stays bounded.
+        if (reportCombat_) {
+            float rf = 0.0f, rb = 0.0f;
+            if (engine::takeReportedDamage(c, &rf, &rb) && !isSquad &&
+                (rf > 0.0f || rb > 0.0f)) {
+                PendingHit& ph = pendingHits_[it->first];
+                ph.flesh += rf; ph.blood += rb;
+            }
+        }
+
+        // ---- Phase A jail-observe (KENSHICOOP_JAIL_OBSERVE, read-only spike) ----
+        // For a peer-owned captive (the join's jailed PC as driven on the host),
+        // temporarily let the host's LOCAL sim run it unopposed: skip drive,
+        // AI-suspend AND furniture self-heal, and log the full trajectory. This
+        // reveals what the host guard's "put to work" actually does to the body
+        // (does it relocate to a fixed work spot -> B-R, or walk a job round ->
+        // B-W). The body is still damage-guarded (harmless) and in drivenChars_
+        // (keeps host-authority suppression off) from above. Knob OFF by default.
+        if (jailObserve_) {
+            engine::FurnitureRead ofr;
+            bool ofrOk = engine::readFurniture(c, &ofr) && ofr.valid;
+            int localKindO = ofrOk ? ofr.kind : 0;
+            int slaveO = engine::readSlaveState(c);
+            bool captive = localKindO != 0 || slaveO > 0 ||
+                           (out.bodyState & (BODY_IN_CAGE | BODY_CHAINED | BODY_IN_BED));
+            if (captive) {
+                int streamKindO = (out.bodyState & BODY_IN_BED) ? 1
+                                : ((out.bodyState & BODY_IN_CAGE) ? 2
+                                : ((out.bodyState & BODY_CHAINED) ? 3 : 0));
+                // Log on any kind change, a >5u move, or every 500ms - enough to
+                // reconstruct the cage -> work trajectory without flooding.
+                JailObs& jo = jailObs_[it->first];
+                float dx = ax - jo.x, dy = ay - jo.y, dz = az - jo.z;
+                float moved2 = haveActual ? (dx*dx + dy*dy + dz*dz) : 0.0f;
+                bool first = (jo.ms == 0);
+                if (first || localKindO != jo.kind || moved2 > 25.0f ||
+                    (now - jo.ms) >= 500) {
+                    float step = (haveActual && !first) ? std::sqrt(moved2) : 0.0f;
+                    jo.kind = localKindO; jo.ms = now;
+                    if (haveActual) { jo.x = ax; jo.y = ay; jo.z = az; }
+                    char b[256];
+                    _snprintf(b, sizeof(b) - 1,
+                        "[jail] OBSERVE hand=%u,%u localKind=%d streamKind=%d chained=%d "
+                        "inWhat=%u,%u slave=%d task=%u raw=%u pos=%.1f,%.1f,%.1f step=%.1f",
+                        out.hIndex, out.hSerial, localKindO, streamKindO,
+                        (out.bodyState & BODY_CHAINED) ? 1 : 0,
+                        ofrOk ? ofr.furn[3] : 0u, ofrOk ? ofr.furn[4] : 0u,
+                        slaveO, out.task, out.rawTask,
+                        haveActual ? ax : 0.0f, haveActual ? ay : 0.0f,
+                        haveActual ? az : 0.0f, step);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                // Do NOT drive / suspend / self-heal this body: let the host sim run it.
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            }
+        }
+
+        // ---- Stage 2: body-state override (down / KO / ragdoll / dead) --------
+        // A body the host reports as down (on the ground) must NOT be walk-driven or
+        // parked upright - reproducing locomotion on a corpse/KO is exactly the
+        // "marching/sliding while down" artifact. Instead drop the local copy into
+        // ragdoll and skip ALL locomotion + oracle work for it this tick. The local
+        // medical/AI tries to wake the body when its KO timer lapses, so:
+        //   - if the local body has actually stood back up, re-collapse it (knockDown
+        //     re-triggers the ragdoll fall), else
+        //   - top the KO timer EVERY tick (holdDown) so the timer never reaches 0 and
+        //     the wake AI never fires - this kills the get-up/flop/ragdoll-spike
+        //     flicker proactively instead of re-collapsing after the body stood.
+        // When the host reports the body upright again, release the KO once.
+        //
+        // A reliable EVT_DEATH/EVT_KNOCKOUT latch (d.deathLatched/koLatched) FORCES
+        // the down treatment even if this tick's (lossy) continuous sample momentarily
+        // reads upright - the whole point of the reliable event is that the down/dead
+        // transition is honoured regardless of a dropped batch. EVT_REVIVE clears it.
+        //
+        // ---- Carried carve-out (protocol 18) -----------------------------------
+        // A body on someone's shoulder (streamed BODY_CARRIED, or LOCALLY attached
+        // - the local pickup may lead/trail the stream by a beat) is transform-
+        // owned by its local carry attach: the down override (knockDown/holdDown
+        // + the 2u co-locate snap) would rip it off the shoulder and pin it to the
+        // ground - the dragged/teleported-body artifact this feature fixes. Skip
+        // the down path AND all locomotion driving for it this tick. koLatched is
+        // deliberately NOT cleared: the body is still KO'd, and the hold re-engages
+        // the tick after the local drop releases it.
+        if (carrySync_) {
+            engine::CarryRead lcr;
+            bool locallyCarried = engine::readCarry(c, &lcr) && lcr.beingCarried;
+            if (coop::bodyIsCarried(out.bodyState) || locallyCarried) {
+                // Remember a KO'd passenger so the down path can re-assert the
+                // moment the shoulder lets go. Sticky while carried: a lossy
+                // bodyState batch must not disarm the bridge on the one tick it
+                // matters. Cleared when the owner genuinely revives the passenger.
+                if (coop::bodyIsDown(out.bodyState)) d.carriedDown = true;
+                else if (d.fresh && !d.koLatched && !d.deathLatched &&
+                         !coop::bodyIsDown(engine::readBodyState(c)))
+                    d.carriedDown = false;
+            }
+            // The carve-out exists to protect a LOCAL SHOULDER ATTACH from the
+            // down override, so it is the local attach - not the streamed bit -
+            // that decides. Our copy's carrier ends its carry natively (an NPC
+            // carrier keeps its local AI so the carry animates), and the streamed
+            // BODY_CARRIED bit outlives that by a beat. Skipping on the streamed
+            // bit alone left a body with no attach to protect standing upright at
+            // the old shoulder spot, un-driven, until the bit cleared: carry_order
+            // sampled it there (bs=0 at the exact carry position) while the owner
+            // had already ragdolled the same body 21 u away (bs=3). The owner's
+            // drop is atomic - detach and ragdoll in one call - so the peer must
+            // not have an upright frame either. No attach, no carve-out: fall
+            // through and let the down path knock it down and co-locate it.
+            if (locallyCarried) {
+                d.dbgRegime = DR_CARRIED;
+                // Quiet the passenger's own AI like every other carve-out that
+                // skips the drive (the furniture branch below, and the main path
+                // at the walk-drive). This `continue` used to leave a driven
+                // body self-deciding, so the tick the carrier drops it the local
+                // AI is already mid-decision and walks it away from the streamed
+                // drop point before the drive resumes. The suspend set is
+                // rebuilt every tick, so it releases the moment the stream stops
+                // reporting the body as carried.
+                if (aiSuspend_) engine::addAiSuspend(c);
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            }
+        }
+        // ---- Furniture carve-out + self-heal (protocol 19) ----------------------
+        // A body in a bed/cage (streamed BODY_IN_BED/BODY_IN_CAGE, or LOCALLY
+        // occupying - the local placement may lead/trail the stream by a beat) is
+        // transform-owned by its furniture attach: the down override and any
+        // locomotion driving would rip it out onto the floor. Skip both.
+        // Scoped AWAY from conscious bed poses (USE_BED / USE_BED_ORDER /
+        // SLEEP_ON_FLOOR): those ride the validated L3 fixture-pose path
+        // (bed_pose) - a sleeper streams the bed TASK, walks to the bed and
+        // climbs in engine-natively; occupancy owns the task-less (unconscious
+        // placement) case. The reliable enter/exit edges do the work; this
+        // repairs the losses:
+        //   * bit streamed but not locally occupied -> throttled enter into the
+        //     nearest matching fixture at the streamed position (the continuous
+        //     bit carries no furniture hand),
+        //   * locally occupied after the stream stopped reporting the bit ->
+        //     debounced local exit (a 1-batch blip must not eject a valid
+        //     occupant - the carry-drop lesson).
+        // Non-owner unlock guard (protocol 42): a shackled prisoner (isChained ->
+        // BODY_CHAINED) can ALSO be in a cage/bed (IN_PRISON/IN_BED). readFurniture's
+        // kind priority reports the cage (kind=2), so the occupancy self-heal below
+        // only ever re-asserts the CAGE - never the shackle. A peer PC's local
+        // lockpick (or AI break-out) then leaves the owner's prisoner UNLOCKED on
+        // this peer while the owner still streams BODY_CHAINED (the reported "the
+        // other client's PC unlocked the shackle" desync, cage2). Re-assert
+        // setChainedMode INDEPENDENTLY of the furniture kind: remember the owner
+        // (slaveOwner) while the driven copy is locally chained, and re-apply if it
+        // has lost the chain. Scoped to the masked case (chained AND in a cage/bed);
+        // a pole-only chained body is handled by the kind=3 self-heal below.
+        if (chainSync_ && (out.bodyState & BODY_CHAINED) &&
+            (out.bodyState & (BODY_IN_CAGE | BODY_IN_BED))) {
+            engine::ShackleRead lsr;
+            bool haveSr = engine::readShackle(c, &lsr) && lsr.valid;
+            if (haveSr && lsr.chained &&
+                (lsr.owner[3] != 0 || lsr.owner[4] != 0)) {
+                for (int fi = 0; fi < 5; ++fi) d.chainOwner[fi] = lsr.owner[fi];
+                d.haveChainOwner = true;
+            }
+            if (haveSr && !lsr.chained &&
+                (now - d.chainHealTick) >= FURN_HEAL_MS) {
+                d.chainHealTick = now;
+                // Remembered owner if we have one, else the body's own slaveOwner
+                // (furnHand=0) - covers a caged slave that activated unshackled.
+                bool ok = d.haveChainOwner
+                    ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                    : engine::applyFurniture(gw, c, 0, 3, true);
+                engine::endAction(c);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[furn] SHACKLE RELOCK occ=%u,%u owner=%u,%u src=%s ok=%d",
+                    out.hIndex, out.hSerial, d.chainOwner[3], d.chainOwner[4],
+                    d.haveChainOwner ? "remembered" : "slaveOwner", ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (furnSync_ && !engine::taskIsBedPose((int)out.task)) {
+            // Chained/pole prisoner (protocol 41) rides this carve-out as
+            // kind=3 (Character::isChained). Gated by chainSync_ so it can be
+            // turned off without disabling bed/cage occupancy.
+            int streamKind = (out.bodyState & BODY_IN_BED) ? 1
+                           : ((out.bodyState & BODY_IN_CAGE) ? 2
+                           : ((chainSync_ && (out.bodyState & BODY_CHAINED)) ? 3 : 0));
+            engine::FurnitureRead lfr;
+            bool haveFr = engine::readFurniture(c, &lfr);
+            int localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
+            if (localKind == 3 && !chainSync_) localKind = 0;
+            // Jail put-to-work desync spike (KENSHICOOP_JAIL_PROBE, read-only):
+            // the DRIVEN view of a peer-owned captive (the host's copy of the
+            // join's jailed PC). streamKind is what the owner reports;
+            // localKind is where our copy actually sits. A streamKind=2/3 with
+            // localKind=0 (or vice-versa) is the twitch. Pairs with side=own.
+            if (jailProbe_ && (streamKind != 0 || localKind != 0)) {
+                static std::map<Key, unsigned long> s_drvJailMs;
+                Key jk = keyOf(out);
+                std::map<Key, unsigned long>::iterator jt = s_drvJailMs.find(jk);
+                if (jt == s_drvJailMs.end() || (now - jt->second) >= 250) {
+                    s_drvJailMs[jk] = now;
+                    int slave = engine::readSlaveState(c);
+                    char jb[224];
+                    _snprintf(jb, sizeof(jb) - 1,
+                              "[jail] STATE side=drv hand=%u,%u streamKind=%d localKind=%d "
+                              "chained=%d slaveOwner=%u,%u isSlave=%d task=%u raw=%u "
+                              "pos=%.1f,%.1f,%.1f mv=%d",
+                              out.hIndex, out.hSerial, streamKind, localKind,
+                              (out.bodyState & BODY_CHAINED) ? 1 : 0,
+                              lfr.furn[3], lfr.furn[4], slave, out.task, out.rawTask,
+                              out.x, out.y, out.z, out.cMoving ? 1 : 0);
+                    jb[sizeof(jb) - 1] = '\0'; coop::logLine(jb);
+                }
+            }
+            // Remember the owner hand while locally chained, so a lost/late
+            // reliable ENTER (or an AI break-out) can be re-applied below (the
+            // continuous BODY_CHAINED bit carries no owner).
+            if (localKind == 3) {
+                for (int fi = 0; fi < 5; ++fi) d.chainOwner[fi] = lfr.furn[fi];
+                d.haveChainOwner = (lfr.furn[3] != 0 || lfr.furn[4] != 0);
+            }
+            // Chained fall-through (world_parity 2026-07-17): kind=3 (chained)
+            // is an EQUIP state, not a transform anchor - a working slave
+            // walks its mining round while shackled, and the camp save starts
+            // the PCs chained, so the hold below froze every chained body at
+            // its entry position (the host's PC rendered 1600 u away on the
+            // join) and - at rest - left the local copy's own queued job
+            // running (the join's Leaf walked its local mining round while
+            // the host mined in place: the hold skips applyRest, so the
+            // host's task was never reproduced and the stale local task never
+            // cleared). Keep only the CHAINED-STATE heal here (re-chain a
+            // locally-unchained copy, throttled) and fall through: the
+            // unified drive owns transform AND task for chained bodies (it
+            // AI-suspends driven bodies itself; applyRest reproduces the
+            // host's work pose at rest). Cage/bed (kinds 1-2) remain true
+            // transform anchors below - BUT only when the OWNER streams them.
+            if (streamKind == 3) {
+                // Unvouched local bed/cage while the owner streams chained-
+                // not-caged (world_parity camp, Flashbox): the host's guards
+                // re-jail the peer-driven copy locally. The cage is a true
+                // transform anchor, so parks/walks no-op against it, and the
+                // throttled HEAL below lost the re-cage race under
+                // FURN_HEAL_MS (run 20260806_100102: ten HEAL ENTER was=2
+                // lines spanning the exact window of 54-148 u rest gaps,
+                // collapsing to 1.2 u the moment the storm ended). Break the
+                // unvouched seat EVERY tick - do not wait for the heal
+                // throttle - and AI-suspend so the local sim cannot re-seat
+                // the copy before the next drive tick. The chained-state
+                // heal stays throttled below.
+                if (haveFr && (localKind == 1 || localKind == 2)) {
+                    int brokeKind = localKind;
+                    bool broke = engine::applyFurniture(gw, c, lfr.furn,
+                                                        localKind, false);
+                    engine::endAction(c);
+                    if (aiSuspend_) engine::addAiSuspend(c);
+                    char bb[176]; _snprintf(bb, sizeof(bb) - 1,
+                        "[furn] CAGE-BREAK occ=%u,%u was=%d stream=3 ok=%d "
+                        "(unvouched)",
+                        out.hIndex, out.hSerial, brokeKind, broke ? 1 : 0);
+                    bb[sizeof(bb) - 1] = '\0'; coop::logLine(bb);
+                    // Refresh so the re-chain heal below sees post-break state.
+                    haveFr = engine::readFurniture(c, &lfr);
+                    localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
+                    if (localKind == 3 && !chainSync_) localKind = 0;
+                }
+                if (haveFr && localKind != 3 &&
+                    (now - d.furnHealTick) >= FURN_HEAL_MS) {
+                    d.furnHealTick = now;
+                    bool ok = d.haveChainOwner
+                        ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                        : engine::applyFurniture(gw, c, 0, 3, true);
+                    engine::endAction(c);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[furn] HEAL ENTER occ=%u,%u kind=3 was=%d ok=%d (fallthrough)",
+                        out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    // Jail spike (KENSHICOOP_JAIL_PROBE, read-only): quantify the
+                    // re-seat as the user sees it. divergence = how far the local
+                    // copy had drifted from the owner's streamed pos when we
+                    // re-chained it (the visible teleport magnitude); localStep =
+                    // how far our copy moved since last tick while nominally
+                    // seated (>0 => the driven copy's OWN local AI is walking it -
+                    // the "exit cage to run" half of the oscillation).
+                    if (jailProbe_) {
+                        float dvg = haveActual ? std::sqrt(
+                            (ax-out.x)*(ax-out.x)+(ay-out.y)*(ay-out.y)+(az-out.z)*(az-out.z)) : 0.0f;
+                        float lstep = (haveActual && d.haveActual) ? std::sqrt(
+                            (ax-d.lx)*(ax-d.lx)+(ay-d.ly)*(ay-d.ly)+(az-d.lz)*(az-d.lz)) : 0.0f;
+                        char s[192]; _snprintf(s, sizeof(s) - 1,
+                            "[jail] SNAP hand=%u,%u kind=3 was=%d divergence=%.1f localStep=%.1f ok=%d",
+                            out.hIndex, out.hSerial, localKind, dvg, lstep, ok ? 1 : 0);
+                        s[sizeof(s) - 1] = '\0'; coop::logLine(s);
+                    }
+                }
+            } else if (streamKind != 0) {
+                d.furnNoSeeTick = 0;
+                // A jailed/bedded DRIVEN body must not run its own decision layer.
+                // A CONSCIOUS caged squad member (an arrested player) otherwise
+                // "releases from jail", fights the guards and walks out of the cage
+                // while the self-heal re-seats it every FURN_HEAL_MS - the "teleported
+                // in and out of jail" oscillation (2026-07-15). Squad members are
+                // normally never AI-suspended (the !isSquad gate on the locomotion
+                // path below), but a body the host is holding IN furniture is the
+                // exception: suspend its decisions so it stays put. The suspend set is
+                // rebuilt every drive tick, so this self-clears the moment the host
+                // stops streaming the furniture bit (body released) and its AI resumes.
+                if (aiSuspend_) engine::addAiSuspend(c);
+                if (haveFr && localKind != streamKind &&
+                    (now - d.furnHealTick) >= FURN_HEAL_MS) {
+                    d.furnHealTick = now;
+                    // Chain (kind 3) has no searchable building and needs the
+                    // OWNER: re-apply setChainedMode with the remembered owner,
+                    // or - for a prisoner that spawned into interest already
+                    // UNCHAINED (no owner ever remembered) - via its OWN
+                    // slaveOwner (furnHand=0, set from the shared save). Without
+                    // this fallback an obedient working slave that activated
+                    // unshackled+jobless on the join was never re-locked and its
+                    // local AI fled, drawing the join guards into a chase the host
+                    // never saw (manual 2026-07-17, camp working prisoners).
+                    // Cages/beds re-find the nearest matching fixture by name.
+                    bool ok = (streamKind == 3)
+                        ? (d.haveChainOwner
+                           ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                           : engine::applyFurniture(gw, c, 0, 3, true))
+                        : engine::enterFurnitureNearPos(
+                            gw, c, streamKind, out.x, out.y, out.z, FURN_MATCH_DIST);
+                    // Drop the in-progress escape/attack action so the body doesn't
+                    // finish breaking out before the suspend takes hold. endAction is
+                    // SEH-guarded (same call the rest-park path uses).
+                    engine::endAction(c);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[furn] HEAL ENTER occ=%u,%u kind=%d ok=%d",
+                        out.hIndex, out.hSerial, streamKind, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    { char q[160]; _snprintf(q, sizeof(q) - 1,
+                        "[furn] cage-quiet occ=%u,%u kind=%d",
+                        out.hIndex, out.hSerial, streamKind);
+                      q[sizeof(q) - 1] = '\0'; coop::logLine(q); }
+                    // Jail spike (see kind=3 SNAP above): divergence = teleport
+                    // magnitude of this re-seat; localStep = drift since last tick
+                    // while nominally in the cage/bed (>0 => local AI walked it).
+                    if (jailProbe_) {
+                        float dvg = haveActual ? std::sqrt(
+                            (ax-out.x)*(ax-out.x)+(ay-out.y)*(ay-out.y)+(az-out.z)*(az-out.z)) : 0.0f;
+                        float lstep = (haveActual && d.haveActual) ? std::sqrt(
+                            (ax-d.lx)*(ax-d.lx)+(ay-d.ly)*(ay-d.ly)+(az-d.lz)*(az-d.lz)) : 0.0f;
+                        char s[192]; _snprintf(s, sizeof(s) - 1,
+                            "[jail] SNAP hand=%u,%u kind=%d was=%d divergence=%.1f localStep=%.1f ok=%d",
+                            out.hIndex, out.hSerial, streamKind, localKind, dvg, lstep, ok ? 1 : 0);
+                        s[sizeof(s) - 1] = '\0'; coop::logLine(s);
+                    }
+                }
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                d.dbgRegime = DR_FURN;
+                continue;
+            } else if (localKind == 1 && hostMoving) {
+                // Bed fast-exit (conscious sleep wake): a bed pose has NO
+                // reliable EXIT edge (publishOwned suppresses furniture edges
+                // while taskIsBedPose), so a host that wakes and WALKS would
+                // otherwise leave the join copy frozen in bed until the
+                // FURN_EXIT_MS debounce - and a conscious bed sleeper is never
+                // AI-suspended, so its local AI can re-sleep it in the gap
+                // ("stays sleeping" desync, pole save 2026-07-17). The host
+                // genuinely moving is an unambiguous "left the bed" signal (a
+                // caged/chained body - kind 2/3 - never moves, so this can't
+                // false-trigger there and they stay on the debounce): eject NOW,
+                // drop the in-progress sleep action, release the held pose, and
+                // FALL THROUGH (no continue) so the unified drive follows the
+                // host this same tick.
+                bool ok = engine::applyFurniture(gw, c, lfr.furn, 1, false);
+                engine::endAction(c);
+                d.furnNoSeeTick = 0;
+                d.taskApplied = false; d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
+                char bfe[160]; _snprintf(bfe, sizeof(bfe) - 1,
+                    "[furn] BED FAST-EXIT occ=%u,%u ok=%d hostMoving=1",
+                    out.hIndex, out.hSerial, ok ? 1 : 0);
+                bfe[sizeof(bfe) - 1] = '\0'; coop::logLine(bfe);
+            } else if (localKind != 0) {
+                // Third-party placement authority (protocol 36): a HOST-sim
+                // actor (a guard jailing an arrested player) put this PEER-
+                // OWNED squad body into furniture. The occupant's owner never
+                // sees the action, so the occupant-owner ENTER can't fire -
+                // the owner's stream keeps reporting no bit and the debounced
+                // HEAL EXIT below ejected the body every 3 s ("the host kept
+                // taking it out of the cage", 2026-07-09). The host is the
+                // world authority for NPC actions: author the ENTER for the
+                // owner (buffered; publishOwned sends), HOLD the self-heal
+                // exit while it crosses, and re-author every FURN_PEER_MS
+                // until the owner's stream carries the bit. KO'd/down bodies
+                // only - a conscious voluntary use stays owner-authored, which
+                // (protocol 53) is why the crawlers are excluded by name: a
+                // crippled body reads Character::isDown() while conscious, so
+                // plain bodyIsDown would have us author bed-enters for someone
+                // who crawled past a bed under their own control.
+                bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
+                               d.koLatched || d.deathLatched ||
+                               coop::bodyDownNotCrawling(engine::readBodyState(c));
+                // N players under presence authority: several clients run world
+                // sims (streamNpcs_), so only ONE may author this edge - the
+                // authority of the cell our copy stands in. When that authority
+                // is the occupant's own author (its cell, where it cannot see the
+                // third-party action), the host stands in for it, or - for the
+                // host's own body - every other client may (duplicate ENTERs are
+                // idempotent on the receiver). With two players every case
+                // resolves to "author it", exactly as before.
+                bool mayAuthorEnter = true;
+                if (cellAuth_ && d.author != AUTHOR_NONE) {
+                    u32 cellOwner = authorityFor(gw, haveActual ? ax : out.x,
+                                                 haveActual ? az : out.z);
+                    mayAuthorEnter = cellOwner == localId_ ||
+                        (cellOwner == d.author &&
+                         (localId_ == (u32)CELL_OWNER_HOST ||
+                          d.author == (u32)CELL_OWNER_HOST));
+                }
+                if (streamNpcs_ && isSquad && downish) {
+                    // Not ours to author: another world authority is (or will
+                    // be) sending it, so only HOLD the self-heal exit below.
+                    if (mayAuthorEnter &&
+                        (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS)) {
+                        d.furnPeerTick = now;
+                        PendFurnEnter pe;
+                        pe.occ = keyOf(out);
+                        for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = lfr.furn[fi];
+                        pe.kind = localKind;
+                        furnPeerPend_.push_back(pe);
+                        char b[160]; _snprintf(b, sizeof(b) - 1,
+                            "[furn] PEER-ENTER author occ=%u,%u furn=%u,%u kind=%d",
+                            out.hIndex, out.hSerial, lfr.furn[3], lfr.furn[4],
+                            localKind);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                    d.furnNoSeeTick = 0; // never self-heal-eject a host placement
+                    d.parked = false; d.haveDest = false;
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    d.dbgRegime = DR_FURN;
+                    continue;
+                }
+                if (d.furnNoSeeTick == 0) {
+                    d.furnNoSeeTick = now;
+                } else if ((now - d.furnNoSeeTick) > FURN_EXIT_MS) {
+                    d.furnNoSeeTick = 0;
+                    bool ok = engine::applyFurniture(gw, c, lfr.furn, localKind, false);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[furn] HEAL EXIT occ=%u,%u kind=%d ok=%d",
+                        out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                // Still locally attached this tick: hold off all driving until
+                // the debounced exit (or a fresh stream bit) resolves it.
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                d.dbgRegime = DR_FURN;
+                continue;
+            } else {
+                d.furnNoSeeTick = 0;
+            }
+        }
+        // ---- Crawl carve-out (protocol 53) -------------------------------------
+        // A crippled body is DOWN by Character::isDown() but CONSCIOUS and moving
+        // under its own power. Without this it took the down path below, which
+        // knockDown/holdDown-pins it and teleport-co-locates it every tick, so the
+        // copy lay motionless while its owner crawled away - the reported bug -
+        // and it never reached the posture apply or the walk drive at all.
+        // Same shape as the carried/furniture carve-outs above: decided BEFORE the
+        // down test, from the streamed prone field rather than a local guess.
+        // It also overrides a stale koLatched on purpose: the crawler IS the proof
+        // that the body woke up, and the latch would otherwise hold it down until
+        // an EVT_REVIVE that the pre-53 edge detector never sent. deathLatched
+        // still wins absolutely - a corpse does not crawl.
+        bool crawling = proneSync_ && coop::bodyIsCrawling(out.bodyState) &&
+                        !d.deathLatched;
+        // A latched EVT_DEATH/EVT_KNOCKOUT forces the down treatment every tick,
+        // which is what keeps a corpse pinned. That latch lives on this Driven
+        // record, so it MUST survive a hand re-key - rekeyPeerBody carries
+        // deathLatched/koLatched from the old key onto the new one (2026-07-15);
+        // without that carry a dead body that re-containers would fall through
+        // to the drive path below and the local AI would stand it back up.
+        // d.carriedDown is the drop-transient bridge (armed in the carried carve-out):
+        // it forces the down treatment on the release tick even when BOTH the streamed
+        // and local samples momentarily read upright mid-fall. It is a one-shot - the
+        // moment the body reads down again the bridge has done its job and clears.
+        if (!crawling &&
+            (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched ||
+             d.carriedDown)) {
+            unsigned short localBs = engine::readBodyState(c);
+            if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
+            else                          { engine::holdDown(c); d.carriedDown = false; }
+            // A ragdoll/KO falls independently on each client (and the join's local
+            // AI may have walked the body elsewhere before the down state arrived),
+            // so co-locate it with the host's down position when it has drifted.
+            // Teleport (not walk) - a limp body has no gait to preserve.
+            if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > 2.0f)
+                engine::applyRaw(c, out);
+            d.downApplied = true;
+            d.dbgRegime = DR_DOWN;
+            d.parked = false; d.haveDest = false;
+            if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+            continue;
+        }
+        if (d.downApplied) {
+            engine::knockDown(c, false); // host says upright again -> stand back up
+            d.downApplied = false;
+        }
+        // ---- Locomotion-body restore (squad copies) ------------------------------
+        // Reached only by a body the stream says is UPRIGHT and free (the down,
+        // carried, furniture and crawl branches above all continue out). Kenshi
+        // destroys a character's Havok controller when it stops being a free
+        // walker (KO ragdoll, shoulder carry) and the body's own recovery rebuilds
+        // it; an AI-suspended copy never runs that recovery. The MODEL is rendered
+        // from that controller, so without one every placement moves only
+        // CharMovement::pos: the nameplate wanders off while the mesh stays where
+        // the controller died, and walk orders are ignored. Field report
+        // 2026-10-19 (carry, put down, walk off: frozen model, wandering
+        // nameplate, on both screens after a carry each way); carry_swap with a
+        // pre-pickup KO measured pelvis-to-nameplate 245-615 u with hk=0 for the
+        // whole walk, 0.1 u with this restore. Same repair as the crawl drive
+        // (restoreMovement = CharMovement::restore); the glide branch repeats it
+        // per frame for a moving copy.
+        if (isSquad && (now - d.physHealTick) >= PHYS_HEAL_MS &&
+            !engine::hasPhysicsBody(c) && !coop::bodyIsDown(engine::readBodyState(c))) {
+            d.physHealTick = now;
+            bool restored = engine::restoreMovement(c);
+            if (restored) d.haveDest = false;   // re-issue the walk on the new controller
+            ++physHeal_;
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[heal] PHYSICS hand=%u,%u restored=%d", out.hIndex, out.hSerial, restored ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // Kenshi runs a get-up task (GET_UP_STAND_UP / FORCE_GET_UP / STAND_UP)
+        // after any KO or ragdoll, and a body in it ignores move orders. On the
+        // owner it completes in a beat; on an AI-suspended copy it lingered for
+        // seconds (carry_walk: task=65 while the owner already walked; KO-only
+        // control with the walk right after the wake: stuck walk frames 26% -> 9%
+        // with this). Once the OWNER walks and is not itself getting up, the
+        // copy's get-up is stale: end it and re-issue the walk at once.
+        if (out.cMoving != 0 && !coop::taskIsGetUp((int)out.task) &&
+            (now - d.getUpHealTick) >= GETUP_HEAL_MS) {
+            int lt = engine::readTaskKey(c);
+            if (coop::taskIsGetUp(lt) && !coop::bodyIsDown(engine::readBodyState(c))) {
+                d.getUpHealTick = now;
+                bool ok = engine::endAction(c);
+                d.haveDest = false;            // the next walk branch re-issues the order
+                ++getUpHeal_;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[heal] GETUP hand=%u,%u task=%d ok=%d after=%d",
+                    out.hIndex, out.hSerial, lt, ok ? 1 : 0, engine::readTaskKey(c));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        // The same staleness for a SEAT/work pose (recruit_seated): a bar NPC
+        // recruited off its stool keeps the stool action on the peer's copy -
+        // posed by our applyOrder under the key the re-key retired, or natively
+        // (the host's own NPC before the join recruited it) - and an AI-suspended
+        // copy never ends it, so it sat frozen while the owner ran (rj_before1:
+        // gap 108 u) or crawled at the action's pace (rj_after2: 15 u/s vs 55).
+        // Once the OWNER moves with no task of its own, the pose is stale: end
+        // it, forget the applied pose, and re-issue the walk at once.
+        // A leftover MOVE_ON_FREE_WILL is the same staleness for a free-standing
+        // recruit: the host's copy of a JOIN recruit was a host NPC with live AI
+        // up to the recruit (a guard walking back to its post), the suspend only
+        // stops NEW decisions, and that walk kept steering the body back at walk
+        // pace against our orders - 150 u behind the running owner and a hard
+        // snap every ~1.5 s (recruit_run: medGap 84 u, 11 snaps; the join's copy
+        // of a host recruit, driven all along, never has one: 7.8 u, 0 snaps).
+        // Once per drive: far from this client's own squad the engine re-issues a
+        // free-will move for a driven copy on its own (run_apart: the host tab's
+        // copies 118k u away re-gained one within 500 ms of every heal, 109 heals),
+        // so re-ending it only churns - the walk the body brought INTO the drive
+        // is the stale one.
+        if (isSquad && out.cMoving != 0 && out.task == TASK_NONE &&
+            (now - d.poseHealTick) >= POSE_HEAL_MS) {
+            int lt = engine::readTaskKey(c);
+            bool freeWill  = !d.freeWillHealed && engine::isFreeWillMoveTask(lt);
+            bool stalePose = engine::taskIsSeatPose(lt) || freeWill ||
+                             (d.issuedTask != TASK_NONE && lt == (int)d.issuedTask);
+            if (stalePose && !coop::bodyIsDown(engine::readBodyState(c))) {
+                d.poseHealTick = now;
+                if (freeWill) d.freeWillHealed = true;
+                bool ok = engine::endAction(c);
+                d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
+                d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
+                d.haveDest = false;            // the next walk branch re-issues the order
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[heal] POSE hand=%u,%u task=%d ok=%d after=%d",
+                    out.hIndex, out.hSerial, lt, ok ? 1 : 0, engine::readTaskKey(c));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Stealth posture (protocol 20) -------------------------------------
+        // Continuous mode apply: the streamed BODY_SNEAK bit IS Character::
+        // stealthMode on the owner, so a difference on the local copy just
+        // re-runs the engine's own setStealthMode (sneak-walk + stealthUpdate
+        // scanning, all native). Reached only by an upright, un-carried,
+        // un-occupied body (the branches above continue out), so a KO'd or
+        // bedridden copy is never stealth-toggled. Throttled: a copy whose
+        // engine keeps clearing the mode (combat) re-applies at 1 Hz, not per
+        // frame.
+        if (stealthSync_) {
+            bool want  = coop::bodySneaking(out.bodyState);
+            int  local = engine::readStealthMode(c);
+            if (local >= 0 && ((local != 0) != want) &&
+                (d.sneakTick == 0 || (now - d.sneakTick) >= SNEAK_APPLY_MS)) {
+                d.sneakTick = now;
+                bool ok = engine::applyStealth(c, want);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[sneak] APPLY hand=%u,%u on=%d ok=%d",
+                    out.hIndex, out.hSerial, want ? 1 : 0, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Prone posture (protocol 53) ---------------------------------------
+        // The streamed prone FIELD is the owner's Character::_currentProneState
+        // exactly, so a difference on the local copy just re-runs the engine's own
+        // setProneState. This is the half BODY_CRAWL could never supply: that bit
+        // is isStealthModeOrCrawling, true for the sneak toggle AND an injured
+        // crawl, so it names no posture to apply - and it must never be routed to
+        // setStealthMode (that would put a crawler in sneak MODE, changing who can
+        // see it, and its own next capture would then publish a fake BODY_SNEAK).
+        // Without this a crippled crawler fails the down test (correctly - it moves
+        // under its own power), fails the sneak test, and is driven by the upright
+        // walk path below.
+        //
+        // Reached only by an upright-ish, un-carried, un-occupied, un-chained body
+        // (every branch above continues out), so PS_KO / PS_PLAYING_DEAD bodies
+        // stay the down path's property along with its death/KO latches. Throttled
+        // like the sneak apply: a copy whose engine re-derives the posture from its
+        // own medical model re-poses at 1 Hz rather than being fought per frame.
+        // The crippled FLAG that gait selection actually reads is applied by the
+        // medical channel (MED_CRIPPLED); posing without it renders upright.
+        if (proneSync_) {
+            u8  want  = coop::bodyProne(out.bodyState);
+            int local = engine::readProneState(c);
+            if (local >= 0 && local != (int)want &&
+                (d.proneTick == 0 || (now - d.proneTick) >= PRONE_APPLY_MS)) {
+                d.proneTick = now;
+                bool ok = engine::applyProneState(c, (int)want);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[prone] APPLY hand=%u,%u want=%u was=%d ok=%d",
+                    out.hIndex, out.hSerial, (unsigned)want, local, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Stage 3c: combat override (melee) --------------------------------
+        // The host streams a combat INTENT (task == TASK_COMBAT_MELEE for an ACTIVE
+        // attacker, TASK_COMBAT_WAIT for one queued by the AttackSlotManager; subject
+        // = the attack target's hand). Reproduce the cause: order the local copy to
+        // melee the same resolved target and let the join's own engine run the fight
+        // (draw, swing, footwork) - the proven "replicate the intent" path.
+        // A WAITING combatant is a STANCE, not a failed attack: its copy holds the
+        // goal and menaces in the ring, and is never re-issued on a timer (each
+        // re-issue clearGoals-resets the local AI - THE teleporting-crowd artifact).
+        // Re-issues happen only on a new episode, a target change, or an ACTIVE copy
+        // that disengaged, with exponential backoff. Positional drift is corrected in
+        // graded bands (leave / walk-converge / logged teleport). Combatants skip the
+        // AI-suspend path below (their AI must run to animate), reached only via this
+        // early `continue`.
+        if (coop::taskIsCombat(out.task)) {
+            d.dbgRegime = DR_COMBAT;
+            bool hostWaiting = coop::taskIsCombatWait(out.task);
+            d.combatSeenTick = now; // feeds the disarm debounce below
+            // Detach only WORLD NPCs from their town AI. A driven SQUAD member must
+            // NEVER be detached: separateIntoMyOwnSquad changes its hand CONTAINER,
+            // which breaks the cross-client identity (the standers lesson, doctrine
+            // asymmetry rule) - found when player_combat first drove a peer-owned
+            // player character into a fight.
+            if (!isSquad && !d.detached) d.detached = engine::detachFromTownAI(c);
+            engine::CombatRead lc;
+            // modeActive is the STABLE engaged read; isInCombatMode flickers off
+            // between combo sections and slot rotations (the crowd lesson).
+            bool localFighting = engine::readCombat(c, &lc) &&
+                                 (lc.inCombat || lc.modeActive);
+            // The streamed target's LOCAL body, through the same translation the
+            // drive uses for its own subject (bodyForKey). A target the owner
+            // simulates natively is streamed under the owner's raw hand, and on
+            // this client that body can be a MINTED proxy (the raw hand never
+            // resolves here: applyCombat answered r=1 on every re-issue and the
+            // copy of a fighting PC stood idle) or a body our own combat detach
+            // RE-KEYED (its local hand no longer equals the wire key).
+            Key tk; tk.t = out.sType; tk.c = out.sContainer; tk.cs = out.sContainerSerial;
+            tk.i = out.sIndex; tk.s = out.sSerial;
+            Character* wantTgt = bodyForKey(tk, 0, 0);
+            // The copy is engaged with the WRONG body (the local brawl grabbed it).
+            // Judged on BODIES, not hands: comparing the local target hand with
+            // the wire key latched "wrong" for the right body under a re-keyed or
+            // minted hand, and every re-issue then clearGoals-reset a correct
+            // fight while the 6 u walk band (correctFight=false) pulled the copy
+            // out of it. Unjudgeable (either body unresolved here) = not wrong.
+            // The body the copy's own combat is locked on (read whether or not the
+            // engine currently reports it "in combat": the lock outlives the
+            // between-swing DECISION blink of the in-combat flags).
+            Character* lockTgt = lc.hasTarget
+                ? engine::resolveCharByHand(lc.target[3], lc.target[4], lc.target[0],
+                                            lc.target[1], lc.target[2])
+                : 0;
+            Character* haveTgt = localFighting ? lockTgt : 0;
+            bool wrongLocalTgt = wantTgt && haveTgt && haveTgt != wantTgt;
+            // A SQUAD copy locked onto its owner's target is ENGAGED, and stays so
+            // for COMBAT_LOCK_HOLD_MS across the lock's between-swing blinks. Its
+            // fight then owns the footwork: no move-order walk (that replaces the
+            // attack - the "standing still" copy) and no re-issue reset.
+            if (isSquad && wantTgt && lockTgt == wantTgt) d.combatLockTick = now;
+            bool engagedSquad = isSquad && d.combatLockTick != 0 &&
+                                (now - d.combatLockTick) < COMBAT_LOCK_HOLD_MS;
+            // The host retargeted since our last order.
+            bool tgtChanged = d.combatArmed &&
+                (d.combatTgtIdx != out.sIndex || d.combatTgtSer != out.sSerial);
+            // KENSHICOOP_DEBUG_COMBAT_COPY=1: 10 Hz trace of every SQUAD copy in the
+            // combat regime - its local fight read, sword state, which body it is
+            // locked on (1 = the owner's target, 2 = another body, 0 = none), its
+            // current task, and the three distances that tell a lost fight from a
+            // displaced one: copy->owner (dO), copy->target (dT), target->owner (tO).
+            if (isSquad && combatCopyDebug()) {
+                static std::map<unsigned long long, unsigned long> s_traceMs;
+                unsigned long long tkey = ((unsigned long long)out.hIndex << 32) | out.hSerial;
+                unsigned long& last = s_traceMs[tkey];
+                if (now - last >= 100) {
+                    last = now;
+                    float tx = 0.0f, ty = 0.0f, tz = 0.0f;
+                    bool haveT = wantTgt && engine::readPos(wantTgt, &tx, &ty, &tz);
+                    int lock = !lc.hasTarget ? 0 : (lockTgt && lockTgt == wantTgt ? 1 : 2);
+                    char b[256]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] trace hand=%u,%u fight=%d/%d sw=%d lock=%d task=%d "
+                        "dO=%.1f dT=%.1f tO=%.1f stask=%u orders=%u",
+                        out.hIndex, out.hSerial, lc.inCombat ? 1 : 0, lc.modeActive ? 1 : 0,
+                        lc.swordState, lock, engine::readTaskKey(c),
+                        haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : -1.0f,
+                        (haveActual && haveT) ? dist3(ax, ay, az, tx, ty, tz) : -1.0f,
+                        haveT ? dist3(tx, ty, tz, out.x, out.y, out.z) : -1.0f,
+                        (unsigned)out.task, d.combatOrders);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+            // Backoff: 1.5 s base, doubling per re-issue in this episode, 6 s cap -
+            // a copy that legitimately cannot engage is not AI-reset forever.
+            unsigned long interval = COMBAT_REISSUE_MS;
+            if (d.combatOrders > 1) {
+                unsigned int shift = d.combatOrders - 1;
+                if (shift > 2) shift = 2;
+                interval = COMBAT_REISSUE_MS << shift;
+                if (interval > COMBAT_REISSUE_MAX_MS) interval = COMBAT_REISSUE_MAX_MS;
+            }
+            bool reissue = false;
+            if (!d.combatArmed) {
+                reissue = true;
+                d.combatOrders = 0; // new episode: backoff restarts
+            } else if (tgtChanged && (now - d.combatTick) >= COMBAT_REISSUE_MS) {
+                reissue = true;     // retarget promptly (base throttle, no backoff)
+                // A SQUAD copy (a peer's PC) starts a fresh engagement budget per
+                // target: the owner's retargets are not failed attempts, and
+                // counting them spent the whole budget inside one brawl, after
+                // which a copy that dropped out of the fight was never re-ordered
+                // again (host_pc_fight run hpf_after4: order n=6 on a re-target,
+                // a snap 1.5 s later, then no order for 8.7 s while the copy stood
+                // out of the fight and its owner kept swinging at the same body).
+                // The retarget path itself stays base-throttled, so an owner
+                // flicking between two bodies cannot thrash it.
+                if (isSquad) d.combatOrders = 0;
+            } else if ((wrongLocalTgt || (!hostWaiting && !localFighting && !engagedSquad)) &&
+                       (now - d.combatTick) >= interval &&
+                       d.combatOrders <= COMBAT_REISSUE_CAP) {
+                // Active copy disengaged / fighting the wrong body - and the
+                // WAIT -> MELEE promotion case (the slot rotates every few
+                // seconds, so promotions recur: backoff applies, and after
+                // COMBAT_REISSUE_CAP failed attempts the copy is left to the
+                // position bands - a template that won't fight here (fear,
+                // blocked ring spot) must not be clearGoals-reset all fight;
+                // that WAS the artifact. The backoff counter deliberately
+                // never resets mid-episode: local engagement flickers (combo
+                // gaps), and a flicker-reset defeated the backoff (measured:
+                // 30 orders/hand, every one at the base interval).
+                reissue = true;
+            }
+            if (reissue) {
+                // A seat-INJECTED copy (applyRest committed a player order at the
+                // stool) ignores the goal-path attack: player orders outrank AI
+                // goals, so the body stays seated and the fight never starts (run
+                // 014713: the pre-seated striker re-ordered 15x, localFight=0 all
+                // window). Flush the order via the order-path attack, once.
+                bool breakSeat = d.taskApplied || d.issuedTask != TASK_NONE;
+                // Engagement escalation (world_parity camp, run 005538): a
+                // driven guard beating a locally PLAYER-OWNED body (escaped
+                // prisoner PC) accepted the goal-path attack (r=2) every
+                // reissue but never engaged - its running local AI re-decides
+                // against fighting the player squad and drops the goal. After
+                // a failed goal-path episode, flush via the ORDER path too
+                // (player orders outrank AI goals - the seat-injection
+                // precedent). Backoff-throttled like every reissue.
+                if (!breakSeat && !hostWaiting && !localFighting &&
+                    d.combatOrders >= 1)
+                    breakSeat = true;
+                // Wrong-target divergence (Phase 3, 2026-07-16): the local brawl
+                // grabbed a DIFFERENT body than the host reports. Drop the wrong
+                // lock before re-ordering so the engine re-acquires the host's
+                // target instead of re-diverging every episode (the maxPersist /
+                // wrongTgt driver - a snap back doesn't fix the cause, the local
+                // AI just re-locks the wrong enemy). Throttled by the same re-issue
+                // backoff, so this is not a per-frame clearGoals thrash.
+                if (wrongLocalTgt) engine::clearGoals(c);
+                int r = engine::applyCombat(c, wantTgt, out, breakSeat);
+                if (breakSeat && r == 2) {
+                    d.taskApplied = false; d.taskBad = false;
+                    d.issuedTask  = TASK_NONE;
+                }
+                // Final escalation (world_parity camp, run 011417): the copy
+                // accepted BOTH the goal and order attacks yet still never
+                // engaged (localFight=0, task 65535 all window) - its running
+                // AI validates the victim (locally player-owned, non-hostile
+                // faction: the escaped-prisoner recapture) and drops the
+                // committed goal. attackTarget is that AI's own commit entry,
+                // past the validation. Only after two failed ordered episodes
+                // so ordinary NPC-vs-NPC fights never hit this path.
+                int fr = -2; // -2 = not attempted
+                if (r == 2 && !hostWaiting && !localFighting &&
+                    d.combatOrders >= 2) {
+                    fr = engine::forceAttack(c, wantTgt, out);
+                }
+                d.combatArmed = true; d.combatTick = now;
+                if (d.combatOrders < 1000000u) ++d.combatOrders;
+                ++combatOrder_;
+                d.combatTgtIdx = out.sIndex; d.combatTgtSer = out.sSerial;
+                { char b[192]; _snprintf(b, sizeof(b) - 1,
+                    "[combat] order hand=%u,%u tgt=%u,%u localFight=%d r=%d wait=%d n=%u%s%s",
+                    out.hIndex, out.hSerial, out.sIndex, out.sSerial,
+                    localFighting ? 1 : 0, r, hostWaiting ? 1 : 0, d.combatOrders,
+                    breakSeat ? " seatbrk=1" : "", fr == -2 ? "" :
+                    (fr == 2 ? " forced=1" : (fr == 1 ? " forced=notgt" :
+                     (fr == 0 ? " forced=nofn" : " forced=fault"))));
+                  b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            }
+            // Graded position correction (don't kill the gait): under the soft band
+            // the fight owns the footwork; drifted past it, a WAITING copy converges
+            // with a real walk (stance preserved, no AI reset); far gone, teleport
+            // and say so - but on a COOLDOWN: a snap that cannot stick (mid-stagger,
+            // stale interp while the host body sprints) must not re-fire every frame
+            // (measured: one hand snapped ~50x/s at constant drift).
+            // A driven SQUAD copy (a peer's player character) is walked by the
+            // player MOVE-ORDER path, and a player order replaces whatever the copy
+            // was doing in the fight: the attack it is arming, the stance it holds
+            // in the attack-slot ring, the swing it is in. So a squad copy is never
+            // walk-converged inside the churn ceiling (COMBAT_SNAP_DIST, the band a
+            // correctly-engaged fight already owns), and not at all while it is
+            // still ARMING (an active stance with re-issues left) - only the true-
+            // leave snap moves it then. Before this, every combo-gap flicker of the
+            // local fight read and every WAITING sample turned into a jog to the
+            // owner's spot instead of a swing (host_pc_fight: the copy of a fighting
+            // PC was walk-ordered in 23-71% of its owner's fight samples), and an
+            // arming copy never engaged (player_combat: the striker must arm and
+            // land real blood on the victim's owner). Past the ceiling, or once the
+            // arming budget is spent (a copy that won't fight here), the walk band
+            // keeps it tracking the owner's roaming brawl.
+            // World-NPC copies keep the soft bands and converge while arming
+            // (combat_crowd: without it, medians hit 50+ u); their walkTo is a
+            // HIGH_PRIORITY destination, not a player order.
+            if (haveActual) {
+                bool arming = !hostWaiting && !localFighting &&
+                              d.combatOrders <= COMBAT_REISSUE_CAP;
+                float drift = dist3(ax, ay, az, out.x, out.y, out.z);
+                // Source (host) speed estimate: a leave on a FAST source is a real
+                // chase (a teleport is correct there); a big drift on a STATIONARY
+                // source (srcVel~0) is melee churn or a wrong-place body - converge,
+                // never warp. Same 2-sample estimate the locomotion gate uses.
+                float srcVel = 0.0f;
+                { EntityState nn; float cvx = 0.0f, cvy = 0.0f, cvz = 0.0f;
+                  if (d.interp.latest(&nn, &cvx, &cvy, &cvz))
+                      srcVel = std::sqrt(cvx * cvx + cvy * cvy + cvz * cvz); }
+                // Convergence-first correction (2026-07-16 smoothness pass). A
+                // correctly-engaged fight (and any squad copy, above) owns its
+                // footwork up to the churn ceiling (COMBAT_SNAP_DIST); every other
+                // world-NPC copy (arming / idle / WAITING / wrong-target) converges
+                // above a soft band - tighter for a waiting stance that should not
+                // wander. Above the leave band the body
+                // FAST-SLIDES to the host pose (a quick walk, gait preserved); an
+                // INSTANT teleport is reserved for a true LEAVE only (very far, a
+                // source teleport, or a drift that SAT over the band for
+                // COMBAT_CONVERGE_MS on a moving source). Momentary interp/footwork
+                // spikes converge - they never warp.
+                bool correctFight = localFighting && !wrongLocalTgt;
+                float softBand  = hostWaiting ? COMBAT_WAIT_DIST : combatSoftDist_;
+                float leaveBand = (correctFight || isSquad) ? combatSnapDist_ : softBand;
+                if (drift > combatSnapDist_) {
+                    if (d.combatOverTick == 0) d.combatOverTick = now;
+                } else {
+                    d.combatOverTick = 0;
+                }
+                bool sustained = d.combatOverTick != 0 &&
+                                 (now - d.combatOverTick) >= combatConvergeMs_;
+                // The EDGE, not the level: lastMode stays SM_SEG_SNAP until the next
+                // sample lands, so keying on it made "follow the teleport" a standing
+                // condition rather than a one-off (67 snaps on one hand at drift 0.0,
+                // 79 churn snaps/min). One teleport, one follow.
+                bool srcTeleport = teleportEdge;
+                // A WAITING stance has no chase to justify a warp - it only converges.
+                // An ENGAGED squad copy fights a target that is itself driven onto the
+                // owner's fight, so its drift is footwork, not a leave: only the big
+                // distance or a source teleport moves it (a sustained-drift warp mid-
+                // brawl resets the engine's fight just like a walk order does).
+                bool trueLeave = !hostWaiting &&
+                                 (drift > combatBigSnapDist_ || srcTeleport ||
+                                  (sustained && srcVel >= COMBAT_SNAP_VEL && !engagedSquad));
+                // The snap cooldown exists so a correction that CANNOT stick (mid-
+                // stagger, stale interp) does not re-fire every frame at a constant
+                // drift. A source TELEPORT is not that: it is a discrete, unambiguous
+                // event that cannot repeat at frame rate, and until we follow it the
+                // two screens are running the same fight in two places. mint_aggro
+                // measured the cost of pacing it - the host teleports the hostile
+                // squad from 450 u to 12 u, and the join's minted proxies were still
+                // fighting 211-306 u away, closing only one 3 s snap at a time.
+                if (trueLeave &&
+                    (srcTeleport || (now - d.combatSnapTick) >= COMBAT_SNAP_COOL_MS)) {
+                    engine::applyRaw(c, out);
+                    // Whatever the local AI was doing, it decided it at the OLD place:
+                    // the goal outlives the teleport and walks the copy straight back,
+                    // which is what turned one displacement into a standing one.
+                    if (srcTeleport) engine::clearGoals(c);
+                    d.combatSnapTick = now;
+                    d.combatOverTick = 0;
+                    d.haveDest = false; // position jumped: force a fresh slide dest
+                    // A SQUAD copy that was out of the fight when it was moved is
+                    // re-ordered on the next tick instead of after the backoff: the
+                    // teleport put it at its owner's spot, away from wherever its
+                    // local fight had drifted, and the pending backoff (up to 6 s)
+                    // left it standing there (hpf_after4: snaps at drift 23-27 u,
+                    // then 0 of the next 5 samples fighting, 4-6 s idle).
+                    if (isSquad && !localFighting && !hostWaiting)
+                        d.combatTick = now - COMBAT_REISSUE_MAX_MS;
+                    ++d.combatSnapCount; ++combatSnapTotal_;
+                    if (wrongLocalTgt) ++combatWrongTgt_;
+                    { char b[224]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] snap hand=%u,%u drift=%.1f srcVel=%.1f "
+                        "localFight=%d wrongTgt=%d arming=%d wait=%d seg=%lu n=%lu",
+                        out.hIndex, out.hSerial, drift, srcVel,
+                        localFighting ? 1 : 0, wrongLocalTgt ? 1 : 0,
+                        arming ? 1 : 0, hostWaiting ? 1 : 0,
+                        d.interp.lastSegMs(), d.combatSnapCount);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                } else if (drift > leaveBand && !(isSquad && (arming || engagedSquad))) {
+                    // Fast catch-up slide: speed scales with drift (~1 s to close),
+                    // clamped so a big gap glides quickly without a teleport. walkTo
+                    // floors sub-1 speeds to RUN, so small converges stay a walk.
+                    // Re-issue ONLY when the host pose moved past REISSUE_DIST since
+                    // the last slide dest: a per-frame walkTo restarts the path and
+                    // renders as stutter (the locomotion-drive lesson) - the exact
+                    // smoothness regression this throttle removes.
+                    float moved = d.haveDest
+                        ? dist3(out.x, out.y, out.z, d.dx, d.dy, d.dz)
+                        : (REISSUE_DIST + 1.0f);
+                    if (moved > REISSUE_DIST) {
+                        // Speed must EXCEED the source's own pace or a chase never
+                        // closes: the copy would trail at a fixed gap, stay over the
+                        // band, and eventually teleport (the maxPersist=9 driver at
+                        // N=40). Match the streamed locomotion speed and ADD a drift-
+                        // proportional catch-up, capped at 2.5x the source pace (the
+                        // locomotion-drive envelope), with COMBAT_SLIDE_MAX as a
+                        // floor so a stationary-source gap still closes quickly.
+                        float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
+                        float spd = base + drift;
+                        float cap = base * 2.5f;
+                        if (cap < combatSlideMax_) cap = combatSlideMax_;
+                        if (spd > cap) spd = cap;
+                        engine::walkTo(c, out.x, out.y, out.z, spd);
+                        ++combatSoftWalk_;
+                        if (isSquad && combatCopyDebug()) {
+                            char b[160]; _snprintf(b, sizeof(b) - 1,
+                                "[combat] walk hand=%u,%u drift=%.1f spd=%.1f localFight=%d arming=%d",
+                                out.hIndex, out.hSerial, drift, spd, localFighting ? 1 : 0,
+                                arming ? 1 : 0);
+                            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        }
+                        if (drift > combatSnapDist_) ++combatSlide_;
+                        d.haveDest = true; d.dx = out.x; d.dy = out.y; d.dz = out.z;
+                    }
+                } else {
+                    // Converged inside the leave band: release the slide dest so the
+                    // next genuine drift re-issues a fresh walk (and so a body that
+                    // exits combat doesn't inherit a stale combat destination).
+                    d.haveDest = false;
+                }
+            }
+            d.parked = false;
+            if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+            continue;
+        }
+        // Host no longer reports combat for this body. The stance rides the LOSSY
+        // entity batch and the engine's own combat read blips off mid-fight, so a
+        // short gap is NOISE: hold the fight (skip the rest-drive entirely) and
+        // only disarm - clearGoals + fall back to locomotion/rest - after a
+        // sustained combat-free window. Pre-debounce, every blip disarmed the copy
+        // (clearGoals), re-armed it next batch (another order), and the AI reset
+        // wandered it until the snap teleported it - the crowd artifact's second
+        // driver, alongside the waiting-stance re-issue loop.
+        // The hold is a bet that the fight is still on, and it costs a body that
+        // is driven by nothing at all for as long as it lasts: no order, no
+        // converge band, no park. A copy whose local AI picks its own enemy in
+        // that window is free to run, and at 5x it runs a long way. mint_aggro
+        // caught the whole shape - the host had 'Soo' idle at task 65535 with
+        // fight=0, while the join's minted copy of it charged 400 u at the join's
+        // own squad and only stopped when the census park teleported it back.
+        // Divergence is the tell a blip is not: a real gap in a real fight keeps
+        // the copy near the body it stands for. Past the true-leave distance,
+        // stop betting - disarm now and let the ordinary drive walk it home.
+        if (d.combatArmed) {
+            float heldDrift = haveActual
+                ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
+            if ((now - d.combatSeenTick) < COMBAT_DISARM_MS &&
+                heldDrift <= combatBigSnapDist_) {
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            }
+            if (heldDrift > combatBigSnapDist_) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[combat] hold BREAK hand=%u,%u drift=%.1f gap=%lums",
+                    out.hIndex, out.hSerial, heldDrift, now - d.combatSeenTick);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            d.combatArmed = false;
+            d.combatOrders = 0;
+            d.combatTgtIdx = 0; d.combatTgtSer = 0;
+            engine::clearGoals(c); // drop the stale attack goal before re-parking
+        }
+
+        // ---- Carried-body sync (protocol 18): carrier self-heal ----------------
+        // The reliable pickup/drop edges do the work; this repairs the losses.
+        // ANY driven carrier (squad member or host-streamed world NPC) streaming
+        // TASK_CARRY_BODY whose local copy is not carrying that body gets a
+        // throttled local pickup (a lost/failed pickup event, or the carried
+        // body resolved late). A local copy still carrying after the stream
+        // stopped reporting the carry (debounced - stance samples ride the lossy
+        // batch) gets a local drop. A SQUAD carrier then falls through to the
+        // ordinary locomotion drive: it walks like any squad member; the carried
+        // body follows its local attach. An NPC carrier with an ACTIVE local
+        // carry instead ends its tick here (early continue): the kinematic
+        // walk-drive/park/rest/trust paths below applyRaw-teleport and pose-
+        // inject, which rips the shoulder attach apart - its local AI keeps
+        // running (never reaches the AI-suspend add) so the carry walk animates,
+        // and a graded position band below keeps it tracking the host's path.
+        if (carrySync_) {
+            if (coop::taskIsCarry(out.task)) {
+                d.carryNoSeeTick = 0;
+                engine::CarryRead lcr;
+                bool haveCr = engine::readCarry(c, &lcr);
+                // The streamed subject is a WIRE key, and the carried body may
+                // be one we hold as a proxy (or under a re-containered hand):
+                // compare and pick up by the LOCAL hand of the body it maps to.
+                unsigned int ch[5] = { out.sType, out.sContainer,
+                                       out.sContainerSerial,
+                                       out.sIndex, out.sSerial };
+                {
+                    Key sk; sk.t = out.sType; sk.c = out.sContainer;
+                    sk.cs = out.sContainerSerial; sk.i = out.sIndex; sk.s = out.sSerial;
+                    Character* sb = bodyForKey(sk, 0, 0);
+                    unsigned int lh[5];
+                    if (sb && engine::readObjectHand(reinterpret_cast<RootObject*>(sb), lh))
+                        for (int hi = 0; hi < 5; ++hi) ch[hi] = lh[hi];
+                }
+                bool carryingRight = haveCr && lcr.carrying &&
+                                     lcr.carried[3] == ch[3] &&
+                                     lcr.carried[4] == ch[4];
+                if (haveCr && !carryingRight &&
+                    (now - d.carryHealTick) >= CARRY_HEAL_MS) {
+                    d.carryHealTick = now;
+                    bool ok = engine::applyPickup(gw, c, ch);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[carry] HEAL PICKUP carrier=%u,%u carried=%u,%u ok=%d",
+                        out.hIndex, out.hSerial, out.sIndex, out.sSerial,
+                        ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    // Refresh the read: a pickup that just landed must take the
+                    // NPC early-continue below THIS tick, not after one more
+                    // pass through the kinematic drive (which would rip it off).
+                    if (ok) haveCr = engine::readCarry(c, &lcr);
+                }
+                if (!isSquad && haveCr && lcr.carrying) {
+                    d.dbgRegime = DR_CARRIER;
+                    // NPC carrier with a live local attach: position band only.
+                    // Under the soft band the local carry walk owns the feet;
+                    // drifted past it, converge with a real walk (walkTo keeps
+                    // the carried body on the shoulder - move orders don't
+                    // release a carry); far gone, snap once on a cooldown.
+                    if (haveActual) {
+                        float drift = dist3(ax, ay, az, out.x, out.y, out.z);
+                        if (drift > COMBAT_SNAP_DIST &&
+                            (now - d.combatSnapTick) >= COMBAT_SNAP_COOL_MS) {
+                            engine::applyRaw(c, out);
+                            d.combatSnapTick = now;
+                            { char b[128]; _snprintf(b, sizeof(b) - 1,
+                                "[carry] npc snap hand=%u,%u drift=%.1f",
+                                out.hIndex, out.hSerial, drift);
+                              b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                        } else if (drift > COMBAT_SOFT_DIST) {
+                            engine::walkTo(c, out.x, out.y, out.z, 0.0f);
+                        }
+                    }
+                    d.parked = false; d.haveDest = false;
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    continue;
+                }
+            } else {
+                engine::CarryRead lcr;
+                if (engine::readCarry(c, &lcr) && lcr.carrying) {
+                    if (d.carryNoSeeTick == 0) {
+                        d.carryNoSeeTick = now;
+                    } else if ((now - d.carryNoSeeTick) > CARRY_DROP_MS) {
+                        d.carryNoSeeTick = 0;
+                        bool ok = engine::applyDrop(c, true);
+                        char b[144]; _snprintf(b, sizeof(b) - 1,
+                            "[carry] HEAL DROP carrier=%u,%u ok=%d",
+                            out.hIndex, out.hSerial, ok ? 1 : 0);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                } else {
+                    d.carryNoSeeTick = 0;
+                }
+            }
+        }
+
+        // AI-suspend decision is made BELOW, once we know whether this NPC is
+        // genuinely moving and whether the host has it node-anchored - node-sitters
+        // must keep their local AI so they can execute the node behavior.
+
+        // AI-gating spike: compare the join's LOCAL task for this NPC to the host's
+        // raw task. High agreement means the local AI is mostly doing the same
+        // thing the host is, so we could gate it (freeze on match / release on
+        // divergence) rather than replicate animation data. Logged, not acted on.
+        if (!isSquad) {
+            int localKey = engine::readTaskKey(c);
+            ++gateSamples_;
+            bool agree = (localKey == (int)out.rawTask);
+            if (agree) ++gateAgree_;
+            if (!agree && (now - gateLogTick_) > 2000) {
+                gateLogTick_ = now;
+                unsigned long pct = gateSamples_ ? (gateAgree_ * 100 / gateSamples_) : 0;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[gate] hand=%u,%u host=%u local=%d  agree=%lu/%lu (%lu%%)",
+                    out.hIndex, out.hSerial, (unsigned)out.rawTask, localKey,
+                    gateAgree_, gateSamples_, pct);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+
+            // ---- Step 4: divergence-gated authority (doctrine 18, flagged) -----
+            // A world NPC whose LOCAL AI has agreed with the host's raw task for a
+            // sustained streak while staying in position is TRUSTED: its own AI is
+            // provably doing what the host's is, so we stop suspending + driving
+            // it (fewer fights with the AI, graceful under latency). Divergence or
+            // drift revokes trust instantly and the normal drive re-engages this
+            // same tick. Bodies in host-reported combat/down never reach here
+            // (their branches continue earlier), so trust only governs the
+            // locomotion/rest regime.
+            if (gateAuthority_) {
+                float drift = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 1e9f;
+                bool inPos = (drift <= TRUST_DRIFT_MAX);
+                if (agree && inPos) {
+                    if (d.agreeStreak < 1000000u) ++d.agreeStreak;
+                } else {
+                    d.agreeStreak = 0;
+                }
+                if (d.trusted) {
+                    if (agree && inPos) {
+                        // Stay trusted: no suspend (set not re-added), no drive.
+                        if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                        continue;
+                    }
+                    d.trusted = false;
+                    ++trustRevokes_;
+                    d.parked = false; d.haveDest = false;
+                    d.taskApplied = false; d.taskBad = false; d.goalsCleared = false;
+                    { char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[trust] revoke hand=%u,%u reason=%s drift=%.1f",
+                        out.hIndex, out.hSerial, agree ? "drift" : "task", drift);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    // fall through: the normal drive re-engages below this tick
+                } else if (d.agreeStreak >= TRUST_STREAK_FRAMES) {
+                    d.trusted = true;
+                    ++trustGrants_;
+                    // Hand the body back to its own AI cleanly.
+                    d.parked = false; d.haveDest = false;
+                    d.taskApplied = false; d.taskBad = false; d.goalsCleared = false;
+                    { char b[112]; _snprintf(b, sizeof(b) - 1,
+                        "[trust] grant hand=%u,%u streak=%u",
+                        out.hIndex, out.hSerial, d.agreeStreak);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    continue;
+                }
+            }
+
+            // Probe the "inhabit" lever: the first time we see a diverged NPC,
+            // recruit it into the player squad ONCE (capped). If the lever works,
+            // it stops self-tasking and next tick resolves as isSquad => the proven
+            // squad drive path takes over (walkTo + addGoal), and [gate] for this
+            // hand should converge as its local AI goes idle.
+            if (probeRecruit_ && !agree && probedCount_ < 8) {
+                Key k = keyOf(out);
+                if (probed_.find(k) == probed_.end()) {
+                    probed_.insert(k);
+                    bool ok = engine::recruitNpc(gw, c);
+                    ++probedCount_;
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[probe] recruit hand=%u,%u host=%u local=%d ok=%d (#%u)",
+                        out.hIndex, out.hSerial, (unsigned)out.rawTask, localKey,
+                        ok ? 1 : 0, probedCount_);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+
+        // Newest received pose is the position authority while moving; the interp
+        // sample ('out') is the smoothed authority at rest. gapNewest measures how
+        // far the body trails the true host position.
+        EntityState newest;
+        float vx = 0.0f, vy = 0.0f, vz = 0.0f;
+        bool haveNewest = d.interp.latest(&newest, &vx, &vy, &vz);
+        float gapNewest = (haveActual && haveNewest)
+                              ? dist3(ax, ay, az, newest.x, newest.y, newest.z) : 0.0f;
+
+        // Genuine translation speed (estimated from the snapshot stream). For NPCs
+        // this - not the cMoving flag (which a fidget/turn sets in place) - decides
+        // walk-vs-rest, and the smoothness oracle uses the same notion of "active"
+        // so a correctly-held (parked) body is not counted as missed movement.
+        //
+        // Walk/rest DEBOUNCE (2026-07-11 choppiness fix): the instantaneous
+        // 2-sample velocity dips below NPC_MOVE_VEL at every sample-pair
+        // boundary of a walking source, so the raw classifier FLAPPED
+        // walk->rest->walk several times a second - each rest entry parks/
+        // halts the body, each walk re-entry restarts the path = the observed
+        // stutter. Hold the walking verdict for a fixed TIME after the last
+        // genuinely-moving sample instead: a walking source's dips are always
+        // shorter than the hold, a genuine stop enters rest ~1 s later.
+        // (A velPeak-based debounce was tried first and reverted same-day:
+        // the peak is magnitude-sensitive, so one teleport-artifact velocity
+        // spike in the stream - srcVel 90-150 u/s on a seg snap - held a
+        // genuinely SEATED divergent NPC in the walk branch for ~7 s per
+        // spike, hard-snapping every frame; spawn_far run 124346.)
+        // The floor is what a NEAR-tier body gets, and it only has to outlast a
+        // sample-boundary dip: at ~50 ms segments a 1000 ms floor is 20x longer
+        // than needed, and every millisecond past the dip is hold that outlives a
+        // real stop (holdStop - the visible idle jitter). The cadence scaling below
+        // still gives sparse mid-tier bodies their drought protection.
+        // A/B toggle (2026-08-01): 1000 restores the pre-fix arm.
+        const unsigned long NPC_MOVE_HOLD_MS = 300;
+        // Phase 2 mid-band tier: the per-entity stream cadence. Near-tier
+        // bodies see ~50 ms segments; a round-robin mid-tier body sees the
+        // rotation period (~500 ms +, growing with the mid population). The
+        // walk-hold and the lead point both scale with it, so a sparsely
+        // sampled walker neither flips to rest between samples nor reaches
+        // its lead point and idles waiting for the next one. Cadence = the
+        // LARGER of the newest segment and the smoothed inter-arrival EMA:
+        // the newest segment alone reads ~50 ms whenever the 1 Hz census
+        // rebuild reshuffles the rotation and a hand lands two slices in a
+        // row (run 105155: mid bodies misclassified as near-tier, dragging
+        // their sparse-stream rendering into the near gates).
+        unsigned long segMs = d.interp.lastSegMs();
+        {
+            unsigned long avgMs = (unsigned long)d.interp.avgInterval();
+            if (avgMs > segMs) segMs = avgMs;
+        }
+        unsigned long moveHold = NPC_MOVE_HOLD_MS;
+        if (segMs * 5 > moveHold) moveHold = segMs * 5; // survive sample droughts
+        if (moveHold > 5000) moveHold = 5000;
+        float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
+        d.dbgGap = gapNewest; d.dbgVlen = vlen; d.dbgHaveNewest = haveNewest;
+        if (haveNewest) { d.dbgNx = newest.x; d.dbgNy = newest.y; d.dbgNz = newest.z; }
+        // Consensus sim paused (protocol 25 speed SET 0). Nothing local moves -
+        // neither our walk orders nor, measurably, our teleports: the
+        // 2026-10-17 Steam session hard-snapped 'Plank' every frame for 5 s of
+        // pause (snapSq 2 -> 794) at a CONSTANT gap of 39.5 u, while the owner's
+        // frozen stream kept reporting cSpeed=71.6 / currentlyMoving. The drive
+        // holds still while paused (see the hold below) and the snap gate's
+        // velocity peak stops decaying, so unpausing resumes where it stopped.
+        bool simPaused = speedLastSet_ >= 0.0f && speedLastSet_ <= 0.01f;
+        // Peak decays with a ~1 s half-life of WALL time. It decayed 1% per
+        // frame ("~1 s at 75 fps"), which is 0.6 s at 120 fps and kept
+        // collapsing the gate to the snapDist floor during a pause.
+        {
+            unsigned long vdt = (d.velPeakMs != 0) ? (now - d.velPeakMs) : 0;
+            d.velPeakMs = now;
+            if (vlen > d.velPeak) d.velPeak = vlen;
+            // A squad copy's peak is frozen while its owner is halted (MoveSync
+            // 2026-10-18): the gate must not collapse under a body still walking
+            // in to the stop point.
+            else if (!simPaused && vdt > 0 && (!isSquad || hostMoving))
+                d.velPeak *= std::pow(0.5f, (float)vdt / 1000.0f);
+        }
+        if (haveNewest && vlen > NPC_MOVE_VEL) d.moveSeenMs = now;
+        bool npcMoving = haveNewest && d.moveSeenMs != 0 &&
+                         (now - d.moveSeenMs) <= moveHold;
+        // This hold is what the idle march-in-place costs: while it runs the drive
+        // stays in the walk branch and keeps walk-ORDERING a body that has already
+        // arrived, so the engine holds currentlyMoving with no translation - what
+        // the march oracle counts. marchFrac went from ~0.000 to 0.05-0.36 across
+        // EVERY scenario the afternoon the hold replaced the instantaneous
+        // classifier (2026-07-11, bracketed to 14:33-14:40 by leader_move
+        // 0.001 -> 0.192), and the oracle note further down was written knowing
+        // the hold "keeps the drive in the walk branch through source stops" -
+        // it re-scored zeroFrac around that instead, which hid the cost from
+        // smoothness but left the body visibly marching.
+        //
+        // But most of that marchFrac is the ORACLE disagreeing with this debounce,
+        // not a visible defect. The holdDip/holdStop split (see the counter decls)
+        // measured 86-93% of march frames as holdDip across leader_move / npc_sync
+        // / craft_order: the source is genuinely WALKING, a fast sample landed
+        // within 200 ms, and the instantaneous velocity is in the sample-boundary
+        // dip this hold exists to bridge - while the oracle calls the host "at
+        // rest" on that same instantaneous velocity. Only holdStop (the hold
+        // outliving a real stop) is the visible idle jitter, and it runs
+        // 310-505 frames per run = ~0.013-0.019 of rest samples, against the
+        // pre-hold marchFrac of ~0.001. So the real regression is ~13-19x, an
+        // order of magnitude smaller than marchFrac reports.
+        //
+        // Two consequences before touching this code. First, marchFrac cannot
+        // judge a fix here - holdStop is the signal; a source-displacement stop
+        // detector (0.5 u / 500 ms) was tried on 2026-08-01 and reverted after an
+        // interleaved A/B (5 clean runs/arm) moved marchFrac the WRONG way
+        // (leader_move 0.095 -> 0.100, npc_sync 0.087 -> 0.142) - it can only ever
+        // touch the ~13% holdStop slice, and dip noise swamped it. Second, single
+        // runs cannot judge anything here: marchFrac spans 0.046-0.183 WITHIN one
+        // arm, so fewer than ~5 runs per arm just reports the last run.
+        // Mid-tier body = sparse stream cadence (the round-robin period).
+        // Its drive shares the near-tier code below, but its counters/oracles
+        // are tracked apart: the near-tier gates guard the validated 20 Hz
+        // pipeline, the mid tier is judged by the anti-zombie oracle.
+        bool midTier = !isSquad && segMs > 250;
+        if (midTier) d.midSeenMs = now;
+        if (!isSquad) {
+            if (d.wasMoving && !npcMoving) {
+                if (midTier) ++restFlipMid_;
+                else         ++restFlipNpc_;
+            }
+            d.wasMoving = npcMoving;
+        }
+
+        // Velocity-aware hard-snap gate (2026-07-11 rubber-banding fix). The
+        // walk-drive's natural trailing distance behind 'newest' scales with the
+        // source's WALL-CLOCK speed (render delay + batch cadence are time, not
+        // distance): a sprinter at ~50 u/s trails ~8-9 u in steady state, which
+        // sat exactly on the old fixed 8 u gate ([snap] measured gap=8.6 with
+        // srcVel~50 repeatedly), and any game-speed multiplier scales measured
+        // velocity the same way (5x turned the gate into a per-sample teleport).
+        // Gate on TIME behind the source instead - snap only when the body
+        // trails by more than snapSeconds_ of travel. Two hardenings from the
+        // fast_march validation run:
+        //   * the velocity estimate is a slow-decaying PEAK (~1 s half-life),
+        //     not the instantaneous sample - a source stopping at a leg end
+        //     deflated the gate to the floor while the body was still tens of
+        //     units out, turning every stop into a teleport;
+        //   * the distance floor scales with the consensus game speed - at 5x
+        //     every trailing distance is 5x in world units for the same time
+        //     lag, and burst onsets outrun the engine's real max locomotion
+        //     speed for a moment regardless of the commanded catch-up.
+        // (velPeak itself is updated above, where the walk/rest debounce
+        // shares it.)
+        float multEff = (speedLastSet_ > 1.0f) ? speedLastSet_ : 1.0f;
+        float snapGate = snapDist_ * multEff;
+        // The trailing allowance grows with the stream cadence (Phase 2
+        // mid-band tier): against ~500 ms+ samples the body legitimately
+        // trails newest by a full segment of source travel (the lead point
+        // it walks toward was computed a segment ago), so the near-tier
+        // allowance hard-snapped mid walkers chronically (run 103044: 4,259
+        // teleports in 30 s, 'Dust Boss' at gap 20-40 u vs gate 18-25 all
+        // run).
+        float gateSec = snapSeconds_ + (float)segMs / 1000.0f;
+        if (gateSec > 2.5f) gateSec = 2.5f;
+        if (d.velPeak * gateSec > snapGate) snapGate = d.velPeak * gateSec;
+
+        // Mid-tier bodies are only DRIVEN while the host copy genuinely moves
+        // (Phase 2): a stationary far NPC goes back to its own local AI and
+        // the census-park divergence fallback - the pre-mid-tier regime.
+        // Driving all ~36 census-band bodies at once starved Kenshi's own
+        // character-update budget and the whole town rendered stepwise
+        // (run 112835: near-tier walkers at zeroFrac 0.63 vs the 0.33
+        // baseline; snap storms at every host stop because the drive
+        // trailed farther). Movers stay driven - the anti-zombie fix - and
+        // the release also skips the AI suspend below, so the local AI can
+        // idle the body naturally between host movements.
+            if (!isSquad && midTier && !npcMoving) {
+                drivenChars_.erase(c);
+                drivenSeen_.erase(c); // wide pass may census-park it again
+                d.parked = false; d.haveDest = false;
+                d.taskApplied = false; d.issuedTask = TASK_NONE;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                lifeSet(it->first, LIFE_PARKED, "mid-rest");
+                debugMark(c, 2, lifeName(LIFE_PARKED));
+                continue;
+            }
+
+        // Lifecycle: a body that stays driven past the release checks lives
+        // in the HI (20 Hz) or MID (round-robin) tier by its stream cadence,
+        // with a 10 s hold toward MID so cadence jitter at the tier boundary
+        // doesn't flap the record (run 145113 baselined a 3 s hold: boundary
+        // bodies flapped HI<->MID ~100x/run - classification noise, not tier
+        // changes; and the pre-release placement double-logged every
+        // stationary mid body PARKED<->MID each tick). PCs classify HI
+        // permanently - their 20 Hz stream never opens a mid-sized segment
+        // (Phase 3: PCs and NPCs share this record, the drive below, and
+        // the classifier).
+        {
+            bool midish = midTier ||
+                          (d.midSeenMs != 0 && (now - d.midSeenMs) < 10000);
+            int st = (!isSquad && midish) ? LIFE_MID : LIFE_HI;
+            lifeSet(it->first, st, "drive");
+            debugMark(c, st == LIFE_MID ? 3 : 0, lifeName(st));
+        }
+
+        // AI-suspend: for any body we DRIVE from the peer's stream, suspend its
+        // AI decision layer (faction-safe) so it stops self-tasking but keeps
+        // animating. The peer's stream is the sole task authority; the body holds
+        // + animates its current/injected action instead of the AI re-deciding
+        // every tick. (Releasing node-anchored sitters to local AI was tried -
+        // Idea I4 - and regressed: the freed AI wandered them off-host,
+        // CROSSCHECK 0.5, and it still did not reliably sit them. So we suspend
+        // uniformly.)
+        //
+        // Phase 1b: this now covers driven SQUAD members too (dropped the old
+        // !isSquad gate). A peer-owned squad FOLLOWER (e.g. a recruit, or a unit
+        // transferred into the peer's tab) otherwise self-tasks "follow my local
+        // leader" at walk speed while the walk-drive simultaneously issues the
+        // owner's run-speed move order - the two fight, giving the slow-follow +
+        // periodic-snap artifact (manual 2026-07-17: Dust Bandit). Suspending it
+        // lets the walk-drive alone own the motion, so it reproduces the owner's
+        // run cleanly. A driven squad LEADER has nothing to follow, so the
+        // suspend is a no-op for it (leaders already rendered correctly). All
+        // bodies here are peer-owned (applyTargets only drives what we do NOT
+        // own), so this never quiets a locally-controlled character; the set is
+        // rebuilt every tick, so it self-clears the instant ownership flips back.
+        if (aiSuspend_) engine::addAiSuspend(c);
+
+        // Squad settle (MoveSync 2026-10-17). A PC copy classified moving on the
+        // owner's instantaneous flags, so the tick the owner stopped it entered
+        // the rest branch and PARKED (halt + teleport) at the interpolated pose -
+        // which renders a render-delay behind the stop point (~150 ms x run speed
+        // = 10 u at a run), while the walk-drive had the body at or past it: a
+        // visible jump back at every stop, then a per-frame re-place slide
+        // forward. Keep walking the body to the stop point until the render pose
+        // has caught up AND the body is there, bounded so a blocked body still
+        // settles. Beds keep their anchored rest path (see taskIsBedPose above).
+        bool squadSettle = false;
+        if (isSquad && !hostMoving && !crawling && haveNewest && haveActual &&
+            !engine::taskIsBedPose((int)out.task)) {
+            if (d.settleSinceMs == 0) d.settleSinceMs = now;
+            bool renderBehind = dist3(out.x, out.y, out.z,
+                                      newest.x, newest.y, newest.z) > SQUAD_SETTLE_DIST;
+            bool bodyAway = gapNewest > WALK_ARRIVE_DIST && !d.walkHalted;
+            // The settle cap is a SAFETY bound for a blocked body, not a
+            // schedule: a copy 60-100 u behind at the halt needs 1.5-3 s at a
+            // run to walk in; ending earlier fell through to the rest-path
+            // park (a teleport). Measured 2026-10-18 move_legs.
+            if ((renderBehind || bodyAway) &&
+                (now - d.settleSinceMs) < SQUAD_SETTLE_MAX_MS) {
+                squadSettle = true;
+                ++sqSettle_;
+            }
+        } else if (hostMoving) {
+            d.settleSinceMs = 0;
+        }
+        // Re-arm rest-pose reproduction whenever the body is genuinely moving, so
+        // the next time it stops we re-evaluate the host's (possibly new) task.
+        bool genuinelyMoving = isSquad ? (hostMoving || squadSettle) : npcMoving;
+        if (genuinelyMoving) {
+            // Seat-break (2026-07-11): a rest pose applyRest committed is a
+            // PLAYER-RANK order, and a seated body both ignores goal-level
+            // movement and re-places itself at the fixture - applyRaw
+            // teleports NO-OP on it (spawn_far run 124346: 'Bar Thug' hard-
+            // snapped every frame at constant gap=343 while locally still
+            // task=87). When the host copy starts moving, flush the order by
+            // issuing the walk through the player move-order path once.
+            if (!isSquad && haveNewest &&
+                (d.taskApplied || d.issuedTask != TASK_NONE)) {
+                float spd = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
+                engine::walkTo(c, newest.x, newest.y, newest.z, spd);
+                d.haveDest = true; d.dx = newest.x; d.dy = newest.y; d.dz = newest.z;
+                char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "[interp] seat-break hand=%u,%u task=%u",
+                    out.hIndex, out.hSerial, (unsigned)d.issuedTask);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            d.taskApplied = false; d.taskBad = false; d.issuedTask = TASK_NONE;
+            d.taskNoneTick = 0;     // movement already released the task; clear the streak
+            d.goalsCleared = false; // next rest episode gets one fresh goal-clear
+        }
+
+        // ---- Unified drive (Phase 3): one walk/rest/snap path for PCs and
+        // NPCs. The kinds differ by POLICY, not code:
+        //   * moving CLASSIFIER - a PC body is inert when uncontrolled, so
+        //     the host's cMoving flag is trustworthy; an NPC's flag flaps on
+        //     fidgets/turns, so NPCs classify by debounced stream VELOCITY
+        //     (npcMoving, the walk-hold above). Both feed the same tree.
+        //   * SNAP permission - PCs keep the validated instant absolute gate
+        //     (the other player's characters are the user-facing rubber
+        //     banding; falling behind must reconcile immediately). NPCs are
+        //     divergence-gated at 3x the velocity-scaled gate (run 115656:
+        //     a max-speed chase holds a STABLE trailing gap catch-up can
+        //     never close - re-snapping it every few hundred ms was the
+        //     storm; a stable trail is faithful-if-late rendering, and every
+        //     genuine warp measured >= 3x anyway), with the mid-tier
+        //     cooldown on top (far teleports routinely fail to stick - seat
+        //     anchors, unloaded terrain - and must not re-fire per frame).
+        //   * at REST - both kinds reproduce the host's pose via applyRest
+        //     (per-kind inside: squad members are never town-AI-detached).
+        // Walk mechanics are IDENTICAL: lead-point walk along the source
+        // velocity (cadence-adaptive - at 20 Hz the fixed 0.6 s lead PCs
+        // were validated with; stretched to 1.5 stream segments against
+        // sparse mid-tier samples so the body never idles between them),
+        // gap-proportional catch-up speed capped at 2.5x, re-issued only
+        // when the lead point moves (per-frame re-issue = path-restart
+        // stutter). No clearGoals while walking: the HIGH_PRIORITY move
+        // order already overrides AI movement, and clearGoals would CANCEL
+        // our destination. removeFromUpdateList is never used: it freezes
+        // the movement controller (walk + teleport both no-op).
+        bool snapOk;
+        if (isSquad) {
+            // Cooldown (MoveSync): a squad snap that did not stick (paused sim,
+            // seat anchor, unloaded ground) re-fired EVERY frame - 600+ teleports
+            // in 5 s on the 2026-10-17 session. Between snaps the catch-up walk
+            // converges; a source teleport (segment snap edge) is never deferred.
+            bool cooling = d.sqSnapMs != 0 && (now - d.sqSnapMs) < SQUAD_SNAP_COOL_MS;
+            // Squad snap floor (MoveSync 2026-10-18). The velocity-scaled gate
+            // (velPeak x ~0.75 s) sat right at the copy's ordinary trail: in
+            // move_legs every squad snap was gap ~= gate (25-105 u) while the
+            // walk-drive was still closing it - a visible teleport for a body
+            // that would have walked in. A squad body now snaps only for a
+            // genuine desync (> SQUAD_SNAP_MIN_DIST, scaled by game speed) or
+            // a source teleport edge; anything less is walked in at catch-up
+            // speed (and the settle keeps it walking after the owner halts).
+            float sqFloor = SQUAD_SNAP_MIN_DIST * multEff;
+            if (snapGate < sqFloor && !teleportEdge) snapGate = sqFloor;
+            snapOk = haveNewest && (!cooling || teleportEdge);
+            if (haveNewest && !snapOk && !simPaused && genuinelyMoving && haveActual &&
+                gapNewest > snapGate)
+                ++sqSnapCool_;
+            if (squadDriveDebug() && haveActual && haveNewest) {
+                char b[256]; _snprintf(b, sizeof(b) - 1,
+                    "[sqdrv] hand=%u,%u gap=%.1f gate=%.1f srcVel=%.1f peak=%.1f mv=%d "
+                    "settle=%d halted=%d body=%.1f,%.1f new=%.1f,%.1f out=%.1f,%.1f tpe=%d",
+                    out.hIndex, out.hSerial, gapNewest, snapGate, vlen, d.velPeak,
+                    hostMoving ? 1 : 0, squadSettle ? 1 : 0, d.walkHalted ? 1 : 0,
+                    ax, az, newest.x, newest.z, out.x, out.z, teleportEdge ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        } else {
+            // (A grow-vs-own-EMA ratio trigger was tried for the divergence
+            // gate first and kept firing on melee-lunge jitter - srcVel 0,
+            // gap hopping 30% within a couple frames, 10-14 snaps/min in
+            // npc_sync run 123101. Marginal trailing under the 3x bound
+            // converges through the catch-up walk; a stopped source heals
+            // through the rest-path park.)
+            snapOk = gapNewest > snapGate * 3.0f &&
+                     (!midTier || (now - d.npcSnapTick) >= NPC_SNAP_COOL_MS);
+        }
+        // ---- Squad glide (source outruns its own gait) -----------------------
+        // While the join's clock catches up to the host's (timeSlew up to 2x on
+        // the join after loading in with a clock skew) its characters run at their
+        // normal gait in GAME time but cover up to twice the ground per WALL
+        // second. The copy on the other screen walks at that normal gait - the
+        // engine will not run a player character faster than its max speed - so
+        // it fell ~65 u/s behind and hard-snapped at the 150 u gate: move_legs
+        // under 120 ms netsim measured srcSpd=135 vs cSpeed=71 and 10 squad snaps
+        // in the 22 s the join spent at slew=2.00, none after. The owner's own
+        // speed (cSpeed) is per GAME second, the stream's velocity per WALL
+        // second, so their ratio names this case directly. Then the copy follows
+        // the interpolated path frame by frame with the gait mirrored - the crawl
+        // drive's placement - instead of trailing and teleporting.
+        // Gated on a SUSTAINED excess at running pace: during a start or stop
+        // the interpolated velocity lags the owner's instantaneous speed, which
+        // read as a false ratio at cSpeed 10-24 (glide entered on every leg).
+        bool srcFast = isSquad && out.cSpeed > GLIDE_MIN_SPEED &&
+                       vlen > out.cSpeed * GLIDE_SPEED_RATIO;
+        if (!srcFast) d.glideFastSinceMs = 0;
+        else if (d.glideFastSinceMs == 0) d.glideFastSinceMs = now;
+        if (srcFast && (now - d.glideFastSinceMs) >= GLIDE_SUSTAIN_MS)
+            d.glideUntilMs = now + GLIDE_HOLD_MS;
+        // The mirror case on the slewing side itself: while OUR sim runs at a
+        // catch-up rate, a walked copy of the other player's character covers
+        // timeSlew_ x its gait per wall second and overruns/trails the stream
+        // (move_legs mg1: 3 join-side squad snaps at slew 1.76-2.00).
+        if (isSquad && (timeSlew_ > 1.0f + GLIDE_SLEW_BAND || timeSlew_ < 1.0f - GLIDE_SLEW_BAND))
+            d.glideUntilMs = now + GLIDE_HOLD_MS;
+        // Symptom fallback: the owner runs, the gap is open, and our copy has not
+        // moved for GLIDE_STALL_MS although the walk drive keeps ordering it. Seen
+        // after a shoulder carry + drop (the field report's frozen copy ending in
+        // 150 u snaps), after a KO, and right after a glide episode; the cause is
+        // not known yet. Placement does not depend on the copy accepting move
+        // orders, so hand it to the glide until the owner stops. Reads only our
+        // own position and the stream - never the mirrored locomotion fields.
+        if (isSquad && !d.glideActive && haveActual && vlen > GLIDE_MIN_SPEED &&
+            gapNewest > GLIDE_STALL_GAP) {
+            float sdx = ax - d.glideStallX, sdz = az - d.glideStallZ;
+            if (d.glideStallSinceMs == 0 || sdx * sdx + sdz * sdz > GLIDE_STALL_MOVE * GLIDE_STALL_MOVE) {
+                d.glideStallX = ax; d.glideStallZ = az; d.glideStallSinceMs = now;
+            } else if ((now - d.glideStallSinceMs) >= GLIDE_STALL_MS) {
+                d.glideUntilMs = now + GLIDE_HOLD_MS;
+                d.glideStallSinceMs = 0;
+                ++glideStallEnters_;
+            }
+        } else {
+            d.glideStallSinceMs = 0;
+        }
+        // Once gliding, stay in it until the owner stops: handing a running copy
+        // back to the walk drive mid-run left it ignoring move orders for 4-5 s
+        // after a long placement episode (move_legs: body frozen with reissueSq
+        // climbing, then a 150 u snap). A stop is a clean hand-off - the rest
+        // path places the body anyway.
+        if (d.glideActive && genuinelyMoving)
+            d.glideUntilMs = now + GLIDE_HOLD_MS;
+        // Never glide a CARRIER: per-frame placement of a body with someone on
+        // its shoulder tears the carried body's attach apart (the reason NPC
+        // carriers early-continue in the carry block above). Field log 23:57:33-42:
+        // the join's copy carrying the host's character entered glide via the
+        // stall fallback mid-carry. A carrier stays on the walk drive; the
+        // physics restore above keeps it able to walk.
+        bool carrierNow = coop::taskIsCarry(out.task);
+        if (!carrierNow) {
+            engine::CarryRead gcr;
+            carrierNow = engine::readCarry(c, &gcr) && gcr.carrying;
+        }
+        if (carrierNow) { d.glideUntilMs = 0; d.glideStallSinceMs = 0; }
+        // Config::glide (KENSHICOOP_GLIDE / coop_config.json "glide") = 0: walk
+        // drive + snap gate only.
+        bool squadGlide = glide_ && isSquad && !carrierNow && d.glideUntilMs != 0 &&
+                          (long)(d.glideUntilMs - now) > 0;
+        if (!squadGlide && d.glideActive) {
+            d.glideActive = false;
+            d.haveDest = false;                 // walk resumes with a fresh order
+            char b[128]; _snprintf(b, sizeof(b) - 1, "[glide] exit hand=%u,%u frames=%lu",
+                                   out.hIndex, out.hSerial, d.glideFrames);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (simPaused) {
+            // Paused consensus sim: hold. No snap, walk order, park or pose
+            // apply - none of them take effect until the sim runs again, and the
+            // per-frame retries were the snap storm above. Unpausing resumes the
+            // drive from the live state on the next tick.
+            ++pauseHold_;
+            d.dbgRegime = DR_PAUSED;
+        } else if (squadGlide && genuinelyMoving && haveActual) {
+            if (!d.glideActive) {
+                d.glideActive = true; d.glideFrames = 0;
+                engine::haltMovement(c);        // no walk order fighting the placement
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[glide] enter hand=%u,%u srcVel=%.1f cSpeed=%.1f slew=%.2f gap=%.1f",
+                    out.hIndex, out.hSerial, vlen, out.cSpeed, timeSlew_, gapNewest);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            ++d.glideFrames; ++glideFrames_;
+            d.dbgRegime = DR_GLIDE;
+            // Placement moves CharMovement::pos (nameplate) but the MODEL is
+            // rendered from the physics character: without one the mesh stays
+            // where the controller died - the field report's frozen model with a
+            // wandering nameplate after a put-down. Same repair as the crawl drive.
+            if (!engine::hasPhysicsBody(c) && engine::restoreMovement(c)) {
+                ++physHeal_;
+                char b[128]; _snprintf(b, sizeof(b) - 1, "[glide] PHYS restore hand=%u,%u",
+                                       out.hIndex, out.hSerial);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            engine::applyRaw(c, out);
+            engine::applyMotion(c, true, out.cSpeed, out.cMotionX, out.cMotionY, out.cMotionZ);
+            engine::applyPhysMotion(c, out.cMotionX, out.cMotionY, out.cMotionZ, out.cSpeed);
+            d.parked = false; d.haveDest = false;
+        } else if (genuinelyMoving && haveActual && gapNewest > snapGate && snapOk) {
+            // Fell behind / source warped: hard-snap to the true position
+            // (no-halt teleport keeps the clip phase advancing).
+            engine::applyRaw(c, newest);
+            d.dbgRegime = DR_SNAP;
+            if (isSquad) {
+                ++hardSnapSquad_;
+                d.sqSnapMs = now;
+                logHardSnap(c, out, "squad", gapNewest, vlen, snapGate, d.haveDest);
+            } else {
+                // Accounting: a snap on a YOUNG ring (< 16 samples, ~0.8 s of
+                // 20 Hz coverage) is the one-time divergence reconciliation
+                // of a newly / re-acquired body (Phase 2 replaces the census
+                // park with it) - classed with the mid counter so the
+                // snap-rate gate keeps measuring steady-state tracking only.
+                // A recent mid->near handoff (raid entering the 20 Hz
+                // bubble) is the same reconciliation debt: divergence
+                // accrued under sparse mid coverage, paid with one snap
+                // right after the cadence flips near (run 123101: 'Fuu' gap
+                // 407 on a 20 Hz-classed ring whose history was mid-band).
+                // The clock-slew catch-up window is the same class again:
+                // while timeSlew_ != 1 the join sim runs at a different
+                // wall-clock rate than the host stream, so every divergent
+                // copy legitimately needs reconciliation teleports - the
+                // smoothness oracle already excludes those frames for the
+                // same reason (run 150302: coop_presence spent its whole 25 s
+                // at slew=2.00 and 4 session-start catch-up snaps tripped
+                // the steady-state npc gate).
+                bool slewing = timeSlew_ < 0.99f || timeSlew_ > 1.01f;
+                bool coverage = d.interp.samples() < 16 ||
+                                (d.midSeenMs != 0 && (now - d.midSeenMs) < 5000) ||
+                                slewing;
+                if (midTier || coverage) ++hardSnapMid_;
+                else                     ++hardSnapNpc_;
+                d.npcSnapTick = now;
+                logHardSnap(c, out,
+                            midTier ? "mid" : (coverage ? "cover" : "npc"),
+                            gapNewest, vlen, snapGate, d.haveDest);
+            }
+            d.parked = false; d.haveDest = false;
+        } else if (genuinelyMoving && crawling) {
+            d.dbgRegime = DR_CRAWL;
+            // ---- Crawl drive (protocol 53) --------------------------------------
+            // A crawler obeys no move-order: the engine will not locomote a body
+            // that reports Character::isDown(), so the walkTo below is issued and
+            // silently does nothing (run 20260805_153425: the interp measured
+            // zero=1206 of active=1209 driven ticks moving the body 0 units, while
+            // the streamed mv/cSpeed mirror landed and played the crawl clip - the
+            // body crawled in place as its owner crawled away). So this regime
+            // drives the body itself, in the three parts the engine keeps separate.
+            //
+            // 1. The physics character it is RENDERED from. The engine destroys it
+            // on collapse and re-creates it on recovery; an AI-suspended copy never
+            // runs that recovery, so it is left without one - measured as hk=0 for
+            // 95 of the copy's samples against exactly the 5 the OWNER spent in
+            // PS_KO. Placing such a body moves CharMovement::pos (so getPosition,
+            // the nametag and every position oracle track) while the mesh stays
+            // where the controller died.
+            if (!engine::hasPhysicsBody(c) && engine::restoreMovement(c)) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[prone] CRAWL-PHYS restore hand=%u,%u", out.hIndex, out.hSerial);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ++crawlPhysRestore_;
+            }
+            // 2. The PLACEMENT, per tick against the interpolated sample, which is
+            // what makes the follow smooth (gap 0.25 u, zeroFrac 0.008) rather than
+            // a gap-triggered teleport. applyRaw is the no-halt placement, so it
+            // does not reset the clip phase.
+            // CharMovement::manualMovement was tried here first, on the theory that
+            // asking the engine to MOVE the body would let physics, mesh and
+            // animation all follow from one act. It moved nothing: the copy's
+            // physics velocity stayed at zero and the body only advanced on the
+            // reconciliation teleports, which cost gap 0.25 -> 2.22 u and failed
+            // the smoothness gate (run 20260805_164254). A body the local AI is
+            // suspended on does not consume a desired motion.
+            engine::applyRaw(c, out);
+            // 3. The MOTION, mirrored at BOTH layers, because they answer to
+            // different consumers. applyMotion's CharMovement fields drive an
+            // upright copy's walk/run selection; a crawler's clip instead advances
+            // on its physics character's motion, which a PLACED body never has -
+            // that is the "slides along the ground frozen" half, and it is the same
+            // fact as the earlier "animates but cannot move" half seen from the
+            // other side (that body had no physics character for the clip to read,
+            // so the mirror alone drove it).
+            if (isSquad)
+                engine::applyMotion(c, true, out.cSpeed,
+                                    out.cMotionX, out.cMotionY, out.cMotionZ);
+            engine::applyPhysMotion(c, out.cMotionX, out.cMotionY, out.cMotionZ,
+                                    out.cSpeed);
+            // No destination is outstanding: clear it so a body that HEALS back
+            // upright re-issues a fresh walk target instead of inheriting a stale
+            // lead point from before it was crippled.
+            d.parked = false; d.haveDest = false;
+            if (!d.crawlDrive) {
+                d.crawlDrive = true;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[prone] CRAWL-DRIVE enter hand=%u,%u spd=%.2f",
+                    out.hIndex, out.hSerial, (double)out.cSpeed);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        } else if (genuinelyMoving) {
+            d.dbgRegime = carrierNow ? DR_CARRIER : DR_WALK;
+            float tx = newest.x, ty = newest.y, tz = newest.z;
+            // Lead only while the instantaneous velocity is meaningful: the
+            // debounced classifier keeps the walk verdict through mid-walk
+            // velocity dips (vlen ~ 0), where a lead projection would
+            // divide by zero - aim at the newest position instead.
+            if (vlen > 0.01f) {
+                float leadSec = LEAD_SECONDS;
+                float segSec  = (float)segMs / 1000.0f * 1.5f;
+                if (segSec > leadSec) leadSec = segSec;
+                if (leadSec > 3.0f)   leadSec = 3.0f;
+                float lead = vlen * leadSec;
+                tx += vx / vlen * lead; ty += vy / vlen * lead; tz += vz / vlen * lead;
+            }
+            float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
+                                     : (REISSUE_DIST + 1.0f);
+            // Re-issue stays keyed on the target having MOVED, including after a
+            // cancel. Re-issuing the moment the source's velocity crosses back over
+            // the threshold was tried and is worse: with no hysteresis a source
+            // hovering near NPC_MOVE_VEL alternates cancel and re-order frame by
+            // frame, and each re-order restarts the locomotion so the body never
+            // builds speed (zeroFrac 0.388 -> 0.474 on leader_move). Waiting for a
+            // metre of target movement is the hysteresis.
+            bool sourceMoving = vlen > NPC_MOVE_VEL;
+            // Catch-up speed, low-passed per body (MoveSync). It was computed
+            // only on a re-issue, from gapNewest - which saw-tooths by a whole
+            // sample step (3.5 u at a run) every 50 ms - and for a squad body the
+            // locomotion mirror below then overwrote desiredSpeed with the
+            // source's plain speed in the same tick, so a PC copy that lost
+            // ground could never win it back: it trailed until the velocity gate
+            // teleported it (the 2026-10-17 session: gap 57 u at srcVel 69).
+            float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
+            // Settling squad copy (owner halted, body still short of the stop
+            // point): cSpeed is 0, which used to cap the walk-in at 30 u/s from
+            // the 12 u/s fallback. Walk in at the owner's last running pace
+            // (velPeak is frozen while the owner is halted).
+            if (isSquad && !hostMoving && d.velPeak > base) base = d.velPeak;
+            float wantSpd = out.cSpeed + gapNewest * catchupK_;
+            if (wantSpd > base * 2.5f) wantSpd = base * 2.5f;
+            unsigned long ddt = (d.driveMs != 0) ? (now - d.driveMs) : 0;
+            d.driveMs = now;
+            if (ddt == 0 || ddt > 250 || !d.walkBranchPrev) {
+                d.catchSpd = wantSpd;
+            } else {
+                float a = (float)ddt / CATCHUP_FILTER_MS;
+                if (a > 1.0f) a = 1.0f;
+                d.catchSpd += (wantSpd - d.catchSpd) * a;
+            }
+            // Re-issue threshold. Each walkTo on a PC copy is a player move
+            // order (Character::setDestination) that re-plans the path, and at
+            // a run the lead point crosses the flat 1 u every sample - 14 path
+            // restarts/s measured (reissueSq 130 -> 420 in 35 s). Scale it with
+            // the remaining lead distance for squad bodies: a long lead needs a
+            // proportionally large target shift to change the route, and the
+            // threshold shrinks back to 1 u as the body closes on the point.
+            float reissueDist = REISSUE_DIST;
+            if (isSquad && haveActual) {
+                float leadFar = dist3(ax, ay, az, tx, ty, tz) * SQUAD_REISSUE_FRAC;
+                if (leadFar > reissueDist) reissueDist = leadFar;
+            }
+            if (moved > reissueDist) {
+                engine::walkTo(c, tx, ty, tz, d.catchSpd);
+                if (isSquad) ++walkReissueSquad_;
+                else         ++walkReissueNpc_;
+                d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
+                d.walkHalted = false; d.walkStallF = 0;
+            } else if (!d.walkHalted && haveActual && !sourceMoving) {
+                // The source has stopped feeding us new ground. The debounced
+                // classifier deliberately holds the walk VERDICT through the stop
+                // (dropping it on an instantaneous sample flaps the body - measured
+                // 37 -> 1071 walk->rest flips/min on npc_sync), but the ORDER does
+                // not have to outlive the walk. An order outstanding on a body that
+                // is not translating is exactly what holds currentlyMoving with no
+                // movement - the holdStop frames the march gate scores, and the
+                // marching the player sees. Two ways to get there, and arrival
+                // alone only catches the first:
+                //   * the body reached the point and stands on it, or
+                //   * it never will - blocked, or aiming at a lead point projected
+                //     ahead of a source that has since stopped (WAN stretches the
+                //     lead to seconds, which is why leader_move fails march there
+                //     while its clean twin passes).
+                // Cancel the goal without teleporting; the verdict is left alone.
+                // One-shot, re-armed by the next real walkTo, so it cannot fight
+                // the re-issue - and the stall arm needs ~200 ms of evidence so a
+                // single blocked frame mid-catchup does not drop a live order.
+                float adv = d.haveActual ? dist3(ax, ay, az, d.lx, d.ly, d.lz)
+                                         : (WALK_STALL_ADV + 1.0f);
+                if (adv <= WALK_STALL_ADV) ++d.walkStallF;
+                else                       d.walkStallF = 0;
+                bool atDest = dist3(ax, ay, az, d.dx, d.dy, d.dz) <= WALK_ARRIVE_DIST;
+                if (atDest || d.walkStallF >= WALK_STALL_FRAMES) {
+                    engine::haltMovement(c);
+                    d.walkHalted = true; d.walkStallF = 0;
+                }
+            }
+            d.parked = false;
+            // Locomotion mirror for a DRIVEN SQUAD member (Phase 1b gait fix):
+            // player-squad bodies take their gait from the player move-order path
+            // (Character::setDestination, shift=false) and effectively IGNORE
+            // CharMovement::setDesiredSpeed - so walkTo alone renders a WALK clip
+            // no matter how fast the host ran (manual 2026-07-17: Adi walks while
+            // the host runs). Mirror the host's exact locomotion (currentSpeed +
+            // world-space currentMotion, as streamed) so the anim controller
+            // blends to the RUN clip from a run-magnitude state. World NPCs obey
+            // setDesiredSpeed on the CharMovement path, so they keep the
+            // no-mirror behavior (the engine picks their clip from the locomotion
+            // it actually performs); mirroring an NPC here would fight that.
+            if (isSquad && sourceMoving && haveActual) {
+                // Squad trail telemetry (the "[interp] squadTrail" line).
+                ++trailN_;
+                trailGapNewSum_ += gapNewest;
+                if (gapNewest > trailGapNewMax_) trailGapNewMax_ = gapNewest;
+                trailGapOutSum_ += dist3(ax, ay, az, out.x, out.y, out.z);
+                if (d.haveActual && ddt > 0 && ddt <= 250) {
+                    trailBodySpdSum_ += dist3(ax, ay, az, d.lx, d.ly, d.lz) *
+                                        1000.0f / (float)ddt;
+                    trailSrcSpdSum_  += vlen;
+                    ++trailSpdN_;
+                }
+                // Error bleed (MoveSync, KENSHICOOP_DRIVE_BLEED): a body that
+                // trails the source by more than its natural lag is moved up
+                // continuously - at most bleed x source speed extra, i.e. it
+                // reads as running a little faster - instead of accumulating the
+                // deficit into a velocity-gate teleport. A no-halt placement that
+                // keeps the body's own orientation (the walk owns the facing).
+                float bleed = driveBleed();
+                float allow = vlen * BLEED_ALLOW_SEC + WALK_ARRIVE_DIST;
+                if (bleed > 0.0f && ddt > 0 && ddt <= 250 && gapNewest > allow) {
+                    float step = bleed * vlen * (float)ddt / 1000.0f;
+                    float excess = gapNewest - allow;
+                    if (step > excess) step = excess;
+                    float k = step / gapNewest;
+                    if (engine::nudgePos(c, ax + (newest.x - ax) * k,
+                                         ay + (newest.y - ay) * k,
+                                         az + (newest.z - az) * k)) {
+                        trailBleedSum_ += step;
+                        ++trailBleedN_;
+                    }
+                }
+            }
+            // Locomotion mirror, carrying the catch-up speed: the owner's own
+            // speed here pinned the copy to the pace it had already lost ground
+            // at. While settling after the owner stopped (no source motion to
+            // mirror) the walk order's own gait runs the body to the stop point;
+            // once it has arrived and halted, the mirror says STOPPED - a copy
+            // left mirroring a frozen run state marched in place.
+            if (isSquad) {
+                if (sourceMoving || out.cMoving != 0) {
+                    if (!(d.walkHalted && !sourceMoving)) {
+                        float ms = (d.catchSpd > out.cSpeed) ? d.catchSpd : out.cSpeed;
+                        engine::applyMotion(c, true, ms,
+                                            out.cMotionX, out.cMotionY, out.cMotionZ);
+                    } else {
+                        engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                } else if (d.walkHalted) {
+                    engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+        } else {
+            d.dbgRegime = DR_REST;
+            // At rest, task-authoritative: reproduce the host's sit/idle pose
+            // at the same fixture, else quiet + park. Bar patrons sit
+            // DYNAMICALLY (walk in and SIT_AROUND a stool), so the seat must
+            // be actively INJECTED via applyRest->applyTask; AI-suspend is
+            // what stops the local AI from standing an NPC back up. For a
+            // squad member this is what makes a join squad-mate sit on the
+            // same chair instead of standing on it.
+            // Stamp the rest-entry edge before applyRest, so a march frame in the
+            // engine's post-endAction settle can be told apart from a later relapse.
+            if (d.walkBranchPrev || d.restEnterMs == 0) d.restEnterMs = now;
+            applyRest(c, d, out, haveActual, ax, ay, az, now, isSquad);
+            d.haveDest = false;
+        }
+        // A crawler that STOPS must stop reporting motion, or the clip keeps
+        // crawling on the spot. The rest path zeroes the CharMovement mirror for
+        // every body; this zeroes the physics pair, and only for a crawler - a body
+        // the engine moves itself owns those fields.
+        if (crawling && !genuinelyMoving)
+            engine::applyPhysMotion(c, 0.0f, 0.0f, 0.0f, 0.0f);
+        if (d.crawlDrive && !crawling) {
+            d.crawlDrive = false;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[prone] CRAWL-DRIVE exit hand=%u,%u bs=%u",
+                out.hIndex, out.hSerial, (unsigned)out.bodyState);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        d.walkBranchPrev = genuinelyMoving;
+
+        // ---- Oracles (measured from the body's ACTUAL rendered motion) --------
+        // "Active" == the host is genuinely translating, matching the drive's own
+        // walk-vs-rest decision (velocity-gated for NPCs, flag-based for the squad
+        // leader as validated in Stage 3), so a correctly-parked body at a host
+        // fidget is not scored as a smoothness miss.
+        // NPCs are judged by the INSTANTANEOUS stream velocity, not the
+        // debounced npcMoving: the 1 s walk-hold keeps the drive in the walk
+        // branch through source stops, and scoring that trailing second as
+        // "active" charges ~75 legitimate at-rest frames per stop to
+        // zeroFrac (leader_move zeroFrac 0.66-0.77 vs the 0.3 baseline).
+        // Mid-tier / far bodies are excluded from the smoothness/anim/march
+        // scoring entirely (Phase 2): their sparse cadence renders differently
+        // by design (long-lead walks, occasional reconciliation snaps), Kenshi
+        // itself throttles far/offscreen character updates into stepwise
+        // motion (an engine LOD fact, not an interp fault), and the gates
+        // were tuned for - and must keep guarding - the CLOSE 20 Hz pipeline.
+        // Scope by DISTANCE to the own squad (the historical judged
+        // population), not just cadence: a boundary walker flaps between
+        // cadences faster than the estimate settles (run 111445). The
+        // anti-zombie oracle owns mid-tier quality.
+        // A paused sim moves nothing on either side: scoring those frames
+        // charged every pause to zeroFrac/march (MoveSync).
+        bool oracleNear = !midTier && !simPaused;
+        if (oracleNear && !isSquad && haveActual && oracleSquadN > 0) {
+            float best = -1.0f;
+            for (unsigned int oi = 0; oi < oracleSquadN; ++oi) {
+                float dd = dist3(ax, ay, az, oracleSquad[oi].x,
+                                 oracleSquad[oi].y, oracleSquad[oi].z);
+                if (best < 0.0f || dd < best) best = dd;
+            }
+            if (best > 200.0f) oracleNear = false;
+        }
+        bool oracleActive = oracleNear &&
+                            (isSquad ? hostMoving
+                                     : (haveNewest && vlen > NPC_MOVE_VEL));
+        // Motion-onset edge (audit only, see the onset* declarations). Because
+        // the test above is instantaneous, this fires every time the body
+        // RE-ENTERS the scored population, not just when it first walks - which
+        // is precisely the quantity under test.
+        if (oracleActive && !d.oracleActivePrev) {
+            d.oracleOnsetMs = now;
+            ++onsetReentries_;
+        }
+        d.oracleActivePrev = oracleActive;
+        if (oracleActive && haveActual && d.haveActual) {
+            float step = dist3(ax, ay, az, d.lx, d.ly, d.lz);
+            // Smoothness is only scored at steady sim speed. During the
+            // session-start clock catch-up the join sims at up to 2x
+            // (timeSlew_, protocol 25) while the host streams positions at
+            // 1x wall-clock - about twice the render frames per streamed
+            // step, a structural zero-step source that measured the SLEW,
+            // not the interp pipeline (zeroFrac flaked 0.2-0.9 run-to-run
+            // with the transient inside the window; user-confirmed "join
+            // NPCs animate faster" 2026-07-10). Skipped frames are counted
+            // so the summary shows how much of the run was excluded.
+            if (timeSlew_ > 0.99f && timeSlew_ < 1.01f) {
+                ++activeFrames_;
+                ++d.activeF;
+                // Age this frame against the body's onset and bucket it with its
+                // zero/advance outcome, so the audit reports a FRACTION per
+                // bucket rather than a raw count that just follows the run's
+                // population. A body scored before any onset was recorded is
+                // charged to steady, which biases against the hypothesis.
+                {
+                    unsigned long onsetAge =
+                        (d.oracleOnsetMs != 0) ? (now - d.oracleOnsetMs)
+                                               : ONSET_SETTLE_MS;
+                    bool zeroStep = (step < 0.01f);
+                    if (onsetAge < ONSET_EARLY_MS) {
+                        ++onActiveEarly_;  if (zeroStep) ++onZeroEarly_;
+                    } else if (onsetAge < ONSET_SETTLE_MS) {
+                        ++onActiveMid_;    if (zeroStep) ++onZeroMid_;
+                    } else {
+                        ++onActiveSteady_; if (zeroStep) ++onZeroSteady_;
+                    }
+                }
+                if (step < 0.01f) {
+                    ++zeroWhileActive_; ++d.zeroF;
+                    // Attribute the frame (see the zp* declarations). Ordered
+                    // most-definitive first: a body that is down cannot walk no
+                    // matter what else is true of it.
+                    if      (coop::bodyIsDown(out.bodyState))      ++zpDown_;
+                    else if (coop::bodyIsCarried(out.bodyState))   ++zpCarried_;
+                    else if (out.bodyState & (BODY_IN_BED | BODY_IN_CAGE)) ++zpFurn_;
+                    else if (out.bodyState & BODY_CHAINED)         ++zpChain_;
+                    else if (coop::bodyIsCrawling(out.bodyState))  ++zpCrawl_;
+                    else if (isSquad && out.cMoving == 0)          ++zpSquadIdle_;
+                    else if (out.bodyState & BODY_SNEAK)           ++zpSneak_;
+                    // Free and upright. Did the body move RECENTLY, or is it stuck?
+                    // A render frame that outran the engine's character-update step
+                    // reads zero without anything being wrong; a body that has not
+                    // advanced for ZERO_ALIAS_MS while its source walks is frozen.
+                    else if (d.advMs != 0 && (now - d.advMs) < ZERO_ALIAS_MS)
+                                                                   ++zpAlias_;
+                    else                                           ++zpStall_;
+                }
+                else d.advMs = now;
+                if (step > maxStep_) maxStep_ = step;
+            } else {
+                ++slewSkipFrames_;
+            }
+
+            if (step > TRANSLATE_EPS) {
+                // The body physically moved this frame: it MUST report a real
+                // walk state, else it is sliding a static pose (the float bug).
+                ++translateFrames_;
+                bool m = false; float sp = 0.0f;
+                if (engine::readMotion(c, &m, &sp) && m && sp > 0.1f)
+                    ++walkTruthFrames_;
+            }
+        } else if (oracleNear && !oracleActive && haveActual && d.haveActual) {
+            // Host is AT REST. Is the driven body marching in place? (walk clip
+            // playing while the body does not translate). This is the bug the
+            // float oracle is blind to.
+            float step = dist3(ax, ay, az, d.lx, d.ly, d.lz);
+            ++restSampleFrames_;
+            bool m = false; float sp = 0.0f;
+            if (step < TRANSLATE_EPS && engine::readMotion(c, &m, &sp) && m && sp > 0.1f) {
+                ++marchFrames_;
+                // Attribute the frame so the fix can target the site that actually
+                // dominates. Note sp is currentSpeed - the locomotion speed SETTING,
+                // which stays high on a standing body (a parked Garru streams
+                // cSpeed=15.2), so the condition above is really "currentlyMoving
+                // set while not translating", not a speed measurement.
+                const unsigned long MARCH_SETTLE_MS = 250;
+                const unsigned long MARCH_DIP_MS    = 200;
+                // Only an NPC can land here: a squad body reaches this block with
+                // !hostMoving, which is exactly its genuinelyMoving, so the hold
+                // buckets are NPC-only and moveSeenMs is always the right clock.
+                if (genuinelyMoving) {
+                    ++marchHold_;
+                    if (d.moveSeenMs != 0 &&
+                        (now - d.moveSeenMs) <= MARCH_DIP_MS) ++marchHoldDip_;
+                    else ++marchHoldStop_;
+                }
+                else if (d.restEnterMs != 0 &&
+                         (now - d.restEnterMs) <= MARCH_SETTLE_MS) ++marchSettle_;
+                else ++marchRelapse_;
+            }
+        }
+        if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+    }
+    pruneDriveGrace(now);
+    logDriveTelemetry(now);
+    ageOutStaleTargets(now);
+}
+
+// --- Drive-tick epilogue phases (Phase 7 Workstream C) --------------------
+// Split verbatim out of applyTargets' post-loop tail: each reads/writes only
+// Replicator members + the tick clock, so behavior is identical.
+
+void Replicator::pruneDriveGrace(unsigned long now) {
+    // Prune the recently-driven grace map on a horizon well past the grace
+    // window (pointers to despawned bodies must not accumulate; they are
+    // never dereferenced, only compared, but the map should stay small).
+    for (std::map<Character*, unsigned long>::iterator ds = drivenSeen_.begin();
+         ds != drivenSeen_.end(); ) {
+        if ((now - ds->second) > 30000) {
+            canonicalOf_.erase(ds->first); // same lifetime bound (dangling ptr)
+            drivenSeen_.erase(ds++);
+        }
+        else ++ds;
+    }
+}
+
+// ---- KENSHICOOP_DEBUG_COMBAT_COPY=1 squad-copy combat trace ----
+bool Replicator::combatCopyDebug() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_COMBAT_COPY");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// ---- MoveSync: KENSHICOOP_DEBUG_SQUAD_DRIVE=1 per-frame [sqdrv] trace ----
+bool Replicator::squadDriveDebug() {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_SQUAD_DRIVE");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+// ---- MoveSync: KENSHICOOP_DRIVE_BLEED (read once; default 0 = off) ----
+// Measured 2026-10-18 (move_legs, 60/25/2 netsim): bleed=0.5 raised squad snaps
+// and the mean trail (each nudge teleport re-plans the walk), so it ships off.
+float Replicator::driveBleed() {
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char* e = getenv("KENSHICOOP_DRIVE_BLEED");
+        float f = e ? (float)atof(e) : 0.0f;
+        v = (f > 0.0f && f < 4.0f) ? f : 0.0f;
+    }
+    return v;
+}
+
+void Replicator::logDriveTelemetry(unsigned long now) {
+    if (aiSuspend_ && (now - aiLogTick_) > 3000) {
+        aiLogTick_ = now;
+        char b[96];
+        _snprintf(b, sizeof(b), "[ai] suspended=%u driven=%u",
+                  engine::aiSuspendCount(), (unsigned)targets_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    // Interp/drive stat line (~5 s, protocol 36 jumpiness instrumentation).
+    // Cumulative counters, so two lines diff into a rate; delay/jit report the
+    // WORST live buffer (the adaptive render delay + its jitter estimate).
+    // Since the ceiling became cadence-scaled, a large delay is the EXPECTED
+    // reading for a mid-band body on a ~500 ms round-robin - it is what lets it
+    // interpolate at all. The starvation signal is extrap/clamp outgrowing
+    // lerp, not delay itself; jit here is deviation in the SENDER's cadence
+    // (ring times are send-stamped), so a rotating mid band reads high by
+    // construction and says nothing about the path.
+    if (!targets_.empty() && (now - interpLogTick_) > 5000) {
+        interpLogTick_ = now;
+        unsigned long maxDelay = 0; float maxJit = 0.0f;
+        for (std::map<Key, Driven>::iterator it = targets_.begin();
+             it != targets_.end(); ++it) {
+            if (!it->second.fresh) continue;
+            if (it->second.interp.lastDelayMs() > maxDelay)
+                maxDelay = it->second.interp.lastDelayMs();
+            if (it->second.interp.jitter() > maxJit)
+                maxJit = it->second.interp.jitter();
+        }
+        char b[288];
+        _snprintf(b, sizeof(b) - 1,
+            "[interp] lerp=%lu extrap=%lu clamp=%lu seg=%lu single=%lu "
+            "snapSq=%lu snapNpc=%lu reissueSq=%lu reissueNpc=%lu restFlip=%lu "
+            "delay=%lu jit=%.1f starve=%u snapMid=%lu restFlipMid=%lu",
+            interpLerp_, interpExtrap_, interpClampOld_, interpSegSnap_,
+            interpSingle_, hardSnapSquad_, hardSnapNpc_,
+            walkReissueSquad_, walkReissueNpc_, restFlipNpc_, maxDelay, maxJit,
+            starveHeldNow_, hardSnapMid_, restFlipMid_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Worst zero-step contributor (Phase 2 smoothness diagnosis): name the
+        // hand charging the most frozen-while-active frames to the oracle.
+        {
+            const Driven* worst = 0; const Key* wk = 0;
+            for (std::map<Key, Driven>::iterator it = targets_.begin();
+                 it != targets_.end(); ++it) {
+                if (!worst || it->second.zeroF > worst->zeroF) {
+                    worst = &it->second; wk = &it->first;
+                }
+            }
+            if (worst && worst->zeroF > 0) {
+                char z[144]; _snprintf(z, sizeof(z) - 1,
+                    "[interp] worstZero hand=%u,%u zero=%lu active=%lu seg=%lu",
+                    wk->i, wk->s, worst->zeroF, worst->activeF,
+                    worst->interp.lastSegMs());
+                z[sizeof(z) - 1] = '\0'; coop::logLine(z);
+            }
+        }
+        // ---- MoveSync: squad drive trail window ----
+        {
+            float n  = trailN_ ? (float)trailN_ : 1.0f;
+            float sn = trailSpdN_ ? (float)trailSpdN_ : 1.0f;
+            char s[320]; _snprintf(s, sizeof(s) - 1,
+                "[interp] squadTrail n=%lu gapNew=%.1f gapNewMax=%.1f gapOut=%.1f "
+                "bodySpd=%.1f srcSpd=%.1f bleed=%.1f/%lu pauseHold=%lu snapCool=%lu settle=%lu "
+                "glide=%lu glideStall=%lu getupHeal=%lu physHeal=%lu",
+                trailN_, trailGapNewSum_ / n, trailGapNewMax_, trailGapOutSum_ / n,
+                trailBodySpdSum_ / sn, trailSrcSpdSum_ / sn,
+                trailBleedSum_, trailBleedN_, pauseHold_, sqSnapCool_, sqSettle_,
+                glideFrames_, glideStallEnters_, getUpHeal_, physHeal_);
+            s[sizeof(s) - 1] = '\0'; coop::logLine(s);
+            trailN_ = 0; trailGapNewSum_ = trailGapNewMax_ = trailGapOutSum_ = 0.0f;
+            trailBodySpdSum_ = trailSrcSpdSum_ = 0.0f; trailSpdN_ = 0;
+            trailBleedSum_ = 0.0f; trailBleedN_ = 0;
+        }
+        // ---- end MoveSync ----
+    }
+    // Combat warp-diagnosis rollup (~5 s, Phase 1). Quiet until combat has
+    // happened this session (combatOrder_ > 0), so a peaceful run stays clean.
+    // Cumulative counters diff into rates (the combat_snap_rate oracle); armed
+    // counts + maxPersist are LIVE (a body persistently snapping is diverging in
+    // a directed way - wrong target / wrong place - not occasionally churning).
+    if (combatOrder_ > 0 && (now - combatLogTick_) > 5000) {
+        combatLogTick_ = now;
+        unsigned int armed = 0; unsigned long maxPersist = 0;
+        for (std::map<Key, Driven>::iterator it = targets_.begin();
+             it != targets_.end(); ++it) {
+            if (it->second.combatArmed) ++armed;
+            if (it->second.combatSnapCount > maxPersist)
+                maxPersist = it->second.combatSnapCount;
+        }
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+            "[combat] stats snap=%lu slide=%lu softWalk=%lu order=%lu wrongTgt=%lu "
+            "armed=%u maxPersist=%lu",
+            combatSnapTotal_, combatSlide_, combatSoftWalk_, combatOrder_,
+            combatWrongTgt_, armed, maxPersist);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    if (gateAuthority_ && (now - trustLogTick_) > 3000) {
+        trustLogTick_ = now;
+        unsigned int trusted = 0;
+        for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it)
+            if (it->second.trusted) ++trusted;
+        char b[112];
+        _snprintf(b, sizeof(b), "[trust] trusted=%u driven=%u grants=%lu revokes=%lu",
+                  trusted, (unsigned)targets_.size() - trusted, trustGrants_, trustRevokes_);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+}
+
+void Replicator::ageOutStaleTargets(unsigned long now) {
+    // Step 6: age out long-stale entries so a session's worth of interest-boundary
+    // passers-by doesn't accumulate forever. Reliable-event latches are PRESERVED
+    // (a dead body must stay dead even while unstreamed); everything else is
+    // reconstructed from the stream if the entity ever returns.
+    const unsigned long TARGET_STALE_MS = 30000;
+    for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ) {
+        Driven& d = it->second;
+        bool stale   = (d.lastSeenMs == 0) || (now - d.lastSeenMs > TARGET_STALE_MS);
+        bool latched = d.deathLatched || d.koLatched;
+        if (stale && !latched) targets_.erase(it++);
+        else ++it;
+    }
+    // The authority hysteresis counters are pruned in enforceHostAuthority (by
+    // what its local-NPC enumeration actually saw), NOT here by targets_
+    // membership: a join-local NPC the host NEVER streamed is never in targets_,
+    // and erasing its counter every tick reset the unstreamed streak to 1 forever,
+    // so the suppress threshold (75 frames) was unreachable - the "phantom walker
+    // on the join that never gets hidden" bug.
+}
+
+void Replicator::sweepCarries(GameWorld* gw, u32 leaverId) {
+    if (!carrySync_ && !furnSync_) return;
+    // The departed player's stream will never author its drop/exit edges, so
+    // any driven (non-owned) copy IT authored still carrying gets a local
+    // ragdoll drop here (the carried body then returns to the ordinary KO/down
+    // channels), and any such copy still occupying furniture (protocol 19)
+    // gets a local release the same way. Bodies other players stream keep
+    // their state - their authors are still here to end it. OWNER_ID_ALL (a
+    // join that lost the host) sweeps every driven copy.
+    const bool all = (leaverId == OWNER_ID_ALL);
+    for (std::map<Key, Driven>::iterator it = targets_.begin();
+         it != targets_.end(); ++it) {
+        const Key& k = it->first;
+        if (ownHands_.find(k) != ownHands_.end()) continue;
+        if (!all && it->second.author != leaverId) continue;
+        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        if (!c) continue;
+        if (carrySync_) {
+            engine::CarryRead cr;
+            if (engine::readCarry(c, &cr) && cr.carrying) {
+                bool ok = engine::applyDrop(c, true);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[carry] SWEEP DROP carrier=%u,%u ok=%d", k.i, k.s, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            it->second.carryNoSeeTick = 0;
+        }
+        if (furnSync_) {
+            engine::FurnitureRead fr;
+            if (engine::readFurniture(c, &fr) && fr.valid && fr.kind != 0) {
+                bool ok = engine::applyFurniture(gw, c, fr.furn, fr.kind, false);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[furn] SWEEP EXIT occ=%u,%u kind=%d ok=%d",
+                    k.i, k.s, fr.kind, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            it->second.furnNoSeeTick = 0;
+        }
+    }
+}
+
+void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
+                           bool haveActual, float ax, float ay, float az,
+                           unsigned long now, bool isSquad) {
+    // Re-arm only when the host adopts a genuinely NEW non-NONE rest pose (stood up
+    // then sat somewhere else). Crucially we IGNORE transient host->NONE frames: the
+    // host capture intermittently reads currentAction==NONE for an otherwise-seated
+    // NPC (transition frames), and re-arming on those tore the committed sit back
+    // down to a standing park every few frames -> the body oscillated sit/stand and
+    // mostly rendered standing. Holding through NONE keeps the seated pose sticky;
+    // genuine stand-up is caught by the movement re-arm in applyTargets.
+    // Carried-body sync (protocol 18): TASK_CARRY_BODY is a SYNTHETIC marker
+    // (the carry self-heal in applyTargets owns it), not an engine task - never
+    // inject it as a pose. A stationary carrier just parks like a task-less body
+    // (the engine's own carry attach keeps the shoulder animation running).
+    bool syntheticCarry = coop::taskIsCarry(out.task);
+    if (!syntheticCarry && out.task != TASK_NONE && out.task != d.issuedTask) {
+        { char b[96]; _snprintf(b, sizeof(b) - 1,
+            "[pose] rest re-arm task %u -> %u", (unsigned)d.issuedTask,
+            (unsigned)out.task); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+        d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
+        d.issuedTask = out.task;
+    }
+    // Debounced task-clear (job removal). The re-arm above deliberately IGNORES
+    // host->NONE frames so a transient capture blip can't tear down a committed sit/
+    // operate pose. But a genuine un-assign where the body stays STATIONARY (the
+    // movement re-arm in applyTargets never fires) streams NONE continuously - hold
+    // through blips, but after TASK_CLEAR_MS of sustained NONE release the held pose
+    // so the peer stops reproducing the order (falls through to clearGoals+endAction+
+    // park below). Carry is synthetic (owned by the carry self-heal) - never clear on
+    // it. Mirrors carryNoSeeTick/furnNoSeeTick.
+    if (!syntheticCarry && out.task == TASK_NONE &&
+        (d.taskApplied || d.issuedTask != TASK_NONE)) {
+        if (d.taskNoneTick == 0) {
+            d.taskNoneTick = now; // streak starts; hold this frame
+        } else if (coop::poseClearElapsed(d.taskNoneTick, now, TASK_CLEAR_MS)) {
+            { char b[112]; _snprintf(b, sizeof(b) - 1,
+                "[pose] task-clear hand=%u,%u was=%u", out.hIndex, out.hSerial,
+                (unsigned)d.issuedTask); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
+            d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
+        }
+    } else {
+        d.taskNoneTick = 0; // any real task (incl. a genuine re-arm) cancels the streak
+    }
+    // Commit a reproducible pose (sit/operate) at the SAME fixture, once.
+    // Attempts are throttled (TASK_RETRY_MS) so a retried far-fixture apply
+    // doesn't clearGoals every frame.
+    if (!syntheticCarry && out.task != TASK_NONE && !d.taskBad && !d.taskApplied &&
+        (d.taskRetries == 0 || (now - d.taskTick) >= TASK_RETRY_MS)) {
+        // I9: detach from the town-AI FIRST (once) so nothing auto-tasks this NPC,
+        // then reproduce the pose via the PLAYER-ORDER path (explicit seat location)
+        // so it pins THIS stool instead of running SIT_AROUND's own seat search.
+        //
+        // Step-2 pruning candidate: with AI-suspend as the default quieting layer
+        // the town-AI's re-tasker never runs, so the detach (which carries the
+        // hand-identity hazard - it re-containers the body) may be redundant.
+        // detachUses_ measures how often this fires; KENSHICOOP_NO_DETACH=1 skips
+        // it for a manual A/B before any deletion.
+        // NEVER detach a player-squad member: separateIntoMyOwnSquad re-containers
+        // the body into a NEW platoon (a new hand), destroying the save-stable
+        // identity every hand-keyed protocol relies on. Squad members have no
+        // town-AI re-tasker anyway (they are player-controlled + peer-driven).
+        // NEVER detach a CHAINED body either (world_parity 2026-07-17): the
+        // chained fall-through routes working slaves here, and the detach
+        // re-containered each one (Pao 1,42 -> 1,53 etc.) - the old hand
+        // stopped resolving (drive dropped it, census couldn't match) and the
+        // new-hand body was census-absent, so suppression HID it: the "many
+        // units on the host missing on the join" manual finding. AI-suspend
+        // (default-on) already quiets the town-AI re-tasker for them.
+        bool chained = (out.bodyState & BODY_CHAINED) != 0;
+        if (!d.detached && !noDetach_ && !isSquad && !chained) {
+            d.detached = engine::detachFromTownAI(c);
+            if (d.detached) ++detachUses_;
+        }
+        // A construction site arrives in the PLACER's key space (its runtime hand
+        // differs per client - see buildKeyForLocalHand). Map it to the hand that
+        // site has HERE before ordering, or applyTaskOrder resolves nothing, the
+        // builder parks, and the body jitters with no construction animation.
+        const EntityState* posed = &out;
+        EntityState xlated;
+        bool siteUnresolved = false;
+        if (engine::isBuildSiteTask((int)out.task)) {
+            Key sk; sk.t = out.sType; sk.c = out.sContainer;
+            sk.cs = out.sContainerSerial; sk.i = out.sIndex; sk.s = out.sSerial;
+            unsigned int lh[5];
+            if (localHandForBuildKey(sk, lh)) {
+                xlated = out;
+                xlated.sType = lh[0]; xlated.sContainer = lh[1];
+                xlated.sContainerSerial = lh[2];
+                xlated.sIndex = lh[3]; xlated.sSerial = lh[4];
+                posed = &xlated;
+            } else {
+                siteUnresolved = true;
+            }
+        } else {
+            // A MINE is a runtime object too, for a different reason: each
+            // client instantiates its own building for a terrain resource node,
+            // so the miner's subject hand means nothing here (applyTaskOrder
+            // returned 1 and latched taskBad - the body parked with no mining
+            // animation, which is the reported bug). Translate through the
+            // protocol-55 pairing when we have one.
+            //
+            // Unlike the build-site branch this NEVER latches "unresolved":
+            // only container/machine fixtures are announced, so a seat or bed
+            // subject is simply absent from the map and must keep going with
+            // its save-stable hand, exactly as before.
+            Key sk; sk.t = out.sType; sk.c = out.sContainer;
+            sk.cs = out.sContainerSerial; sk.i = out.sIndex; sk.s = out.sSerial;
+            unsigned int lh[5];
+            if (localHandForFixtureKey(sk, lh) &&
+                (lh[3] != out.sIndex || lh[4] != out.sSerial)) {
+                xlated = out;
+                xlated.sType = lh[0]; xlated.sContainer = lh[1];
+                xlated.sContainerSerial = lh[2];
+                xlated.sIndex = lh[3]; xlated.sSerial = lh[4];
+                posed = &xlated;
+                if (!d.fixtureXlateLogged) {
+                    d.fixtureXlateLogged = true;
+                    char b[208]; _snprintf(b, sizeof(b) - 1,
+                        "[pose] fixture xlate hand=%u,%u task=%u wire=%u.%u.%u.%u.%u"
+                        " -> local=%u.%u.%u.%u.%u",
+                        out.hIndex, out.hSerial, (unsigned)out.task,
+                        sk.t, sk.c, sk.cs, sk.i, sk.s,
+                        lh[0], lh[1], lh[2], lh[3], lh[4]);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+        if (siteUnresolved) {
+            // The PLACE row that mints this site rides a DIFFERENT channel, so a
+            // build pose can arrive first. Ordering the placer's untranslated hand
+            // would resolve nothing and latch taskBad, parking the builder for the
+            // whole construction - retry until the mint lands, and only give up on
+            // the same bounded streak a far fixture gets (a genuinely removed site
+            // never resolves).
+            d.taskTick = now;
+            if (++d.taskRetries >= TASK_FAR_RETRY_MAX) d.taskBad = true;
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[pose] build-site unresolved hand=%u,%u wire=%u.%u.%u.%u.%u try=%u bad=%d",
+                out.hIndex, out.hSerial, out.sType, out.sContainer,
+                out.sContainerSerial, out.sIndex, out.sSerial, d.taskRetries,
+                d.taskBad ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            int r = engine::applyTaskOrder(c, *posed);
+            ++sitOrders_;
+            d.taskTick = now;
+            { char b[208]; _snprintf(b, sizeof(b) - 1,
+                "[pose] applyOrder hand=%u,%u task=%u subj=%u,%u,%u wire=%u,%u det=%d r=%d try=%u",
+                out.hIndex, out.hSerial, (unsigned)out.task,
+                posed->sIndex, posed->sSerial, posed->sType,
+                out.sIndex, out.sSerial, d.detached ? 1 : 0, r,
+                d.taskRetries);
+              b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            if (r == 2) { d.taskApplied = true; d.taskRetries = 0; } // posed at the fixture
+            else if (r == 1) d.taskBad = true; // fixture not loaded here -> park
+            else if (r == 3) {
+                // Far fixture: usually the interp target lagging a snap-into-fixture
+                // on the owner (bed entry teleports the body instantly). The park
+                // drive converges the body meanwhile; retry until the gate passes,
+                // latch bad only when the mismatch persists (genuinely wrong fixture).
+                if (++d.taskRetries >= TASK_FAR_RETRY_MAX) d.taskBad = true;
+            }
+            // r <= 0 / -1: leave unapplied this frame; fall through to park.
+        }
+    }
+    // Drift guard: a committed pose that wandered off the host transform (the
+    // engine re-pathed the body to the fixture) is abandoned for a held park.
+    //
+    // EXCEPT a construction site (2026-08-01). Two builders working the same
+    // structure legitimately stand at DIFFERENT points on it - each client's
+    // engine picks its own work spot along the footprint, which for anything
+    // bigger than a shack exceeds TASK_DRIFT_MAX (field: 4.26 m apart on a
+    // two-storey against a 4.0 m limit). Drift is not evidence of a wrong
+    // fixture here the way it is for a seat: the site was resolved by explicit
+    // key translation, so it IS the right one. Abandoning it latches taskBad,
+    // which drops the builder back to the position drive - the jitter that
+    // reproducing this pose exists to remove.
+    if (d.taskApplied && haveActual && (now - d.taskTick) > TASK_GRACE_MS &&
+        !engine::isBuildSiteTask((int)out.task) &&
+        dist3(ax, ay, az, out.x, out.y, out.z) > TASK_DRIFT_MAX) {
+        float dd = dist3(ax, ay, az, out.x, out.y, out.z);
+        { char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[pose] drift-abandon hand=%u,%u drift=%.2f > %.2f",
+            out.hIndex, out.hSerial, dd, (double)TASK_DRIFT_MAX);
+          b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+        d.taskApplied = false; d.taskBad = true;
+    }
+    if (d.taskApplied) {
+        d.parked = false; // the engine holds the seated/idle pose; don't fight it
+        // NOTE: do NOT AI-suspend a held bed pose. The engine's decision layer
+        // (Character::periodicUpdate) is what plays/maintains the lie-down sleep
+        // clip; suspending it leaves the body placed in the bed but STANDING on
+        // it (manual test 2026-07-17). The wake-and-move desync is handled by the
+        // bed fast-exit in applyTargets (Fix A), so no re-sleep guard is needed
+        // here - the driven copy follows the host the instant it moves.
+        //
+        // Lapsed machine pose (TASK_LAPSE_MS): the copy went idle locally while
+        // the owner still streams machine work (its own action dropped when this
+        // client's machine finished a craft or filled). Only the host sim runs
+        // machine work, so an idle copy produces nothing for its owner. Re-arm
+        // the order; the next tick re-applies it through the block above.
+        if (engine::isMachineWorkTask((int)out.task) && (now - d.taskTick) > TASK_GRACE_MS) {
+            if (engine::readTaskKey(c) == (int)TASK_NONE) {
+                unsigned int sh = d.taskLapses < TASK_LAPSE_BACKOFF_MAX
+                                      ? d.taskLapses : TASK_LAPSE_BACKOFF_MAX;
+                if (d.taskLapseTick == 0) d.taskLapseTick = now;
+                else if ((now - d.taskLapseTick) >= (TASK_LAPSE_MS << sh)) {
+                    ++d.taskLapses;
+                    { char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[pose] lapse re-pose hand=%u,%u task=%u idle=%lums n=%u",
+                        out.hIndex, out.hSerial, (unsigned)out.task,
+                        now - d.taskLapseTick, d.taskLapses);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    d.taskLapseTick = 0;
+                    d.taskApplied = false;
+                    d.taskRetries = 0;
+                }
+            } else {
+                d.taskLapseTick = 0;
+                d.taskLapses = 0; // working again: next lapse starts unthrottled
+            }
+        } else {
+            d.taskLapseTick = 0;
+        }
+        return;
+    }
+    // Fallback (no task / fixture missing / drifted): quiet the AI and hold the
+    // host transform. Settle once (clean halt+teleport), then only re-place on
+    // drift WITHOUT halting (halting every frame freezes the idle clip on frame 0).
+    //
+    // Step-2 finding (2026-07-05 A/B): the once-on-rest-entry clearGoals variant
+    // was tried and REVERTED - coupled with suspension it degraded npc_sync
+    // smoothness/tracking, and the relapse counters below proved the residual
+    // quieting patchwork is still load-bearing even under AI-suspend (relapse
+    // fired ~100-1000x/run in BOTH modes). The per-tick clear stays; the QUIET
+    // counters stay as permanent health telemetry.
+    engine::clearGoals(c);
+    d.goalsCleared = true;
+    // I10: a node-anchored stander (STAND_AT_NODE, not reproducible) that we
+    // suspend mid-walk keeps EXECUTING its walk-to-node action, so held in place it
+    // marches. END its current action once so the (already AI-suspended) body drops
+    // to idle instead of marching, then hold the transform.
+    //
+    // NOTE: we deliberately do NOT detach standers from the town-AI here. Detaching
+    // a sitter is safe because it is immediately re-anchored by a persistent sit
+    // ORDER; a stander gets no replacement intent, so once detached into its own
+    // squad it wanders off the spot (observed: standers went ABSENT). endAction
+    // under the existing AI-suspend is enough to quiet the march without detaching.
+    float gapOut = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
+    if (!d.parked) {
+        engine::endAction(c); // stop the residual walk -> idle (not march in place)
+        if (engine::park(c, out.x, out.y, out.z, out.heading)) d.parked = true;
+    } else if (gapOut > REPARK_DIST) {
+        engine::applyRaw(c, out);
+    }
+    // I11: endAction once is not enough for every stander - some RE-ACQUIRE a
+    // walk action after settling and march again. Re-quiet only when the body
+    // actually reports a walk motion while we hold it stationary (the precise
+    // march signature), so a genuinely idle body's clip is never reset.
+    //
+    // Step-2 pruning candidate: under default AI-suspend the relapse source (the
+    // AI re-acquiring a walk) should be gone. quietRelapse_ counts every firing
+    // ("SCENARIO QUIET relapse=N" per run); sustained zeros = safe to delete.
+    {
+        bool reMoving = false; float reSpeed = 0.0f;
+        if (engine::readMotion(c, &reMoving, &reSpeed) && reMoving && reSpeed > 0.1f) {
+            engine::endAction(c);
+            ++quietRelapse_;
+        }
+    }
+    engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+
+} // namespace coop

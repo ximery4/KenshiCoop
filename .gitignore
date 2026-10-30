@@ -1,0 +1,83 @@
+# Public-repo export staging (pushed to github.com/nhoral/KenshiCoop, not tracked here)
+dist/public-export/
+
+# Build outputs (all configs: Debug / Harness / Release)
+src/plugin/x64/
+build/
+dist/*.exe
+# Generated packages + mutable DLL artifacts under dist/ (the canonical shipped
+# DLL is built on demand and its SHA-256 is recorded in the kit's PROVENANCE.json;
+# we do not track multiple mutable copies). dist/mods/ (RE_Kenshi.json + .mod
+# template) stays tracked - it is a packaging SOURCE, not an output.
+dist/*.zip
+dist/*.dll
+dist/mod-kit/
+dist/remote-kit/
+dist/KenshiCoop-remote-kit-*.zip
+
+# Manual co-op session captures (logs + screenshots)
+tools/manual-sessions/
+
+# Vendored dependency source (fetched via clone/git-LFS, not committed; ~500MB)
+third_party/enet/enet/
+third_party/KenshiLib_deps/
+
+# Test-run artifacts (logs, screenshots, verdicts, history)
+tools/test-runs/
+tools/*.log
+tools/_*.log
+tools/build_out.txt
+
+# Ad-hoc debug scratch scripts and captured screenshots
+tools/_*.ps1
+tools/_*.png
+# One-off UI verification captures (menu/banner screenshots). Same rationale as
+# the scratch PNGs above: megabytes of frames that only mean something during
+# the session that took them.
+tools/banner-check/
+tools/manual-check/
+# Scratch dirs follow the same underscore convention as the scratch scripts
+# (extracted crash dumps, one-off captures).
+tools/_*/
+# Minidumps taken out-of-process by tools/_dumplive.ps1. Named after the pid, so
+# they never collide and never stop accumulating; they are megabytes of machine
+# state that means nothing on another checkout.
+tools/*.dmp
+# Kenshi's own emergency save after a crash lands here.
+tools/save-backups/
+tools/_wip_*.dll
+tools/float_fix*/
+tools/p*_validate/
+tools/last_dev_cycle.txt
+
+# A/B and isolation scratch: candidate saves, built DLLs and run logs from a
+# single investigation. A save worth keeping belongs in fixtures/saves via
+# capture_save.ps1; a DLL is stale the moment it lands.
+tools/ab/
+tools/repair/
+
+# capture_baseline.ps1 output. Per-machine until something actually reads it
+# back - committing it would freeze a snapshot no gate consults.
+tools/baseline/
+
+# Downloaded toolchain installers (large Microsoft binaries)
+tools/*.exe
+
+# Devkit replay tool build output (tools/devkit/replay/build.cmd)
+tools/devkit/replay/bin/
+
+# Root-level run logs (build/deploy/run drivers)
+/*.log
+
+# Machine-specific config (committed template: scripts/lan.config.example.json)
+scripts/lan.config.json
+
+# Local assets / working notes (design docs, spikes, recordings, frames) - kept
+# locally, not tracked in the repo.
+resources/
+
+# Stray shell artifact
+nul
+
+# Local-only maintainer notes (release process, etc.) - not for the public repo
+*.local.md

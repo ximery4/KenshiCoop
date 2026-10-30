@@ -1,0 +1,2093 @@
+#define _CRT_SECURE_NO_WARNINGS 1 // _snprintf is fine here; silence VC10 C4996
+
+#include "NetLink.h"
+#include "SteamP2P.h"
+#include "../CoopLog.h"
+#include "../devtools/PacketRecorder.h"
+
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+
+namespace coop {
+
+namespace {
+const int        TICK_MS       = 50; // 20 Hz service/transmit cadence
+// Traffic-class channels (protocol 44). ENet guarantees ordering + reliable
+// retransmit PER channel, so head-of-line blocking is per channel too. The bulk
+// coordinated save/load transfer (multi-MB, dozens of ~4 KB reliable fragments)
+// used to share CH_RELIABLE with the small latency-sensitive game events (doors,
+// money, faction, ...); during a transfer those events stalled behind megabytes
+// of save data. Moving the whole save/load handshake onto its own CH_BULK keeps
+// its internal ordering intact while letting events flow on CH_RELIABLE. The
+// receive ladder dispatches purely by packet TYPE, so the channel a packet
+// arrives on is irrelevant there - only the sender and the host/connect channel
+// count change.
+const enet_uint8 CH_RELIABLE   = 0;  // handshake + small reliable game events
+const enet_uint8 CH_UNRELIABLE = 1;  // entity batches / stealth / cam (newest supersedes)
+const enet_uint8 CH_BULK       = 2;  // coordinated save/load transfer (bulk reliable)
+const int        CH_COUNT      = 3;  // channels negotiated at host-create / connect
+
+// Net-thread diagnostics. OutputDebugStringA is thread-safe, and CoopLog guards
+// its FILE* with a lock, so both are safe to call off the main thread.
+void netLog(const char* msg) {
+    OutputDebugStringA("[KenshiCoop/net] ");
+    OutputDebugStringA(msg ? msg : "");
+    OutputDebugStringA("\n");
+    char buf[256];
+    _snprintf(buf, sizeof(buf) - 1, "[net] %s", msg ? msg : "");
+    buf[sizeof(buf) - 1] = '\0';
+    coop::logLine(buf);
+}
+void netErr(const char* msg) {
+    OutputDebugStringA("[KenshiCoop/net] ERROR: ");
+    OutputDebugStringA(msg ? msg : "");
+    OutputDebugStringA("\n");
+    char buf[256];
+    _snprintf(buf, sizeof(buf) - 1, "[net] %s", msg ? msg : "");
+    buf[sizeof(buf) - 1] = '\0';
+    coop::logErrLine(buf);
+}
+
+// Monotonic ms clock for the batch send stamp (v35). QPC, not GetTickCount:
+// the receiver reconstructs snapshot SPACING from consecutive stamps, and
+// GetTickCount's ~15 ms granularity would re-introduce the very quantization
+// the stamp exists to remove (the Replicator's nowMs rationale).
+u32 monoMs() {
+    static LARGE_INTEGER freq = { 0 };
+    if (freq.QuadPart == 0) {
+        if (!QueryPerformanceFrequency(&freq) || freq.QuadPart == 0)
+            return (u32)GetTickCount();
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (u32)(((unsigned __int64)c.QuadPart * 1000ULL) /
+                 (unsigned __int64)freq.QuadPart);
+}
+
+// Service ENet until the next transmit slot (an absolute monoMs deadline).
+// The receive ladder used to be `while (enet_host_service(h, &ev, TICK_MS) > 0)`:
+// every inbound event restarted a full 50 ms wait, so the transmit half of the
+// loop (the entity batch and every outbound queue) only ran after 50 ms of
+// inbound SILENCE. Under a peer's own ~20 Hz stream that silence comes and goes
+// with path jitter, so the motion stream left irregularly (the 2026-10-17 Steam
+// session measured jit=20-50 ms on the SENDER's capture stamps) and a host fed
+// by several joins could go whole stretches without transmitting at all.
+int serviceUntil(ENetHost* h, ENetEvent* ev, u32 deadline) {
+    long rem = (long)(deadline - monoMs());
+    if (rem < 0) rem = 0;
+    if (rem > TICK_MS) rem = TICK_MS;
+    return enet_host_service(h, ev, (enet_uint32)rem);
+}
+
+// Packet recorder taps (devtools/PacketRecorder.h). Each is one interlocked
+// read when no .kcrec file is open, so the hot send/receive paths stay free.
+// recordSend is called BEFORE enet_peer_send: the packet is still ours (and
+// unfragmented) there, and the bytes are what the application handed ENet.
+void recordSend(const ENetPacket* p, u32 peerId, enet_uint8 ch) {
+    if (!p || !rec::active()) return;
+    rec::packet(rec::DIR_OUT, peerId, ch, (p->flags & ENET_PACKET_FLAG_RELIABLE) ? 1u : 0u,
+                p->data, (unsigned)p->dataLength);
+}
+// Host side: the sender's player id (0 = connected but HELLO not yet answered,
+// which is exactly what a HELLO arrives as). Join side: always the host (0).
+void recordReceive(const ENetEvent& ev, bool isHost) {
+    if (!rec::active()) return;
+    const u32 from = isHost ? (u32)(size_t)ev.peer->data : 0u;
+    rec::packet(rec::DIR_IN, from, ev.channelID,
+                (ev.packet->flags & ENET_PACKET_FLAG_RELIABLE) ? 1u : 0u,
+                ev.packet->data, (unsigned)ev.packet->dataLength);
+}
+
+// The fixed-POD queueX methods are all the same MAIN-thread enqueue: take the
+// publish lock, append one copied packet, release. This collapses that shared
+// body so each queueX is a one-liner and the lock discipline lives in one place.
+// (The variable-length queues - inv/world-item/census/save-file - keep custom
+// bodies because they flatten a payload before the locked append.)
+template<class T>
+void pushLocked(CRITICAL_SECTION& cs, std::vector<T>& q, const T& v) {
+    EnterCriticalSection(&cs);
+    q.push_back(v);
+    LeaveCriticalSection(&cs);
+}
+} // namespace
+
+NetLink::NetLink()
+    : isHost_(false), port_(0),
+      enetHost_(0), serverPeer_(0), inbound_(0),
+      outOwner_(0), outStampMs_(0), haveOut_(false),
+      thread_(0), running_(0), stopFlag_(0), myId_(0),
+      sendEpoch_(0),
+      steamPeer_(0),
+      simDelayMs_(0), simJitterMs_(0), simLossPct_(0), reservedDirty_(0), tabCount_(0) {
+    InitializeCriticalSection(&outCs_);
+    for (u32 i = 0; i < MAX_PLAYERS; ++i) { peerUp_[i] = 0; peerSteam_[i] = 0; }
+}
+
+NetLink::~NetLink() {
+    stop();
+    DeleteCriticalSection(&outCs_);
+}
+
+bool NetLink::startHost(int port, Inbound* inbound) {
+    isHost_ = true; port_ = port; inbound_ = inbound; myId_ = 0;
+    return launchThread();
+}
+
+bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
+    isHost_ = false; ip_ = ip; port_ = port; inbound_ = inbound; myId_ = 0;
+    return launchThread();
+}
+
+bool NetLink::launchThread() {
+    if (enet_initialize() != 0) { netErr("enet_initialize failed"); return false; }
+    stopFlag_ = 0;
+    thread_ = CreateThread(0, 0, &NetLink::threadEntry, this, 0, 0);
+    if (thread_ == 0) { netErr("CreateThread failed"); enet_deinitialize(); return false; }
+    return true;
+}
+
+void NetLink::stop() {
+    if (thread_) {
+        InterlockedExchange(&stopFlag_, 1);
+        // The worker owns transport teardown (enet_host_destroy + the Steam hook
+        // removal at the end of threadLoop). Deinitializing ENet or closing the
+        // thread handle while the worker is still inside enet_host_service is a
+        // use-after-free / double-free, so we MUST wait for it to fully exit
+        // before tearing anything down. The loop services at TICK_MS (50 ms) and
+        // checks stopFlag_ each pass, so a clean exit is prompt; if it somehow
+        // stalls we keep waiting rather than pulling the rug out from under it.
+        DWORD wr = WaitForSingleObject(thread_, 5000);
+        if (wr != WAIT_OBJECT_0) {
+            netErr("net worker still running after 5s; waiting for clean exit "
+                   "before ENet teardown");
+            WaitForSingleObject(thread_, INFINITE);
+        }
+        CloseHandle(thread_);
+        thread_ = 0;
+        enet_deinitialize();
+        for (u32 i = 0; i < MAX_PLAYERS; ++i) { peerUp_[i] = 0; peerSteam_[i] = 0; }
+    }
+}
+
+void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count) {
+    EnterCriticalSection(&outCs_);
+    outOwner_ = ownerId;
+    if (arr && count > 0) out_.assign(arr, arr + count);
+    else                  out_.clear();
+    // Capture-time stamp (v35). The net thread may re-send this same snapshot
+    // next tick; the unchanged stamp lets the receiver dedupe the re-send
+    // instead of recording a phantom zero-velocity segment.
+    outStampMs_ = monoMs();
+    haveOut_ = true;
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueEvent(const EventPacket& ev) { pushLocked(outCs_, outEvents_, ev); }
+
+void NetLink::queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
+                               const InvItemEntry* items, unsigned int count, u8 flags) {
+    OutInv oi;
+    oi.ownerId = ownerId;
+    oi.keyKind = keyKind;
+    oi.flags   = flags;
+    for (int k = 0; k < 5; ++k) oi.cKey[k] = cKey[k];
+    // Clamping here is itself a truncation: mark it so the receiver stays additive-only
+    // (the caller normally sets the flag, but never let a silent clamp delete items).
+    if (count > INV_ITEMS_MAX) { count = INV_ITEMS_MAX; oi.flags |= INV_FLAG_TRUNCATED; }
+    if (items && count > 0) oi.items.assign(items, items + count);
+    pushLocked(outCs_, outInv_, oi);
+}
+
+void NetLink::queueWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
+    OutWorldItems ow;
+    ow.ownerId = ownerId;
+    if (count > WORLD_ITEMS_MAX) count = WORLD_ITEMS_MAX;
+    if (items && count > 0) ow.items.assign(items, items + count);
+    pushLocked(outCs_, outWorldItems_, ow);
+}
+
+void NetLink::queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int count) {
+    OutWorldRemove ow;
+    ow.ownerId = ownerId;
+    if (count > 255) count = 255; // u8 count on the wire
+    if (netIds && count > 0) ow.netIds.assign(netIds, netIds + count);
+    pushLocked(outCs_, outWorldRemove_, ow);
+}
+
+void NetLink::queueWorldClaim(u32 ownerId, u32 authorId, const u32* netIds,
+                              unsigned int count) {
+    OutWorldClaim ow;
+    ow.ownerId = ownerId; ow.authorId = authorId;
+    if (count > 255) count = 255; // u8 count on the wire
+    if (netIds && count > 0) ow.netIds.assign(netIds, netIds + count);
+    pushLocked(outCs_, outWorldClaim_, ow);
+}
+
+void NetLink::queueNpcCensus(u32 ownerId, const u32* hands, const float* pos,
+                             unsigned int count) {
+    OutNpcCensus oc;
+    oc.ownerId = ownerId;
+    if (count > NPC_CENSUS_MAX) count = NPC_CENSUS_MAX;
+    if (hands && count > 0) oc.hands.assign(hands, hands + count * 5);
+    if (pos && count > 0) oc.pos.assign(pos, pos + count * 3);
+    pushLocked(outCs_, outNpcCensus_, oc);
+}
+
+void NetLink::queueWorldDrop(const WorldDropPacket& pkt) { pushLocked(outCs_, outWorldDrops_, pkt); }
+
+void NetLink::queueMedical(const MedicalPacket& pkt) { pushLocked(outCs_, outMedical_, pkt); }
+
+void NetLink::queueTreatment(const TreatmentPacket& pkt) { pushLocked(outCs_, outTreatments_, pkt); }
+
+void NetLink::queueCombatHit(const CombatHitPacket& pkt) { pushLocked(outCs_, outCombatHits_, pkt); }
+
+void NetLink::queueSpeed(const SpeedPacket& pkt) { pushLocked(outCs_, outSpeed_, pkt); }
+
+void NetLink::queueStats(const StatsPacket& pkt) { pushLocked(outCs_, outStats_, pkt); }
+
+void NetLink::queueMoney(const MoneyPacket& pkt, u32 targetMask) {
+    OutMoney om; om.pkt = pkt; om.mask = targetMask;
+    pushLocked(outCs_, outMoney_, om);
+}
+void NetLink::queueMoneyDelta(const MoneyDeltaPacket& pkt) { pushLocked(outCs_, outMoneyDelta_, pkt); }
+void NetLink::queueVendorDelta(const VendorDeltaPacket& pkt) { pushLocked(outCs_, outVendorDelta_, pkt); }
+void NetLink::queueVendorCash(const VendorCashPacket& pkt) { pushLocked(outCs_, outVendorCash_, pkt); }
+void NetLink::queueNativeTaken(const NativeTakenPacket& pkt) { pushLocked(outCs_, outNativeTaken_, pkt); }
+void NetLink::queueTrade(const TradeHeader& hdr, const InvItemEntry* items, unsigned int count) {
+    OutTrade ot;
+    ot.hdr = hdr;
+    ot.hdr.type = PKT_TRADE;
+    if (!(hdr.flags & TRADE_FLAG_STOCK)) count = 0;
+    if (count > TRADE_LINES_MAX) { count = TRADE_LINES_MAX; ot.hdr.flags |= TRADE_FLAG_TRUNCATED; }
+    ot.hdr.count = (u8)count;
+    if (items && count > 0) ot.items.assign(items, items + count);
+    pushLocked(outCs_, outTrade_, ot);
+}
+
+void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFaction_, pkt); }
+
+void NetLink::queueTime(const TimePacket& pkt) { pushLocked(outCs_, outTime_, pkt); }
+
+void NetLink::queueDoor(const DoorPacket& pkt) { pushLocked(outCs_, outDoor_, pkt); }
+
+void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pkt); }
+
+void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
+
+void NetLink::queueJoinState(const JoinStatePacket& pkt) { pushLocked(outCs_, outJoinState_, pkt); }
+
+void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pkt); }
+
+void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
+
+void NetLink::queueCharGen(const std::vector<u8>& flat) { pushLocked(outCs_, outCharGen_, flat); }
+
+void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
+
+void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, outBuildState_, pkt); }
+
+void NetLink::queueBuildDoor(const BuildDoorPacket& pkt) { pushLocked(outCs_, outBuildDoor_, pkt); }
+
+void NetLink::queueBuildRemove(const BuildRemovePacket& pkt) { pushLocked(outCs_, outBuildRemove_, pkt); }
+
+void NetLink::queueStealth(const StealthPacket& pkt) { pushLocked(outCs_, outStealth_, pkt); }
+
+void NetLink::queueCamHint(const CamHintPacket& pkt) { pushLocked(outCs_, outCamHint_, pkt); }
+
+void NetLink::queueCellClaim(const CellClaimPacket& pkt) { pushLocked(outCs_, outCellClaim_, pkt); }
+
+void NetLink::queueSpawnReq(const SpawnReqPacket& pkt) { pushLocked(outCs_, outSpawnReq_, pkt); }
+
+void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, outSpawnInfo_, pkt); }
+
+void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) { pushLocked(outCs_, outWorldPickups_, pkt); }
+
+void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInvXfers_, pkt); }
+
+void NetLink::queueInvXferAck(const InvXferAckPacket& pkt) { pushLocked(outCs_, outInvXferAcks_, pkt); }
+
+void NetLink::queueSaveReq(const SaveReqPacket& pkt) { pushLocked(outCs_, outSaveReq_, pkt); }
+
+void NetLink::queueSaveBegin(const SaveBeginPacket& pkt, u32 targetMask) {
+    OutSaveBegin ob; ob.pkt = pkt; ob.mask = targetMask;
+    pushLocked(outCs_, outSaveBegin_, ob);
+}
+
+void NetLink::queueSaveFile(const SaveFileHeader& hdr, const char* relPath,
+                            const unsigned char* data, unsigned int dataLen,
+                            u32 targetMask) {
+    OutSaveFile of;
+    of.hdr = hdr;
+    of.mask = targetMask;
+    of.tail.reserve(hdr.pathLen + dataLen);
+    of.tail.assign(relPath, relPath + hdr.pathLen);
+    if (data && dataLen > 0) of.tail.insert(of.tail.end(), data, data + dataLen);
+    pushLocked(outCs_, outSaveFile_, of);
+}
+
+void NetLink::queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs,
+                            unsigned int count, u32 targetMask) {
+    OutSaveDone od;
+    od.hdr = hdr;
+    od.mask = targetMask;
+    if (crcs && count > 0) od.crcs.assign(crcs, crcs + count);
+    pushLocked(outCs_, outSaveDone_, od);
+}
+
+void NetLink::queueSaveAck(const SaveAckPacket& pkt) { pushLocked(outCs_, outSaveAck_, pkt); }
+
+void NetLink::queueLoadGo(const LoadGoPacket& pkt, u32 targetMask) {
+    OutLoadGo og; og.pkt = pkt; og.mask = targetMask;
+    pushLocked(outCs_, outLoadGo_, og);
+}
+
+void NetLink::queueRoster(const RosterPacket& pkt, u32 targetMask) {
+    OutRoster r; r.pkt = pkt; r.mask = targetMask;
+    pushLocked(outCs_, outRoster_, r);
+}
+
+void NetLink::queueLoadReq(const LoadReqPacket& pkt) { pushLocked(outCs_, outLoadReq_, pkt); }
+
+void NetLink::queueLoadNack(const LoadNackPacket& pkt) { pushLocked(outCs_, outLoadNack_, pkt); }
+
+void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct) {
+    simDelayMs_  = delayMs;
+    simJitterMs_ = jitterMs;
+    simLossPct_  = (lossPct > 100) ? 100 : lossPct;
+}
+
+void NetLink::setSteamTransport(unsigned long long peerSteamId) {
+    steamPeer_ = peerSteamId;
+}
+
+namespace {
+// Star-topology relay policy (host receive path): which join-authored packets
+// the host forwards verbatim to the OTHER joins. Owner-authoritative state and
+// owner-addressed intents are relayed (receivers already scope them by the
+// packet's ownerId / authorId / xferOwnerId, so an extra copy is filtered, not
+// misapplied). Never relayed: the handshake + clock probes, and everything the
+// host alone consumes or arbitrates - speed votes, money deltas, save/load
+// requests and acks, combat-hit reports - plus host-only rows a join never sends.
+bool relayToJoins(u8 type) {
+    switch (type) {
+    case PKT_ENTITY_BATCH:  case PKT_EVENT:         case PKT_INV_SNAPSHOT:
+    case PKT_WORLD_ITEM:    case PKT_WORLD_ITEM_REMOVE:
+    case PKT_WORLD_DROP:    case PKT_WORLD_PICKUP:  case PKT_MEDICAL:
+    case PKT_TREATMENT:     case PKT_STATS:         case PKT_SPAWN_REQ:
+    case PKT_SPAWN_INFO:    case PKT_FACTION:       case PKT_DOOR:
+    case PKT_BUILD_PLACE:   case PKT_BUILD_STATE:   case PKT_BUILD_DOOR:
+    case PKT_BUILD_REMOVE:  case PKT_NPC_CENSUS:    case PKT_INV_XFER:
+    case PKT_CAM_HINT:      case PKT_WORLD_ITEM_CLAIM:  case PKT_NATIVE_TAKEN:
+    case PKT_CELL_CLAIM:    case PKT_INV_XFER_ACK:  case PKT_DEED:
+    case PKT_FIXTURE:       case PKT_CHARGEN:       case PKT_JOIN_STATE:
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+void NetLink::sendOut(ENetPacket* out, enet_uint8 ch, u32 targetMask, ENetPeer* except) {
+    if (!isHost_) {
+        if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+            recordSend(out, 0, ch);
+            enet_peer_send(serverPeer_, ch, out);
+        } else {
+            enet_packet_destroy(out); // no one to send to yet
+        }
+        return;
+    }
+    for (size_t i = 0; i < enetHost_->peerCount; ++i) {
+        ENetPeer* p = &enetHost_->peers[i];
+        if (p == except || p->state != ENET_PEER_STATE_CONNECTED) continue;
+        u32 id = (u32)(size_t)p->data;
+        if (id == 0) continue; // HELLO not answered yet: not a session member
+        if ((targetMask & peerBit(id)) == 0) continue;
+        // A targeted send is recorded per recipient; a send to everyone is
+        // recorded once below as PEER_ANY (one copy, not one per join).
+        if (targetMask != PEER_MASK_ALL) recordSend(out, id, ch);
+        enet_peer_send(p, ch, out);
+    }
+    // ENet refcounts a packet per queued send; an unsent one is ours to free
+    // (the same rule enet_host_broadcast applies).
+    if (out->referenceCount == 0) enet_packet_destroy(out);
+    else if (targetMask == PEER_MASK_ALL) recordSend(out, rec::PEER_ANY, ch);
+}
+
+void NetLink::relay(const ENetEvent& ev) {
+    ENetPacket* fwd = enet_packet_create(ev.packet->data, ev.packet->dataLength,
+                                         ev.packet->flags & ENET_PACKET_FLAG_RELIABLE);
+    if (fwd) sendOut(fwd, ev.channelID, PEER_MASK_ALL, ev.peer);
+}
+
+void NetLink::sendPeerState(u32 peerId, bool present, u32 targetMask) {
+    PeerStatePacket ps;
+    ps.type    = (u8)PKT_PEER_STATE;
+    ps.peerId  = peerId;
+    ps.present = present ? 1 : 0;
+    ENetPacket* out = enet_packet_create(&ps, sizeof(ps), ENET_PACKET_FLAG_RELIABLE);
+    if (out) sendOut(out, CH_RELIABLE, targetMask);
+}
+
+// NET thread (host): pick the player id for a HELLO. An identity seen earlier
+// this session gets its old id back when that id is free (reconnect = same
+// squad tab). Ids >= the host's squad tab count (setTabCount) have no squad to
+// drive, so the order is: own reserved id that has a tab; a free unreserved id
+// with a tab; a free id with a tab reserved by a player who is not here (the
+// tab passes to the newcomer - its reservation moves to them, so the roster and
+// tab name follow the person actually playing it); own reserved id without a
+// tab; any free id. 0 = session full.
+u32 NetLink::allocPlayerId(const std::string& identity) {
+    const u32 tabs = (u32)tabCount_ ? (u32)tabCount_ : MAX_PLAYERS; // 0 = unknown: all count
+    u32 own = 0;
+    if (!identity.empty()) {
+        std::map<std::string, u32>::const_iterator it = idByIdentity_.find(identity);
+        if (it != idByIdentity_.end() && !idInUse_[it->second]) own = it->second;
+    }
+    if (own != 0 && own < tabs) return own;
+    u32 borrow = 0, spare = 0;
+    for (u32 id = 1; id < MAX_PLAYERS; ++id) {
+        if (idInUse_[id]) continue;
+        bool reserved = false;
+        for (std::map<std::string, u32>::const_iterator it = idByIdentity_.begin();
+             it != idByIdentity_.end(); ++it) {
+            if (it->second == id && it->first != identity) { reserved = true; break; }
+        }
+        if (id < tabs) {
+            if (!reserved) return id;
+            if (borrow == 0) borrow = id;
+        } else if (spare == 0 && !reserved) {
+            spare = id;
+        }
+    }
+    if (borrow != 0) {
+        for (std::map<std::string, u32>::iterator it = idByIdentity_.begin(); it != idByIdentity_.end(); ) {
+            if (it->second == borrow && it->first != identity) idByIdentity_.erase(it++); else ++it;
+        }
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "player id %u: absent player's squad tab passes to the newcomer", borrow);
+        b[sizeof(b) - 1] = '\0';
+        netLog(b);
+        return borrow;
+    }
+    if (own != 0) return own;
+    if (spare != 0) return spare;
+    for (u32 id = 1; id < MAX_PLAYERS; ++id) if (!idInUse_[id]) return id;
+    return 0;
+}
+
+// Host (main thread): how many squad tabs the live world has (ids 1..n-1 can
+// drive one). 0 = unknown.
+void NetLink::setTabCount(u32 n) { InterlockedExchange(&tabCount_, (LONG)n); }
+
+// Host (main thread): the identity -> player id table remembered with the save
+// (kenshicoop_players.txt), so a returning player gets their own squad tab back
+// whatever order everyone connects in. Applied by the net thread at session
+// start and whenever it changes (a save loaded while hosting).
+void NetLink::setReservedIds(const std::map<std::string, u32>& ids) {
+    EnterCriticalSection(&outCs_);
+    reservedIds_ = ids;
+    LeaveCriticalSection(&outCs_);
+    InterlockedExchange(&reservedDirty_, 1);
+}
+
+// NET thread: fold the reserved table into idByIdentity_. A connected player
+// keeps the id it already holds; everyone else is pinned to their reserved id.
+void NetLink::applyReservedIds() {
+    std::map<std::string, u32> ids;
+    EnterCriticalSection(&outCs_);
+    ids = reservedIds_;
+    LeaveCriticalSection(&outCs_);
+    unsigned int n = 0;
+    for (std::map<std::string, u32>::const_iterator it = ids.begin(); it != ids.end(); ++it) {
+        if (it->second == 0 || it->second >= MAX_PLAYERS) continue;
+        std::map<std::string, u32>::iterator cur = idByIdentity_.find(it->first);
+        if (cur != idByIdentity_.end() && idInUse_[cur->second]) continue; // connected now
+        idByIdentity_[it->first] = it->second;
+        ++n;
+    }
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "reserved player ids applied: %u", n);
+    b[sizeof(b) - 1] = '\0';
+    netLog(b);
+}
+
+// Deliver one received entity to the game thread, applying the WAN sim if enabled.
+// Loopback has ~0 latency, so without this a received "down"/move lands the same
+// frame it was sent - exactly the regime we want to stop relying on. With it, the
+// entity is parked until base +/- jitter has elapsed (and dropped lossPct% of the
+// time), so the join must coast on interpolation/local enforcement between arrivals.
+// MAIN thread: advance the session epoch so post-reset batches supersede any
+// still-in-flight batch from the prior session, and drop the pending owned-
+// entity snapshot so the net thread does not re-broadcast a stale (old-world)
+// snapshot stamped with the NEW epoch (which the peer would then accept as
+// fresh). The main thread republishes a real snapshot within a tick or two.
+void NetLink::bumpSessionEpoch() {
+    InterlockedIncrement(&sendEpoch_);
+    EnterCriticalSection(&outCs_);
+    out_.clear();
+    haveOut_ = false;
+    LeaveCriticalSection(&outCs_);
+}
+
+// NET thread: monotonic per-owner epoch gate. Latest-wins on the unreliable
+// motion stream, so "accept if >= newest seen" both admits a fresh session
+// (higher epoch) and rejects a delayed prior-session batch (lower epoch).
+bool NetLink::acceptEpoch(u32 ownerId, u32 epoch) {
+    std::map<u32, u32>::iterator it = epochSeen_.find(ownerId);
+    if (it == epochSeen_.end()) { epochSeen_[ownerId] = epoch; return true; }
+    if (epoch < it->second) return false;
+    it->second = epoch;
+    return true;
+}
+
+void NetLink::deliverEntity(u32 ownerId, u32 sendMs, const EntityState& e) {
+    if (simDelayMs_ == 0 && simJitterMs_ == 0 && simLossPct_ == 0) {
+        if (inbound_) inbound_->pushEntity(ownerId, sendMs, e);
+        return;
+    }
+    if (simLossPct_ > 0 && (unsigned)(rand() % 100) < simLossPct_) return; // dropped
+    int jitter = 0;
+    if (simJitterMs_ > 0) jitter = (rand() % (int)(2 * simJitterMs_ + 1)) - (int)simJitterMs_;
+    int delay = (int)simDelayMs_ + jitter;
+    if (delay < 0) delay = 0;
+    Delayed d;
+    d.releaseTick = GetTickCount() + (DWORD)delay;
+    d.ownerId     = ownerId;
+    d.sendMs      = sendMs;
+    d.e           = e;
+    delayed_.push_back(d);
+}
+
+// Release every held entity whose simulated arrival time has passed. Jitter can put
+// release times out of order; we scan the whole queue (small N) and keep the rest.
+// "Newest supersedes" on the receiver makes any reordering harmless (and realistic).
+void NetLink::flushDelayed() {
+    if (delayed_.empty()) return;
+    DWORD now = GetTickCount();
+    std::deque<Delayed> keep;
+    for (std::deque<Delayed>::iterator it = delayed_.begin(); it != delayed_.end(); ++it) {
+        if ((long)(now - it->releaseTick) >= 0) { if (inbound_) inbound_->pushEntity(it->ownerId, it->sendMs, it->e); }
+        else                                     { keep.push_back(*it); }
+    }
+    delayed_.swap(keep);
+}
+
+DWORD WINAPI NetLink::threadEntry(LPVOID self) {
+    reinterpret_cast<NetLink*>(self)->threadLoop();
+    return 0;
+}
+
+void NetLink::threadLoop() {
+    InterlockedExchange(&running_, 1);
+
+    // Steam P2P transport: redirect ENet's socket layer through the Steam tunnel
+    // BEFORE the host is created (the fake socket is handed out at create time).
+    // The tunnel is addressless; ENet still needs an ENetAddress for its peer
+    // routing, so both sides use the fabricated "1.0.0.1:port".
+    const bool steam = (steamPeer_ != 0);
+    if (steam) {
+        if (steamp2p::installEnetHooks(port_)) {
+            netLog("transport=steam (ENet tunnelled over Steam P2P)");
+        } else {
+            netErr("steam transport requested but hooks failed; falling back to UDP");
+        }
+    }
+
+    if (isHost_) {
+        ENetAddress addr;
+        addr.host = ENET_HOST_ANY;
+        addr.port = (enet_uint16)port_;
+        // Room for every join plus reconnect churn (a dropped peer lingers in
+        // ENet's zombie state for a moment while its replacement connects).
+        enetHost_ = enet_host_create(&addr, 2 * MAX_PLAYERS /*peers*/, CH_COUNT /*channels*/, 0, 0);
+        if (!enetHost_) { netErr("host create failed"); InterlockedExchange(&running_, 0); return; }
+        netLog("hosting");
+    } else {
+        enetHost_ = enet_host_create(0, 1, CH_COUNT, 0, 0);
+        if (!enetHost_) { netErr("client create failed"); InterlockedExchange(&running_, 0); return; }
+        ENetAddress addr;
+        if (steam) enet_address_set_host_ip(&addr, "1.0.0.1");
+        else       enet_address_set_host(&addr, ip_.c_str());
+        addr.port = (enet_uint16)port_;
+        serverPeer_ = enet_host_connect(enetHost_, &addr, CH_COUNT, 0);
+        if (!serverPeer_) netErr("connect failed");
+        else              netLog("connecting");
+    }
+
+    // Packet recorder: one .kcrec per net-thread session when armed (no-op
+    // otherwise). Begun only once the ENet host exists, so a failed create
+    // leaves no empty file; ended after enet_host_destroy at thread exit.
+    {
+        char note[64];
+        if (isHost_) _snprintf(note, sizeof(note) - 1, "host port=%d%s", port_, steam ? " steam" : "");
+        else         _snprintf(note, sizeof(note) - 1, "join %s:%d%s", ip_.c_str(), port_, steam ? " steam" : "");
+        note[sizeof(note) - 1] = '\0';
+        rec::sessionBegin(isHost_, note);
+    }
+
+    // Steam's unreliable P2P packets cap at 1200 bytes; clamp the MTU so every
+    // ENet datagram (including fragments of large reliable packets) fits one
+    // P2P packet. Set before any peer negotiates its own MTU from ours.
+    if (steam && enetHost_ && enetHost_->mtu > 1200) {
+        enetHost_->mtu = 1200;
+        if (serverPeer_) serverPeer_->mtu = 1200;
+    }
+
+    for (u32 i = 0; i < MAX_PLAYERS; ++i) { idInUse_[i] = false; peerUp_[i] = 0; peerSteam_[i] = 0; }
+    idByIdentity_.clear();
+    InterlockedExchange(&reservedDirty_, 0);
+    applyReservedIds();
+    DWORD lastConnectAttempt = GetTickCount();
+
+    // Wall-clock time-sync state (client only). The join pings every ~2 s; each
+    // pong yields an (rtt, offset) sample; the minimum-RTT sample wins (NTP
+    // filter). CLOCKSYNC is logged every ~5 s so the oracles can align this
+    // log's timestamps into the host clock frame.
+    DWORD         lastTimePing  = 0;
+    DWORD         lastClockLog  = 0;
+    u32           pingNonce     = 1;
+    unsigned long bestRttMs     = 0xFFFFFFFFul;
+    long          bestOffsetMs  = 0;
+    unsigned int  syncSamples   = 0;
+    const long    HALF_DAY_MS   = 12l * 3600l * 1000l;
+    u32           nextTx        = monoMs() + (u32)TICK_MS; // transmit slot (serviceUntil)
+
+    while (!stopFlag_) {
+        if (InterlockedCompareExchange(&reservedDirty_, 0, 1) == 1) applyReservedIds();
+        // Steam heartbeat: spike ping/echo + session-state change logging.
+        // Cheap no-op when Steam isn't initialised (pure-UDP sessions).
+        steamp2p::tick();
+
+        // Client reconnect: if we have no live connection, retry every 2 s so
+        // dropping/relaunching the host re-establishes.
+        if (!isHost_) {
+            bool disconnected =
+                (serverPeer_ == 0) ||
+                (serverPeer_->state == ENET_PEER_STATE_DISCONNECTED) ||
+                (serverPeer_->state == ENET_PEER_STATE_ZOMBIE);
+            DWORD now = GetTickCount();
+            if (disconnected && (now - lastConnectAttempt) >= 2000) {
+                lastConnectAttempt = now;
+                if (serverPeer_) { enet_peer_reset(serverPeer_); serverPeer_ = 0; }
+                ENetAddress addr;
+                if (steam) enet_address_set_host_ip(&addr, "1.0.0.1");
+                else       enet_address_set_host(&addr, ip_.c_str());
+                addr.port = (enet_uint16)port_;
+                serverPeer_ = enet_host_connect(enetHost_, &addr, CH_COUNT, 0);
+                if (steam && serverPeer_) serverPeer_->mtu = 1200;
+                netLog(serverPeer_ ? "reconnecting" : "reconnect failed");
+            }
+        }
+
+        ENetEvent ev;
+        while (serviceUntil(enetHost_, &ev, nextTx) > 0) {
+            switch (ev.type) {
+                case ENET_EVENT_TYPE_CONNECT: {
+                    if (isHost_) {
+                        // Wait for the client's HELLO before assigning an id, so
+                        // a version mismatch is rejected before we admit it.
+                        netLog("peer connecting (awaiting HELLO)");
+                    } else {
+                        // A fresh connection to the host restarts every owner's
+                        // epoch sequence (the host and the joins it relays may
+                        // resume at a lower epoch than the one we last saw), so
+                        // the new session's first batch is never stale (v44).
+                        epochSeen_.clear();
+                        // Introduce ourselves: protocol version + identity token.
+                        unsigned nameLen = (unsigned)identity_.size();
+                        if (nameLen > 63) nameLen = 63;
+                        ENetPacket* out = enet_packet_create(0, sizeof(HelloPacket) + nameLen,
+                                                             ENET_PACKET_FLAG_RELIABLE);
+                        HelloPacket h;
+                        h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION; h.nameLen = (u8)nameLen;
+                        std::memcpy(out->data, &h, sizeof(h));
+                        if (nameLen > 0) std::memcpy(out->data + sizeof(h), identity_.data(), nameLen);
+                        recordSend(out, 0, CH_RELIABLE);
+                        enet_peer_send(ev.peer, CH_RELIABLE, out);
+                        netLog("connected to host; sent HELLO");
+                    }
+                    break;
+                }
+                case ENET_EVENT_TYPE_RECEIVE: {
+                    // Record before any early drop below, so a pre-WELCOME
+                    // packet (peer 0) and the HELLO itself are in the file.
+                    recordReceive(ev, isHost_);
+                    const u8 type = packetType(ev.packet->data, (unsigned)ev.packet->dataLength);
+                    if (isHost_ && type != PKT_HELLO) {
+                        // Only a welcomed join is a session member: drop what it
+                        // sends before its HELLO is answered, then fan its owner
+                        // state out to the other joins (star relay).
+                        if ((u32)(size_t)ev.peer->data == 0) {
+                            enet_packet_destroy(ev.packet);
+                            break;
+                        }
+                        if (relayToJoins(type)) relay(ev);
+                    }
+                    if (isHost_ && type == PKT_HELLO) {
+                        HelloPacket h;
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if ((u32)(size_t)ev.peer->data != 0) {
+                            // Already welcomed (duplicate HELLO): ignore.
+                        } else if (readPacket(ev.packet->data, len, &h)) {
+                            std::string ident;
+                            if (h.nameLen > 0 && len >= sizeof(h) + h.nameLen)
+                                ident.assign((const char*)ev.packet->data + sizeof(h), h.nameLen);
+                            u32 id = 0;
+                            if (h.version != PROTOCOL_VERSION) {
+                                char b[128];
+                                _snprintf(b, sizeof(b) - 1,
+                                          "protocol mismatch: peer v%u, ours v%u; rejecting",
+                                          (unsigned)h.version, (unsigned)PROTOCOL_VERSION);
+                                b[sizeof(b) - 1] = '\0';
+                                netErr(b);
+                                enet_peer_disconnect(ev.peer, 0);
+                            } else if ((id = allocPlayerId(ident)) == 0) {
+                                char b[96];
+                                _snprintf(b, sizeof(b) - 1,
+                                          "session full (%u players); rejecting", (unsigned)MAX_PLAYERS);
+                                b[sizeof(b) - 1] = '\0';
+                                netErr(b);
+                                enet_peer_disconnect(ev.peer, 0);
+                            } else {
+                                idInUse_[id] = true;
+                                if (!ident.empty()) idByIdentity_[ident] = id;
+                                // Lobby UI (main thread): who holds this id. 64-bit
+                                // aligned store - atomic on x64, read without a lock.
+                                peerSteam_[id] = _strtoui64(ident.c_str(), 0, 10);
+                                peerUp_[id] = 1;
+                                epochSeen_.erase(id); // its epoch sequence starts over
+                                ev.peer->data = (void*)(size_t)id;
+                                WelcomePacket w;
+                                w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
+                                ENetPacket* out =
+                                    enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
+                                recordSend(out, id, CH_RELIABLE);
+                                enet_peer_send(ev.peer, CH_RELIABLE, out);
+                                // Roster: the other joins learn the newcomer, and the
+                                // newcomer learns every join already here (after its
+                                // WELCOME on the same ordered channel).
+                                u32 others = 0;
+                                for (u32 k = 1; k < MAX_PLAYERS; ++k)
+                                    if (k != id && idInUse_[k]) others |= peerBit(k);
+                                if (others != 0) sendPeerState(id, true, others);
+                                for (u32 k = 1; k < MAX_PLAYERS; ++k)
+                                    if (others & peerBit(k)) sendPeerState(k, true, peerBit(id));
+                                char b[128];
+                                _snprintf(b, sizeof(b) - 1,
+                                          "peer connected id=%u (proto v%u)%s",
+                                          (unsigned)id, (unsigned)PROTOCOL_VERSION,
+                                          ident.empty() ? "" : " identity reserved");
+                                b[sizeof(b) - 1] = '\0';
+                                netLog(b);
+                                if (inbound_) inbound_->pushConnect(id);
+                            }
+                        }
+                    } else if (!isHost_ && type == PKT_WELCOME) {
+                        WelcomePacket w;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &w)) {
+                            if (w.version != PROTOCOL_VERSION) {
+                                char b[128];
+                                _snprintf(b, sizeof(b) - 1,
+                                          "protocol mismatch: host v%u, ours v%u",
+                                          (unsigned)w.version, (unsigned)PROTOCOL_VERSION);
+                                b[sizeof(b) - 1] = '\0';
+                                netErr(b);
+                            } else {
+                                InterlockedExchange(&myId_, (LONG)w.playerId);
+                                char b[96];
+                                _snprintf(b, sizeof(b) - 1,
+                                          "peer connected id=%u (proto v%u) - received WELCOME",
+                                          (unsigned)w.playerId, (unsigned)PROTOCOL_VERSION);
+                                b[sizeof(b) - 1] = '\0';
+                                netLog(b);
+                                if (inbound_) inbound_->pushConnect(0); // host id = 0
+                            }
+                        }
+                    } else if (!isHost_ && type == PKT_PEER_STATE) {
+                        // Roster edge for another join (relayed by the host). Same
+                        // game-thread edges as the host's own: a newcomer gets our
+                        // state re-announced, a leaver's proxies are purged.
+                        PeerStatePacket ps;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ps)
+                            && ps.peerId != 0 && ps.peerId < MAX_PLAYERS
+                            && ps.peerId != (u32)myId_ && inbound_) {
+                            epochSeen_.erase(ps.peerId);
+                            char b[64];
+                            _snprintf(b, sizeof(b) - 1, "roster: player %u %s",
+                                      (unsigned)ps.peerId, ps.present ? "joined" : "left");
+                            b[sizeof(b) - 1] = '\0';
+                            netLog(b);
+                            if (ps.present) inbound_->pushConnect(ps.peerId);
+                            else            inbound_->pushLeave(ps.peerId);
+                        }
+                    } else if (type == PKT_ENTITY_BATCH) {
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(EntityBatchHeader) && inbound_) {
+                            EntityBatchHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need =
+                                sizeof(EntityBatchHeader) + (unsigned)hdr.count * sizeof(EntityState);
+                            // Drop batches from a superseded session (protocol 44)
+                            // before they reach the WAN-sim queue / interp buffers.
+                            if (len >= need && acceptEpoch(hdr.ownerId, hdr.epoch)) {
+                                const enet_uint8* p = ev.packet->data + sizeof(EntityBatchHeader);
+                                for (unsigned i = 0; i < hdr.count; ++i) {
+                                    EntityState e;
+                                    std::memcpy(&e, p + i * sizeof(EntityState), sizeof(e));
+                                    deliverEntity(hdr.ownerId, hdr.sendMs, e);
+                                }
+                            }
+                        }
+                    } else if (type == PKT_EVENT) {
+                        // Reliable transition. Delivered immediately (NOT through the
+                        // WAN-sim delay buffer): the sim models unreliable-batch loss,
+                        // while the whole point of the reliable channel is that these
+                        // survive that loss - so we honour their guaranteed delivery.
+                        EventPacket evp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &evp)
+                            && inbound_) {
+                            inbound_->pushEvent(evp.ownerId, evp);
+                        }
+                    } else if (type == PKT_INV_SNAPSHOT) {
+                        // Reliable container-contents snapshot (Phase 4a). Like
+                        // PKT_EVENT, delivered immediately (not through the WAN-sim
+                        // delay buffer): it rides the reliable channel precisely so a
+                        // content change survives unreliable-batch loss.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(InvSnapshotHeader) && inbound_) {
+                            InvSnapshotHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(InvSnapshotHeader)
+                                          + (unsigned)hdr.count * sizeof(InvItemEntry);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(InvSnapshotHeader);
+                                u32 cKey[5] = { hdr.cType, hdr.cContainer,
+                                                hdr.cContainerSerial, hdr.cIndex, hdr.cSerial };
+                                const InvItemEntry* items =
+                                    (hdr.count > 0) ? reinterpret_cast<const InvItemEntry*>(p) : 0;
+                                inbound_->pushInv(hdr.ownerId, hdr.keyKind, cKey,
+                                                  items, hdr.count, hdr.flags);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_ITEM) {
+                        // Reliable world-item snapshot (Phase W1). Delivered immediately
+                        // (not through the WAN-sim delay buffer), like the inventory
+                        // snapshot - it rides the reliable channel so a ground-item
+                        // change survives unreliable-batch loss.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(WorldItemSnapshotHeader) && inbound_) {
+                            WorldItemSnapshotHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(WorldItemSnapshotHeader)
+                                          + (unsigned)hdr.count * sizeof(WorldItemEntry);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(WorldItemSnapshotHeader);
+                                const WorldItemEntry* items =
+                                    (hdr.count > 0) ? reinterpret_cast<const WorldItemEntry*>(p) : 0;
+                                inbound_->pushWorldItems(hdr.ownerId, items, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_ITEM_REMOVE) {
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(WorldItemRemoveHeader) && inbound_) {
+                            WorldItemRemoveHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(WorldItemRemoveHeader)
+                                          + (unsigned)hdr.count * sizeof(u32);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(WorldItemRemoveHeader);
+                                const u32* netIds =
+                                    (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
+                                inbound_->pushWorldRemove(hdr.ownerId, netIds, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_ITEM_CLAIM) {
+                        // A peer consumed the proxies it held for these netIds
+                        // (protocol 47), so the AUTHOR must destroy its real
+                        // ground objects - the pickup mirror W1 lacked.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(WorldItemClaimHeader) && inbound_) {
+                            WorldItemClaimHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(WorldItemClaimHeader)
+                                          + (unsigned)hdr.count * sizeof(u32);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(WorldItemClaimHeader);
+                                const u32* netIds =
+                                    (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
+                                inbound_->pushWorldClaim(hdr.ownerId, hdr.authorId,
+                                                         netIds, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_NPC_CENSUS) {
+                        // Reliable wide-radius NPC existence census (protocol
+                        // 36; v38 rows carry positions too). Latest-wins on
+                        // the game thread; delivered whole.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(NpcCensusHeader) && inbound_) {
+                            NpcCensusHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(NpcCensusHeader)
+                                          + (unsigned)hdr.count * 5 * sizeof(u32)
+                                          + (unsigned)hdr.count * 3 * sizeof(float);
+                            if (len >= need && hdr.count <= NPC_CENSUS_MAX) {
+                                const enet_uint8* p = ev.packet->data + sizeof(NpcCensusHeader);
+                                const u32* hands =
+                                    (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
+                                const float* pos = (hdr.count > 0)
+                                    ? reinterpret_cast<const float*>(
+                                          p + (unsigned)hdr.count * 5 * sizeof(u32))
+                                    : 0;
+                                inbound_->pushNpcCensus(hdr.ownerId, hands, pos, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_DROP) {
+                        // Reliable conservation drop intent (Phase W2). Delivered immediately
+                        // (not via the WAN-sim buffer) like the other reliable packets.
+                        WorldDropPacket wdp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wdp)
+                            && inbound_) {
+                            inbound_->pushWorldDrop(wdp.ownerId, wdp);
+                        }
+                    } else if (type == PKT_WORLD_PICKUP) {
+                        // Reliable conservation pickup intent (Phase W3), mirror of the drop.
+                        WorldPickupPacket wpp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wpp)
+                            && inbound_) {
+                            inbound_->pushWorldPickup(wpp.ownerId, wpp);
+                        }
+                    } else if (type == PKT_INV_XFER) {
+                        // Reliable cross-owner transfer intent (protocol 37).
+                        InvXferPacket ixp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ixp)
+                            && inbound_) {
+                            inbound_->pushInvXfer(ixp.ownerId, ixp);
+                        }
+                    } else if (type == PKT_INV_XFER_ACK) {
+                        // Reliable transfer verdict (protocol 50). Must be as
+                        // reliable as the intent it answers: a lost ack leaves
+                        // the author back on the wall-clock guess it replaces.
+                        InvXferAckPacket iap;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &iap)
+                            && inbound_) {
+                            inbound_->pushInvXferAck(iap.ownerId, iap);
+                        }
+                    } else if (type == PKT_MEDICAL) {
+                        // Reliable owner-authoritative vitals snapshot (phase 2).
+                        // Delivered immediately like the other reliable packets.
+                        MedicalPacket mp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &mp)
+                            && inbound_) {
+                            inbound_->pushMedical(mp.ownerId, mp);
+                        }
+                    } else if (type == PKT_TREATMENT) {
+                        // Reliable treatment delta (first aid on a driven copy,
+                        // forwarded to the owner).
+                        TreatmentPacket tp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &tp)
+                            && inbound_) {
+                            inbound_->pushTreatment(tp.ownerId, tp);
+                        }
+                    } else if (type == PKT_COMBAT_HIT) {
+                        // Reliable join-dealt damage report (join -> host): the
+                        // host wounds the authoritative world NPC.
+                        CombatHitPacket chp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
+                            && inbound_) {
+                            inbound_->pushCombatHit(chp.ownerId, chp);
+                        }
+                    } else if (type == PKT_SPEED_REQ || type == PKT_SPEED_SET) {
+                        // Reliable game-speed request/set (consensus speed sync).
+                        // Delivered immediately like the other reliable packets.
+                        SpeedPacket sp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sp)
+                            && inbound_) {
+                            inbound_->pushSpeed(sp.ownerId, sp);
+                        }
+                    } else if (type == PKT_STATS) {
+                        // Reliable owner-authoritative character-stats snapshot
+                        // (protocol 17). Delivered immediately like the others.
+                        StatsPacket stp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &stp)
+                            && inbound_) {
+                            inbound_->pushStats(stp.ownerId, stp);
+                        }
+                    } else if (type == PKT_MONEY) {
+                        // Reliable host-authoritative money-pool total
+                        // (protocol 52). Delivered immediately like the others.
+                        MoneyPacket mo;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &mo)
+                            && inbound_) {
+                            inbound_->pushMoney(mo.ownerId, mo);
+                        }
+                    } else if (type == PKT_MONEY_DELTA) {
+                        // Reliable money-pool delta (protocol 52, join -> host).
+                        // Ordered delivery is what makes the fold exactly-once.
+                        MoneyDeltaPacket md;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &md)
+                            && inbound_) {
+                            inbound_->pushMoneyDelta(md.ownerId, md);
+                        }
+                    } else if (isHost_ && type == PKT_VENDOR_DELTA) {
+                        // Reliable shop-counter stock change (protocol 60,
+                        // join -> host; the host alone owns the stock).
+                        VendorDeltaPacket vd;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &vd)
+                            && inbound_) {
+                            inbound_->pushVendorDelta(vd.ownerId, vd);
+                        }
+                    } else if (!isHost_ && type == PKT_VENDOR_CASH) {
+                        // Merchant cash at a mirrored counter (protocol 60, host -> join).
+                        VendorCashPacket vc;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &vc)
+                            && inbound_) {
+                            inbound_->pushVendorCash(vc.ownerId, vc);
+                        }
+                    } else if (type == PKT_TRADE) {
+                        // Trader lock / shop hand-over (protocol 65). NOT relayed:
+                        // the host is the hub - it arbitrates REQUESTs and re-sends
+                        // an accepted RELEASE itself, so every join sees one order.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(TradeHeader) && inbound_) {
+                            TradeHeader th;
+                            std::memcpy(&th, ev.packet->data, sizeof(th));
+                            unsigned need = sizeof(TradeHeader) + (unsigned)th.count * sizeof(InvItemEntry);
+                            if (len >= need) {
+                                const InvItemEntry* items = th.count > 0
+                                    ? reinterpret_cast<const InvItemEntry*>(ev.packet->data + sizeof(TradeHeader))
+                                    : 0;
+                                inbound_->pushTrade(th, items, th.count);
+                            }
+                        }
+                    } else if (type == PKT_NATIVE_TAKEN) {
+                        // A peer took a save-native ground item (protocol 61);
+                        // drop our copy. Relayed by the host to the other joins.
+                        NativeTakenPacket nt;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &nt)
+                            && inbound_) {
+                            inbound_->pushNativeTaken(nt.ownerId, nt);
+                        }
+                    } else if (type == PKT_FACTION) {
+                        // Reliable player-faction relation row (protocol 24):
+                        // host stream or join intent, disambiguated on apply.
+                        FactionPacket fa;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fa)
+                            && inbound_) {
+                            inbound_->pushFaction(fa.ownerId, fa);
+                        }
+                    } else if (type == PKT_TIME) {
+                        // Reliable host-authoritative game-clock sample
+                        // (protocol 25). Delivered immediately like the others.
+                        TimePacket ti;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ti)
+                            && inbound_) {
+                            inbound_->pushTime(ti.ownerId, ti);
+                        }
+                    } else if (type == PKT_DOOR) {
+                        // Reliable baked-door state row (protocol 26):
+                        // symmetric change-gated, disambiguated on apply.
+                        DoorPacket dp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dp)
+                            && inbound_) {
+                            inbound_->pushDoor(dp.ownerId, dp);
+                        }
+                    } else if (type == PKT_PROD) {
+                        // Reliable host-authoritative machine state row
+                        // (protocol 33), applied via the engine levers.
+                        ProdPacket pp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pp)
+                            && inbound_) {
+                            inbound_->pushProd(pp.ownerId, pp);
+                        }
+                    } else if (type == PKT_RESEARCH) {
+                        // Reliable host-authoritative known-research row
+                        // (protocol 38), applied via Research::startResearch.
+                        ResearchPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            inbound_->pushResearch(rp.ownerId, rp);
+                        }
+                    } else if (type == PKT_JOIN_STATE) {
+                        // Reliable squad-name / faction-name / permanent-job row
+                        // (protocol 64). The host also relays it to the other joins
+                        // (relayToJoins); receivers scope it by kind and role.
+                        JoinStatePacket jp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &jp)
+                            && inbound_) {
+                            inbound_->pushJoinState(jp.ownerId, jp);
+                        }
+                    } else if (type == PKT_DEED) {
+                        // Reliable property-deed ownership row (protocol 54):
+                        // symmetric, applied as a pure state write.
+                        DeedPacket dep;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dep)
+                            && inbound_) {
+                            inbound_->pushDeed(dep.ownerId, dep);
+                        }
+                    } else if (type == PKT_FIXTURE) {
+                        // Reliable runtime-fixture identity row (protocol 55):
+                        // symmetric, pairs the sender's hand with our own copy.
+                        FixturePacket fxp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fxp)
+                            && inbound_) {
+                            inbound_->pushFixture(fxp.ownerId, fxp);
+                        }
+                    } else if (type == PKT_CHARGEN) {
+                        // Reliable join character-creation result (protocol 57):
+                        // [CharGenHeader][name][raceSid][bod2].
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(CharGenHeader) && inbound_) {
+                            CharGenHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(CharGenHeader) + (unsigned)hdr.nameLen
+                                          + (unsigned)hdr.raceLen + hdr.dataLen;
+                            if (hdr.dataLen <= CHARGEN_DATA_MAX && len >= need) {
+                                const char* p = (const char*)ev.packet->data + sizeof(CharGenHeader);
+                                inbound_->pushCharGen(hdr, p, p + hdr.nameLen,
+                                                      (const u8*)(p + hdr.nameLen + hdr.raceLen));
+                            }
+                        }
+                    } else if (type == PKT_BUILD_PLACE) {
+                        // Reliable placed-building announcement (protocol 27):
+                        // describe/mint edge, keyed by the placer's hand.
+                        BuildPlacePacket bp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bp)
+                            && inbound_) {
+                            inbound_->pushBuildPlace(bp.ownerId, bp);
+                        }
+                    } else if (type == PKT_BUILD_STATE) {
+                        // Reliable construction-progress row (protocol 27),
+                        // placer-authoritative, translation-map applied.
+                        BuildStatePacket bs;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bs)
+                            && inbound_) {
+                            inbound_->pushBuildState(bs.ownerId, bs);
+                        }
+                    } else if (type == PKT_BUILD_DOOR) {
+                        // Reliable placed-building door row (protocol 28),
+                        // symmetric on the translated (bkey, index) identity.
+                        BuildDoorPacket bd;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bd)
+                            && inbound_) {
+                            inbound_->pushBuildDoor(bd.ownerId, bd);
+                        }
+                    } else if (type == PKT_BUILD_REMOVE) {
+                        // Reliable placer-authoritative building removal
+                        // (protocol 28).
+                        BuildRemovePacket br;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &br)
+                            && inbound_) {
+                            inbound_->pushBuildRemove(br.ownerId, br);
+                        }
+                    } else if (type == PKT_STEALTH) {
+                        // Unreliable stealth detection-map snapshot (protocol 20).
+                        // Delivered immediately; the game thread keeps latest-wins
+                        // per subject.
+                        StealthPacket slp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &slp)
+                            && inbound_) {
+                            inbound_->pushStealth(slp.ownerId, slp);
+                        }
+                    } else if (type == PKT_SPAWN_REQ) {
+                        // Reliable runtime-spawn query (protocol 21, join -> host).
+                        SpawnReqPacket srp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &srp)
+                            && inbound_) {
+                            inbound_->pushSpawnReq(srp.ownerId, srp);
+                        }
+                    } else if (type == PKT_SPAWN_INFO) {
+                        // Reliable runtime-spawn description (protocol 21, host -> join).
+                        SpawnInfoPacket sip;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sip)
+                            && inbound_) {
+                            inbound_->pushSpawnInfo(sip.ownerId, sip);
+                        }
+                    } else if (type == PKT_SAVE_REQ) {
+                        // Reliable join save request (protocol 31, join -> host).
+                        SaveReqPacket sq;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sq)
+                            && inbound_) {
+                            inbound_->pushSaveReq(sq.ownerId, sq);
+                        }
+                    } else if (type == PKT_SAVE_BEGIN) {
+                        // Reliable save-transfer announce (protocol 31, host -> join).
+                        SaveBeginPacket sb;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sb)
+                            && inbound_) {
+                            inbound_->pushSaveBegin(sb.ownerId, sb);
+                        }
+                    } else if (type == PKT_SAVE_FILE) {
+                        // Reliable save-file chunk (protocol 31, host -> join):
+                        // [SaveFileHeader][path[pathLen]][payload[dataLen]].
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(SaveFileHeader) && inbound_) {
+                            SaveFileHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(SaveFileHeader)
+                                          + (unsigned)hdr.pathLen + (unsigned)hdr.dataLen;
+                            if (len >= need && hdr.pathLen > 0 &&
+                                hdr.pathLen <= SAVE_PATH_MAX &&
+                                hdr.dataLen <= SAVE_CHUNK_MAX) {
+                                const enet_uint8* p = ev.packet->data + sizeof(SaveFileHeader);
+                                inbound_->pushSaveFile(hdr.ownerId, hdr,
+                                                       (const char*)p,
+                                                       (const u8*)p + hdr.pathLen);
+                            }
+                        }
+                    } else if (type == PKT_SAVE_DONE) {
+                        // Reliable save-transfer CRC table (protocol 31, host -> join):
+                        // [SaveDoneHeader][u32 crc * fileCount].
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(SaveDoneHeader) && inbound_) {
+                            SaveDoneHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(SaveDoneHeader)
+                                          + (unsigned)hdr.fileCount * sizeof(u32);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(SaveDoneHeader);
+                                inbound_->pushSaveDone(hdr.ownerId, hdr,
+                                                       (hdr.fileCount > 0)
+                                                           ? (const u32*)p : 0);
+                            }
+                        }
+                    } else if (type == PKT_SAVE_ACK) {
+                        // Reliable commit acknowledgement (protocol 31, join -> host).
+                        SaveAckPacket sa;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sa)
+                            && inbound_) {
+                            inbound_->pushSaveAck(sa.ownerId, sa);
+                        }
+                    } else if (!isHost_ && type == PKT_ROSTER) {
+                        // Who is player N (protocol 59, host -> join).
+                        RosterPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            rp.name[sizeof(rp.name) - 1] = '\0';
+                            inbound_->pushRoster(rp);
+                        }
+                    } else if (type == PKT_LOAD_GO) {
+                        // Reliable coordinated-load order (protocol 32, host -> join).
+                        LoadGoPacket lg;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &lg)
+                            && inbound_) {
+                            inbound_->pushLoadGo(lg.ownerId, lg);
+                        }
+                    } else if (type == PKT_LOAD_REQ) {
+                        // Reliable join load request (protocol 32, join -> host).
+                        LoadReqPacket lr;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &lr)
+                            && inbound_) {
+                            inbound_->pushLoadReq(lr.ownerId, lr);
+                        }
+                    } else if (type == PKT_LOAD_NACK) {
+                        // Reliable copy-missing/diverged answer (protocol 32, join -> host).
+                        LoadNackPacket ln;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ln)
+                            && inbound_) {
+                            inbound_->pushLoadNack(ln.ownerId, ln);
+                        }
+                    } else if (type == PKT_CAM_HINT) {
+                        // Camera hint (protocol 43): latest-wins interest
+                        // anchor. Accepted in BOTH directions - the attention
+                        // gate needs each side to know where the peer is
+                        // looking, not just the host.
+                        CamHintPacket chp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
+                            && inbound_) {
+                            inbound_->pushCamHint(chp.ownerId, chp);
+                        }
+                    } else if (type == PKT_CELL_CLAIM) {
+                        // Cell claim (protocol 49): presence-based authorship.
+                        // Both directions - each side claims the cells its own
+                        // tabs are standing in.
+                        CellClaimPacket ccp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ccp)
+                            && inbound_) {
+                            inbound_->pushCellClaim(ccp.ownerId, ccp);
+                        }
+                    } else if (type == PKT_TIME_PING) {
+                        // Wall-clock sync probe: echo immediately (host side). Answered
+                        // inside the service loop so the response delay stays minimal
+                        // (the join's rtt/2 assumption depends on it).
+                        TimePingPacket tp;
+                        if (isHost_ && readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &tp)) {
+                            TimePongPacket po;
+                            po.type = (u8)PKT_TIME_PONG;
+                            po.nonce = tp.nonce;
+                            po.echoWallMs = tp.senderWallMs;
+                            po.responderWallMs = (u32)coop::wallClockMs();
+                            ENetPacket* out = enet_packet_create(&po, sizeof(po), 0 /*unreliable*/);
+                            recordSend(out, (u32)(size_t)ev.peer->data, CH_UNRELIABLE);
+                            enet_peer_send(ev.peer, CH_UNRELIABLE, out);
+                        }
+                    } else if (type == PKT_TIME_PONG) {
+                        // Wall-clock sync echo (join side): derive one (rtt, offset)
+                        // sample; keep the minimum-RTT one (least queueing noise).
+                        TimePongPacket po;
+                        if (!isHost_ && readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &po)) {
+                            unsigned long t1 = coop::wallClockMs();
+                            unsigned long t0 = (unsigned long)po.echoWallMs;
+                            if (t1 >= t0) { // skip the (rare) sample spanning local midnight
+                                unsigned long rtt = t1 - t0;
+                                long offset = (long)po.responderWallMs + (long)(rtt / 2ul) - (long)t1;
+                                // Normalize a cross-midnight host/join wrap into [-12h, +12h).
+                                while (offset >= HALF_DAY_MS)  offset -= 2l * HALF_DAY_MS;
+                                while (offset < -HALF_DAY_MS)  offset += 2l * HALF_DAY_MS;
+                                ++syncSamples;
+                                if (rtt <= bestRttMs) { bestRttMs = rtt; bestOffsetMs = offset; }
+                            }
+                        }
+                    }
+                    enet_packet_destroy(ev.packet);
+                    break;
+                }
+                case ENET_EVENT_TYPE_DISCONNECT: {
+                    if (isHost_) {
+                        u32 id = (u32)(size_t)ev.peer->data;
+                        ev.peer->data = 0;
+                        char b[64];
+                        _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
+                        b[sizeof(b) - 1] = '\0';
+                        netLog(b);
+                        // A peer that never got past HELLO was never a member.
+                        if (id != 0 && id < MAX_PLAYERS) {
+                            idInUse_[id] = false;
+                            peerSteam_[id] = 0;
+                            peerUp_[id] = 0;
+                            epochSeen_.erase(id); // its epoch sequence ends (v44)
+                            sendPeerState(id, false, PEER_MASK_ALL);
+                            if (inbound_) inbound_->pushLeave(id);
+                        }
+                    } else {
+                        epochSeen_.clear(); // host gone: every relayed sequence ends
+                        serverPeer_ = 0;
+                        if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
+                        netLog("disconnected from host");
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        // Next transmit slot: a fixed 20 Hz schedule, re-anchored if this pass
+        // ran so long that the slot already passed (never a catch-up burst).
+        {
+            u32 nowTx = monoMs();
+            nextTx += (u32)TICK_MS;
+            if ((long)(nowTx - nextTx) >= 0) nextTx = nowTx + (u32)TICK_MS;
+        }
+
+        // Release any WAN-sim-delayed inbound entities whose arrival time has come.
+        // No-op (and cheap) when the sim is disabled / nothing is pending.
+        flushDelayed();
+
+        // Wall-clock time sync (join side): ping every ~2 s on the UNRELIABLE
+        // channel (a retransmitted probe would carry a stale t0), and log the
+        // best CLOCKSYNC estimate every ~5 s for the oracles' clock alignment.
+        if (!isHost_) {
+            DWORD nowTick = GetTickCount();
+            if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED
+                && (lastTimePing == 0 || nowTick - lastTimePing >= 2000)) {
+                lastTimePing = nowTick;
+                TimePingPacket tp;
+                tp.type = (u8)PKT_TIME_PING;
+                tp.nonce = pingNonce++;
+                tp.senderWallMs = (u32)coop::wallClockMs();
+                ENetPacket* out = enet_packet_create(&tp, sizeof(tp), 0 /*unreliable*/);
+                recordSend(out, 0, CH_UNRELIABLE);
+                enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
+            }
+            if (syncSamples > 0 && (lastClockLog == 0 || nowTick - lastClockLog >= 5000)) {
+                lastClockLog = nowTick;
+                char b[96];
+                _snprintf(b, sizeof(b) - 1, "CLOCKSYNC offset=%ld rtt=%lu n=%u",
+                          bestOffsetMs, bestRttMs, syncSamples);
+                b[sizeof(b) - 1] = '\0';
+                netLog(b);
+            }
+        }
+
+        // Drain + send any queued reliable events on CH_RELIABLE. ENet guarantees
+        // delivery + ordering on that channel, so these survive the unreliable-batch
+        // loss the WAN sim injects (the reliability proof the death oracle checks).
+        std::vector<EventPacket> events;
+        EnterCriticalSection(&outCs_);
+        events.swap(outEvents_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < events.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&events[i], sizeof(EventPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued conservation DROP intents on CH_RELIABLE (Phase W2). A
+        // fixed-size POD per drop, like an event; reliable so a drop is never lost.
+        //
+        // Ordered BEFORE the inventory snapshots below: both ride CH_RELIABLE, which ENet
+        // delivers in SEND order, so draining drops first means a drop intent can never be
+        // overtaken on the wire by the bag snapshot that reflects it. The peer's apply phase
+        // already runs drops before the reconcile within a tick, so this is belt-and-braces
+        // - but it removes an inversion that made the same-tick case confusing to reason
+        // about (and to read in a packet capture).
+        std::vector<WorldDropPacket> drops;
+        EnterCriticalSection(&outCs_);
+        drops.swap(outWorldDrops_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < drops.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&drops[i], sizeof(WorldDropPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued conservation PICKUP intents on CH_RELIABLE (Phase W3).
+        std::vector<WorldPickupPacket> pickups;
+        EnterCriticalSection(&outCs_);
+        pickups.swap(outWorldPickups_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < pickups.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&pickups[i], sizeof(WorldPickupPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued container-contents snapshots on CH_RELIABLE. Each
+        // is [InvSnapshotHeader][InvItemEntry*count]; only enqueued on content-change,
+        // so this channel stays quiet. Reliable so the change survives WAN loss.
+        std::vector<OutInv> invs;
+        EnterCriticalSection(&outCs_);
+        invs.swap(outInv_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < invs.size(); ++i) {
+            unsigned count = (unsigned)invs[i].items.size();
+            u8 iflags = invs[i].flags;
+            if (count > INV_ITEMS_MAX) { count = INV_ITEMS_MAX; iflags |= INV_FLAG_TRUNCATED; }
+            unsigned bytes = sizeof(InvSnapshotHeader) + count * sizeof(InvItemEntry);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            InvSnapshotHeader hdr;
+            hdr.type             = (u8)PKT_INV_SNAPSHOT;
+            hdr.ownerId          = invs[i].ownerId;
+            hdr.keyKind          = invs[i].keyKind;
+            hdr.flags            = iflags;
+            hdr.cType            = invs[i].cKey[0];
+            hdr.cContainer       = invs[i].cKey[1];
+            hdr.cContainerSerial = invs[i].cKey[2];
+            hdr.cIndex           = invs[i].cKey[3];
+            hdr.cSerial          = invs[i].cKey[4];
+            hdr.count            = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &invs[i].items[0],
+                            count * sizeof(InvItemEntry));
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued world-item snapshots on CH_RELIABLE (Phase W1). Each
+        // is [WorldItemSnapshotHeader][WorldItemEntry*count]; only enqueued for new/
+        // changed ground items, so a settled world produces no traffic. Host-authored.
+        std::vector<OutWorldItems> wis;
+        std::vector<OutWorldRemove> wrs;
+        std::vector<OutWorldClaim> wcs;
+        EnterCriticalSection(&outCs_);
+        wis.swap(outWorldItems_);
+        wrs.swap(outWorldRemove_);
+        wcs.swap(outWorldClaim_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < wis.size(); ++i) {
+            unsigned count = (unsigned)wis[i].items.size();
+            if (count > WORLD_ITEMS_MAX) count = WORLD_ITEMS_MAX;
+            unsigned bytes = sizeof(WorldItemSnapshotHeader) + count * sizeof(WorldItemEntry);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            WorldItemSnapshotHeader hdr;
+            hdr.type    = (u8)PKT_WORLD_ITEM;
+            hdr.ownerId = wis[i].ownerId;
+            hdr.count   = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &wis[i].items[0],
+                            count * sizeof(WorldItemEntry));
+            sendOut(out, CH_RELIABLE);
+        }
+        // Drain + send any queued world-item culls on CH_RELIABLE (Phase W1).
+        for (size_t i = 0; i < wrs.size(); ++i) {
+            unsigned count = (unsigned)wrs[i].netIds.size();
+            if (count > 255) count = 255;
+            unsigned bytes = sizeof(WorldItemRemoveHeader) + count * sizeof(u32);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            WorldItemRemoveHeader hdr;
+            hdr.type    = (u8)PKT_WORLD_ITEM_REMOVE;
+            hdr.ownerId = wrs[i].ownerId;
+            hdr.count   = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &wrs[i].netIds[0], count * sizeof(u32));
+            sendOut(out, CH_RELIABLE);
+        }
+        // Drain + send any queued world-item CLAIMS on CH_RELIABLE (protocol 47). A claim
+        // travels the opposite way to a cull: the peer that consumed a proxy tells the
+        // AUTHOR to destroy its real ground copy.
+        for (size_t i = 0; i < wcs.size(); ++i) {
+            unsigned count = (unsigned)wcs[i].netIds.size();
+            if (count > 255) count = 255;
+            unsigned bytes = sizeof(WorldItemClaimHeader) + count * sizeof(u32);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            WorldItemClaimHeader hdr;
+            hdr.type     = (u8)PKT_WORLD_ITEM_CLAIM;
+            hdr.ownerId  = wcs[i].ownerId;
+            hdr.authorId = wcs[i].authorId;
+            hdr.count    = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &wcs[i].netIds[0], count * sizeof(u32));
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued NPC existence censuses on CH_RELIABLE
+        // (protocol 36, host -> join, 1 Hz). ENet fragments the large list.
+        std::vector<OutNpcCensus> censuses;
+        EnterCriticalSection(&outCs_);
+        censuses.swap(outNpcCensus_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < censuses.size(); ++i) {
+            unsigned count = (unsigned)(censuses[i].hands.size() / 5);
+            if (count > NPC_CENSUS_MAX) count = NPC_CENSUS_MAX;
+            // v38 layout: hands block then positions block. A queue call that
+            // somehow lacked positions still sends a well-formed packet
+            // (zeroed positions), never a short one.
+            unsigned bytes = sizeof(NpcCensusHeader) + count * 5 * sizeof(u32)
+                           + count * 3 * sizeof(float);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            NpcCensusHeader hdr;
+            hdr.type    = (u8)PKT_NPC_CENSUS;
+            hdr.ownerId = censuses[i].ownerId;
+            hdr.count   = (u16)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0) {
+                std::memcpy(out->data + sizeof(hdr), &censuses[i].hands[0],
+                            count * 5 * sizeof(u32));
+                enet_uint8* pp = out->data + sizeof(hdr) + count * 5 * sizeof(u32);
+                std::memset(pp, 0, count * 3 * sizeof(float));
+                if (censuses[i].pos.size() >= count * 3)
+                    std::memcpy(pp, &censuses[i].pos[0], count * 3 * sizeof(float));
+            }
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued cross-owner TRANSFER intents on CH_RELIABLE
+        // (protocol 37). Fixed-size PODs like the drop/pickup intents.
+        std::vector<InvXferPacket> xfers;
+        EnterCriticalSection(&outCs_);
+        xfers.swap(outInvXfers_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < xfers.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&xfers[i], sizeof(InvXferPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Transfer VERDICTS (protocol 50), same channel as the intents.
+        std::vector<InvXferAckPacket> xferAcks;
+        EnterCriticalSection(&outCs_);
+        xferAcks.swap(outInvXferAcks_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < xferAcks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&xferAcks[i], sizeof(InvXferAckPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued medical snapshots + treatment deltas on
+        // CH_RELIABLE (phase 2). Fixed-size PODs like events; change-gated by the
+        // Replicator so steady state is silent.
+        std::vector<MedicalPacket>   meds;
+        std::vector<TreatmentPacket> treats;
+        std::vector<CombatHitPacket> combatHits;
+        EnterCriticalSection(&outCs_);
+        meds.swap(outMedical_);
+        treats.swap(outTreatments_);
+        combatHits.swap(outCombatHits_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < meds.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&meds[i], sizeof(MedicalPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+        for (size_t i = 0; i < treats.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&treats[i], sizeof(TreatmentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+        for (size_t i = 0; i < combatHits.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&combatHits[i], sizeof(CombatHitPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued game-speed packets on CH_RELIABLE (consensus
+        // speed sync). Change-gated by the Replicator; a lost SET would leave
+        // the engines running at different rates, so reliable is mandatory.
+        std::vector<SpeedPacket> speeds;
+        EnterCriticalSection(&outCs_);
+        speeds.swap(outSpeed_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < speeds.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&speeds[i], sizeof(SpeedPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued character-stats snapshots on CH_RELIABLE
+        // (protocol 17). Fixed-size PODs; change-gated by the Replicator so
+        // steady state is silent (stats creep slowly).
+        std::vector<StatsPacket> statPkts;
+        EnterCriticalSection(&outCs_);
+        statPkts.swap(outStats_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < statPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&statPkts[i], sizeof(StatsPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued money-pool totals on CH_RELIABLE (protocol
+        // 52). Fixed-size PODs; change-gated by the Replicator so a settled
+        // economy is silent. A lost total would diverge cats until the safety
+        // resend, so reliable is the right channel.
+        std::vector<OutMoney> moneyPkts;
+        EnterCriticalSection(&outCs_);
+        moneyPkts.swap(outMoney_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < moneyPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&moneyPkts[i].pkt, sizeof(MoneyPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE, moneyPkts[i].mask);
+        }
+
+        // Drain + send any queued money-pool deltas on CH_RELIABLE (protocol
+        // 52, join -> host). These are CONSERVATION intents, not snapshots: a
+        // dropped or reordered delta would silently mint or burn cats, which is
+        // exactly what the reliable ordered channel prevents.
+        std::vector<MoneyDeltaPacket> moneyDeltaPkts;
+        EnterCriticalSection(&outCs_);
+        moneyDeltaPkts.swap(outMoneyDelta_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < moneyDeltaPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&moneyDeltaPkts[i], sizeof(MoneyDeltaPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Shop-counter stock changes (protocol 60, join -> host): conservation
+        // intents like the money deltas - reliable + ordered, never coalesced.
+        std::vector<VendorDeltaPacket> vendorDeltaPkts;
+        EnterCriticalSection(&outCs_);
+        vendorDeltaPkts.swap(outVendorDelta_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < vendorDeltaPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&vendorDeltaPkts[i], sizeof(VendorDeltaPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+        {
+            std::vector<VendorCashPacket> vendorCashPkts;
+            EnterCriticalSection(&outCs_);
+            vendorCashPkts.swap(outVendorCash_);
+            LeaveCriticalSection(&outCs_);
+            for (size_t i = 0; i < vendorCashPkts.size(); ++i) {
+                ENetPacket* out = enet_packet_create(&vendorCashPkts[i], sizeof(VendorCashPacket),
+                                                     ENET_PACKET_FLAG_RELIABLE);
+                sendOut(out, CH_RELIABLE);
+            }
+        }
+        {
+            std::vector<NativeTakenPacket> nativeTakenPkts;
+            EnterCriticalSection(&outCs_);
+            nativeTakenPkts.swap(outNativeTaken_);
+            LeaveCriticalSection(&outCs_);
+            for (size_t i = 0; i < nativeTakenPkts.size(); ++i) {
+                ENetPacket* out = enet_packet_create(&nativeTakenPkts[i], sizeof(NativeTakenPacket),
+                                                     ENET_PACKET_FLAG_RELIABLE);
+                sendOut(out, CH_RELIABLE);
+            }
+        }
+        {
+            // Trader lock / shop hand-over (protocol 65): header + stock tail.
+            std::vector<OutTrade> tradePkts;
+            EnterCriticalSection(&outCs_);
+            tradePkts.swap(outTrade_);
+            LeaveCriticalSection(&outCs_);
+            for (size_t i = 0; i < tradePkts.size(); ++i) {
+                const OutTrade& ot = tradePkts[i];
+                size_t n = ot.items.size();
+                size_t bytes = sizeof(TradeHeader) + n * sizeof(InvItemEntry);
+                ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+                if (!out) continue;
+                std::memcpy(out->data, &ot.hdr, sizeof(TradeHeader));
+                if (n) std::memcpy(out->data + sizeof(TradeHeader), &ot.items[0], n * sizeof(InvItemEntry));
+                sendOut(out, CH_RELIABLE);
+            }
+        }
+
+        // Drain + send any queued faction-relation rows on CH_RELIABLE
+        // (protocol 24). Change-gated by the Replicator; a settled diplomacy
+        // is silent. A lost row would diverge hostility until the safety
+        // resend, so reliable is the right channel.
+        std::vector<FactionPacket> facPkts;
+        EnterCriticalSection(&outCs_);
+        facPkts.swap(outFaction_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < facPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&facPkts[i], sizeof(FactionPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued game-clock samples on CH_RELIABLE (protocol
+        // 25). ~1 Hz host broadcast; ordered-reliable keeps the join's offset
+        // estimator from ever seeing samples out of order.
+        std::vector<TimePacket> timePkts;
+        EnterCriticalSection(&outCs_);
+        timePkts.swap(outTime_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < timePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&timePkts[i], sizeof(TimePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued baked-door state rows on CH_RELIABLE
+        // (protocol 26). Change-gated by the Replicator; a settled town is
+        // silent. A lost row would leave a door diverged until the safety
+        // resend, so reliable is the right channel.
+        std::vector<DoorPacket> doorPkts;
+        EnterCriticalSection(&outCs_);
+        doorPkts.swap(outDoor_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < doorPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&doorPkts[i], sizeof(DoorPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued machine state rows on CH_RELIABLE
+        // (protocol 33). Host -> joins only in practice (the Replicator only
+        // publishes on the host); change-gated + safety-resent by the caller,
+        // so a settled base is near-silent.
+        std::vector<ProdPacket> prodPkts;
+        EnterCriticalSection(&outCs_);
+        prodPkts.swap(outProd_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < prodPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&prodPkts[i], sizeof(ProdPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued known-research rows on CH_RELIABLE
+        // (protocol 38; protocol 63: both roles - a join sends its own research,
+        // the host every row); first-sight + safety-resent by the caller, so a
+        // settled tech tree is near-silent.
+        std::vector<ResearchPacket> researchPkts;
+        EnterCriticalSection(&outCs_);
+        researchPkts.swap(outResearch_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < researchPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued join-state rows on CH_RELIABLE (protocol 64):
+        // both roles; change-gated + safety-resent by the caller.
+        std::vector<JoinStatePacket> joinStatePkts;
+        EnterCriticalSection(&outCs_);
+        joinStatePkts.swap(outJoinState_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < joinStatePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&joinStatePkts[i], sizeof(JoinStatePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued property-deed rows on CH_RELIABLE (protocol
+        // 54). SYMMETRIC - either client may buy - so this drains on both
+        // sides. First-sight + safety-resent by the caller; a party that owns a
+        // stable set of buildings is silent between resends.
+        std::vector<DeedPacket> deedPkts;
+        EnterCriticalSection(&outCs_);
+        deedPkts.swap(outDeed_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < deedPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&deedPkts[i], sizeof(DeedPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued runtime-fixture identity rows on CH_RELIABLE
+        // (protocol 55). SYMMETRIC: the pose path is bidirectional, so each side
+        // must be able to translate the other's fixture hands.
+        std::vector<FixturePacket> fixPkts;
+        EnterCriticalSection(&outCs_);
+        fixPkts.swap(outFixture_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < fixPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&fixPkts[i], sizeof(FixturePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // ---- CharCreate (protocol 57): pre-flattened character-creation results.
+        std::vector<std::vector<u8> > cgPkts;
+        EnterCriticalSection(&outCs_);
+        cgPkts.swap(outCharGen_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < cgPkts.size(); ++i) {
+            if (cgPkts[i].empty()) continue;
+            ENetPacket* out = enet_packet_create(&cgPkts[i][0], cgPkts[i].size(),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued placed-building announcements + progress
+        // rows on CH_RELIABLE (protocol 27). PLACE is a one-shot describe/mint
+        // edge (a lost one strands an invisible building on the peer - the
+        // protocol-21 lesson); STATE rows are change-gated by the Replicator
+        // (~1 Hz sample, 10 s safety resend while incomplete), so the channel
+        // is silent once every site completes. Same-channel ordered-reliable
+        // guarantees a STATE row never arrives before its PLACE.
+        std::vector<BuildPlacePacket> buildPlacePkts;
+        std::vector<BuildStatePacket> buildStatePkts;
+        EnterCriticalSection(&outCs_);
+        buildPlacePkts.swap(outBuildPlace_);
+        buildStatePkts.swap(outBuildState_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < buildPlacePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&buildPlacePkts[i], sizeof(BuildPlacePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+        for (size_t i = 0; i < buildStatePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&buildStatePkts[i], sizeof(BuildStatePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued placed-building door rows + removals on
+        // CH_RELIABLE (protocol 28). Door rows are change-gated by the
+        // Replicator (the protocol-26 door cadence on the translated key);
+        // a REMOVE is a one-shot edge - losing it would strand a ghost proxy
+        // on the peer, so reliable is mandatory.
+        std::vector<BuildDoorPacket>   buildDoorPkts;
+        std::vector<BuildRemovePacket> buildRemovePkts;
+        EnterCriticalSection(&outCs_);
+        buildDoorPkts.swap(outBuildDoor_);
+        buildRemovePkts.swap(outBuildRemove_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < buildDoorPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&buildDoorPkts[i], sizeof(BuildDoorPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+        for (size_t i = 0; i < buildRemovePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&buildRemovePkts[i], sizeof(BuildRemovePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued stealth detection-map snapshots on
+        // CH_UNRELIABLE (protocol 20). Latest-wins continuous state: loss just
+        // delays an arrow refresh until the next throttled snapshot.
+        std::vector<StealthPacket> stealthPkts;
+        EnterCriticalSection(&outCs_);
+        stealthPkts.swap(outStealth_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < stealthPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&stealthPkts[i], sizeof(StealthPacket),
+                                                 0 /*unreliable*/);
+            sendOut(out, CH_UNRELIABLE);
+        }
+
+        // Drain + send any queued camera hints on CH_UNRELIABLE (protocol
+        // 43, both directions, ~1 Hz). Latest wins; a lost hint is replaced
+        // by the next one a second later.
+        std::vector<CamHintPacket> camHints;
+        EnterCriticalSection(&outCs_);
+        camHints.swap(outCamHint_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < camHints.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&camHints[i], sizeof(CamHintPacket),
+                                                 0 /*unreliable*/);
+            sendOut(out, CH_UNRELIABLE);
+        }
+
+        // Cell claims ride CH_RELIABLE (protocol 49, ~1 Hz): losing one leaves
+        // the cell reading as host-authored until the next re-assert, and both
+        // sides authoring the same bodies is the failure this channel exists to
+        // prevent.
+        std::vector<CellClaimPacket> cellClaims;
+        EnterCriticalSection(&outCs_);
+        cellClaims.swap(outCellClaim_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < cellClaims.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&cellClaims[i], sizeof(CellClaimPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued runtime-spawn packets on CH_RELIABLE
+        // (protocol 21). Requests are debounced per hand and replies are
+        // cache-throttled by the Replicator, so the reliable channel stays
+        // quiet; a lost request would strand an invisible enemy on the join,
+        // so reliable is mandatory.
+        std::vector<SpawnReqPacket>  spawnReqs;
+        std::vector<SpawnInfoPacket> spawnInfos;
+        EnterCriticalSection(&outCs_);
+        spawnReqs.swap(outSpawnReq_);
+        spawnInfos.swap(outSpawnInfo_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < spawnReqs.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&spawnReqs[i], sizeof(SpawnReqPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+        for (size_t i = 0; i < spawnInfos.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&spawnInfos[i], sizeof(SpawnInfoPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE);
+        }
+
+        // Drain + send any queued coordinated-save packets on CH_BULK (protocol
+        // 31; moved off CH_RELIABLE in v44). REQ/ACK are fixed PODs; FILE/DONE
+        // carry their variable tails (ENet fragments + reassembles the ~4 KB
+        // chunks transparently on the reliable channel). Pacing lives in the
+        // SaveXfer sender (~32 chunks queued per 50 ms), so one drain never
+        // floods the channel - and CH_BULK keeps the megabytes off CH_RELIABLE,
+        // so a live transfer no longer stalls door/money/faction events.
+        std::vector<SaveReqPacket>   saveReqs;
+        std::vector<OutSaveBegin>    saveBegins;
+        std::vector<OutSaveFile>     saveFiles;
+        std::vector<OutSaveDone>     saveDones;
+        std::vector<SaveAckPacket>   saveAcks;
+        EnterCriticalSection(&outCs_);
+        saveReqs.swap(outSaveReq_);
+        saveBegins.swap(outSaveBegin_);
+        saveFiles.swap(outSaveFile_);
+        saveDones.swap(outSaveDone_);
+        saveAcks.swap(outSaveAck_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < saveReqs.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&saveReqs[i], sizeof(SaveReqPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK);
+        }
+        for (size_t i = 0; i < saveBegins.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&saveBegins[i].pkt, sizeof(SaveBeginPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK, saveBegins[i].mask);
+        }
+        for (size_t i = 0; i < saveFiles.size(); ++i) {
+            unsigned bytes = sizeof(SaveFileHeader) + (unsigned)saveFiles[i].tail.size();
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            std::memcpy(out->data, &saveFiles[i].hdr, sizeof(SaveFileHeader));
+            if (!saveFiles[i].tail.empty())
+                std::memcpy(out->data + sizeof(SaveFileHeader), &saveFiles[i].tail[0],
+                            saveFiles[i].tail.size());
+            sendOut(out, CH_BULK, saveFiles[i].mask);
+        }
+        for (size_t i = 0; i < saveDones.size(); ++i) {
+            unsigned bytes = sizeof(SaveDoneHeader)
+                           + (unsigned)saveDones[i].crcs.size() * sizeof(u32);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            std::memcpy(out->data, &saveDones[i].hdr, sizeof(SaveDoneHeader));
+            if (!saveDones[i].crcs.empty())
+                std::memcpy(out->data + sizeof(SaveDoneHeader), &saveDones[i].crcs[0],
+                            saveDones[i].crcs.size() * sizeof(u32));
+            sendOut(out, CH_BULK, saveDones[i].mask);
+        }
+        for (size_t i = 0; i < saveAcks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&saveAcks[i], sizeof(SaveAckPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK);
+        }
+
+        // Drain + send queued coordinated-load packets (protocol 32) on CH_BULK
+        // (v44). All fixed PODs: GO host -> join, REQ/NACK join -> host. They
+        // share CH_BULK with the save transfer they gate (a NACK's fallback
+        // stream must stay ordered behind its GO), and off CH_RELIABLE so they
+        // do not queue behind - or ahead of - live game events.
+        std::vector<OutLoadGo>      loadGos;
+        std::vector<OutRoster>      rosters;
+        std::vector<LoadReqPacket>  loadReqs;
+        std::vector<LoadNackPacket> loadNacks;
+        EnterCriticalSection(&outCs_);
+        loadGos.swap(outLoadGo_);
+        rosters.swap(outRoster_);
+        loadReqs.swap(outLoadReq_);
+        loadNacks.swap(outLoadNack_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < loadGos.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&loadGos[i].pkt, sizeof(LoadGoPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK, loadGos[i].mask);
+        }
+        for (size_t i = 0; i < rosters.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&rosters[i].pkt, sizeof(RosterPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK, rosters[i].mask);
+        }
+        for (size_t i = 0; i < loadReqs.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&loadReqs[i], sizeof(LoadReqPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK);
+        }
+        for (size_t i = 0; i < loadNacks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&loadNacks[i], sizeof(LoadNackPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_BULK);
+        }
+
+        // Transmit this peer's owned entities (latest snapshot), chunked so each
+        // batch fits one datagram - which on Steam means the 1200 B clamped MTU
+        // (ENet would otherwise send the oversized unreliable packet as RELIABLE
+        // fragments: retransmits + ordering stalls on the motion stream). Raw UDP
+        // keeps the full 17-entity chunk. Unreliable: the newest batch supersedes
+        // loss.
+        const unsigned batchCap = steam ? ENTITY_BATCH_MAX_STEAM : ENTITY_BATCH_MAX;
+        std::vector<EntityState> ents;
+        u32  owner = 0;
+        u32  stamp = 0;
+        bool have  = false;
+        EnterCriticalSection(&outCs_);
+        ents  = out_;
+        owner = outOwner_;
+        stamp = outStampMs_;
+        have  = haveOut_;
+        LeaveCriticalSection(&outCs_);
+
+        if (have && !ents.empty()) {
+            for (size_t off = 0; off < ents.size(); off += batchCap) {
+                unsigned count = (unsigned)(ents.size() - off);
+                if (count > batchCap) count = batchCap;
+
+                unsigned bytes = sizeof(EntityBatchHeader) + count * sizeof(EntityState);
+                ENetPacket* out = enet_packet_create(0, bytes, 0 /*unreliable*/);
+                EntityBatchHeader hdr;
+                hdr.type = (u8)PKT_ENTITY_BATCH; hdr.ownerId = owner; hdr.count = (u8)count;
+                hdr.sendMs = stamp;
+                hdr.epoch  = (u32)sendEpoch_; // v44: current session epoch
+                std::memcpy(out->data, &hdr, sizeof(hdr));
+                std::memcpy(out->data + sizeof(hdr), &ents[off], count * sizeof(EntityState));
+                sendOut(out, CH_UNRELIABLE);
+            }
+        }
+    }
+
+    if (enetHost_) { enet_host_destroy(enetHost_); enetHost_ = 0; }
+    if (steam) steamp2p::removeEnetHooks();
+    rec::sessionEnd();
+    InterlockedExchange(&running_, 0);
+}
+
+} // namespace coop

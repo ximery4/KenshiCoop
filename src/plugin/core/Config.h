@@ -1,0 +1,674 @@
+// Config - parse the KENSHICOOP_* environment variables once at load.
+//
+// Mode/role and all runtime knobs are env-driven so host vs join is chosen
+// without a recompile (the test harness sets these before launching Kenshi).
+
+#ifndef KENSHICOOP_CONFIG_H
+#define KENSHICOOP_CONFIG_H
+
+#include <string>
+#include <set>
+
+namespace coop {
+
+struct Config {
+    bool          isHost;          // KENSHICOOP_MODE != "join"
+    std::string   ip;              // KENSHICOOP_IP   (join target)
+    int           port;            // KENSHICOOP_PORT
+    std::string   save;            // KENSHICOOP_SAVE (auto-load; empty = manual)
+    int           testSeconds;     // KENSHICOOP_TEST_SECONDS (0 = no self-exit)
+    std::string   logPath;         // KENSHICOOP_LOG
+    std::string   scenario;        // KENSHICOOP_SCENARIO (empty = normal tick)
+    unsigned long autoLoadDelayMs; // KENSHICOOP_AUTOLOAD_DELAY_MS
+    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold"/"duel"/"squad"/"inventory"/"bedcage")
+                                   // host-only one-shot world spawn to bake a
+                                   // deterministic test scene into a save.
+    std::string   bakeSave;        // KENSHICOOP_BAKESAVE ("" = manual save): after
+                                   // a setup scene spawns, auto-write the fixture
+                                   // save under this name (SaveManager::save).
+    bool          probeRecruit;    // KENSHICOOP_PROBE_RECRUIT == "1" (join only):
+                                   // recruit diverged NPCs into the player squad
+                                   // to validate the AI-gating "inhabit" lever.
+    bool          aiSuspend;      // KENSHICOOP_AI_SUSPEND != "0" (BOTH roles; DEFAULT ON):
+                                   // detour Character::periodicUpdate to suspend the
+                                   // AI decision layer for any peer-DRIVEN body (keeps
+                                   // animation; stops self-tasking) - faction-safe.
+                                   // Phase 1b: host too, for units transferred into
+                                   // the join's tab (host then drives them).
+                                   // Promoted from probe to the default quieting layer
+                                   // (2026-07-05 review: pose_state 0.972 vs 0.962 with
+                                   // it on). "0" is the escape hatch; the legacy
+                                   // KENSHICOOP_PROBE_AISUSPEND=1 still forces it on.
+
+    // Debug WAN simulation: artificially delay (and optionally drop) inbound entity
+    // batches so the same loopback harness exercises the latency path - render
+    // interpolation, dead reckoning, stale-state enforcement - that a real internet
+    // link would impose. All zero (default) = no simulation, immediate delivery.
+    unsigned int  netSimDelayMs;   // KENSHICOOP_NETSIM_DELAY_MS  (base one-way delay)
+    unsigned int  netSimJitterMs;  // KENSHICOOP_NETSIM_JITTER_MS (+/- uniform variance)
+    unsigned int  netSimLossPct;   // KENSHICOOP_NETSIM_LOSS_PCT  (0-100 drop chance)
+
+    // Protocol 36 movement-smoothness live tuning (defaults = the historical
+    // constants; 0/absent = default). The interp knobs feed InterpConfig, the
+    // drive knobs feed the walk-drive's hard-snap / catch-up gains - all for
+    // WAN A/B runs without a rebuild.
+    bool         sendStamp;         // KENSHICOOP_SEND_STAMP != "0": index interp
+                                    // rings on the sender's capture stamp (wire
+                                    // v35); "0" = legacy arrival-time indexing
+                                    // (receiver-local A/B, no wire change)
+    unsigned int interpMinDelayMs;  // KENSHICOOP_INTERP_MIN_DELAY_MS  (50)
+    unsigned int interpMaxDelayMs;  // KENSHICOOP_INTERP_MAX_DELAY_MS  (200)
+    unsigned int interpMaxExtrapMs; // KENSHICOOP_INTERP_MAX_EXTRAP_MS (250)
+    float        interpCadenceK;    // KENSHICOOP_INTERP_CADENCE_K     (2.0)
+    unsigned int interpMaxCadenceDelayMs; // KENSHICOOP_INTERP_MAX_CADENCE_DELAY_MS (1200)
+    unsigned int interpStaleMs;     // KENSHICOOP_INTERP_STALE_MS      (2000)
+    float        interpSnapDist;    // KENSHICOOP_INTERP_SNAP_DIST     (50 u)
+    float        catchupK;          // KENSHICOOP_CATCHUP_K            (2.0)
+    float        snapDist;          // KENSHICOOP_SNAP_DIST            (8 u)
+    float        snapSeconds;       // KENSHICOOP_SNAP_SECONDS         (0.75 s)
+                                    // velocity-aware hard-snap gate: teleport a
+                                    // driven body only when it trails the newest
+                                    // sample by more than this much travel time
+                                    // (snapDist stays the slow-mover floor)
+    // Combat-drive convergence bands (2026-07-16 smoothness pass). All default to
+    // the ReplicatorUtil constants when the env is unset/0 (the drive keeps its own
+    // constant-initialized member unless the value is > 0), so ONE build sweeps them.
+    float        combatSoftDist;    // KENSHICOOP_COMBAT_SOFT_DIST     (6 u)
+    float        combatSnapDist;    // KENSHICOOP_COMBAT_SNAP_DIST     (20 u churn ceiling)
+    float        combatBigSnapDist; // KENSHICOOP_COMBAT_BIG_SNAP_DIST (60 u true-leave)
+    float        combatSlideMax;    // KENSHICOOP_COMBAT_SLIDE_MAX     (60 u/s slide cap floor)
+    unsigned int combatConvergeMs;  // KENSHICOOP_COMBAT_CONVERGE_MS   (400 ms hysteresis)
+
+    // Protocol 36 NPC existence census: wide-radius ghost-culling reach in
+    // world units. The host broadcasts the hand list of every world NPC within
+    // this radius at 1 Hz; the join suppresses local NPCs absent from it.
+    // 0 disables the census channel entirely (stream-bubble culling only).
+    float        censusRadius;      // KENSHICOOP_CENSUS_RADIUS        (2000 u)
+
+    // Census-mint reach (2026-07-11): how far from the join's own squad a
+    // census-missing host NPC may be proxy-minted, so host runtime spawns
+    // (raids) appear at render range and walk in instead of materializing at
+    // the ~200 u stream bubble. 0 disables (legacy stream-bubble minting).
+    float        spawnMintRadius;   // KENSHICOOP_SPAWN_MINT_RADIUS    (600 u)
+
+    // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
+    // census-PRESENT local NPC copy may drift from the host's census position
+    // before the join parks it back onto the host's spot (wide pass only,
+    // per-key cooldown). The census carries positions per row; existence
+    // culling is untouched. 0 disables parking.
+    float        censusParkDist;    // KENSHICOOP_CENSUS_PARK          (120 u)
+    float        censusWalkDist;    // KENSHICOOP_CENSUS_WALK          (400 u)
+
+    // Census ADOPTION reach (zone-load population parity, 2026-08-06): how far
+    // from a census row's position the join looks for one of its OWN bodies of
+    // the same template+faction to BIND to that row, instead of minting a proxy
+    // beside it. The zone-generated town case: both engines create the population
+    // when the zone streams in, from the same spawn points but with different
+    // engine hands, so nothing resolves, the join mints a full duplicate town and
+    // suppresses its own - measured 231 bodies against the host's 111, 133 mints
+    // and 125 hidden. Adoption binds the body that is already standing there.
+    // Sized off the MEASURED drift between the two copies of one townsperson
+    // (median 16 u, 86% inside 150 u) rather than off spawn accuracy - see the
+    // Config.cpp note for the distribution and for what the tail costs.
+    // 0 disables adoption (defer-only duplicate guard, i.e. the old behaviour).
+    float        adoptRadius;       // KENSHICOOP_ADOPT_RADIUS         (250 u)
+
+    // Attention gate (attention-gated reconciliation): how close an interest
+    // anchor - either client's tab leaders, either client's camera - must be
+    // to a body before the two worlds are reconciled there. A body no anchor
+    // is within this radius of is DORMANT: the host leaves it out of the
+    // census, and the join never suppresses it for being census-absent. That
+    // makes "the join sees an NPC the host doesn't" the intended outcome in a
+    // region nobody is watching, instead of a ghost to be hidden.
+    // Default 1000 u: above spawnMintRadius, so anything the join may proxy-
+    // mint is observed by construction, and well below censusRadius, so the
+    // gate actually bites on the outer census band. 0 disables the gate -
+    // every body is treated as observed, i.e. exactly the pre-gate behaviour
+    // (fail-open A/B hatch).
+    float        attentionRadius;   // KENSHICOOP_ATTENTION_RADIUS     (1000 u)
+
+    // Presence authority (protocol 49): each side claims the zone cells its own
+    // squad tabs stand in and authors NPC existence there, instead of the host
+    // authoring everywhere. DEFAULT ON as of v0.47. Set to "0" and authorityFor
+    // returns the host unconditionally, every gate that consults it collapses to
+    // the previous isHost branch, and the build behaves exactly as v0.46 did -
+    // which is the shape the scenario tier still runs in, since the harness pins
+    // the flag clear for every scenario that does not ask for it.
+    bool         cellAuth;          // KENSHICOOP_CELL_AUTH            (on)
+
+    // Co-location collapse (KENSHICOOP_CELL_COLLAPSE, DEFAULT ON): while the two
+    // squads stand in the SAME zone cell, resolve every claimed cell to the
+    // host, so being in one camp together behaves as v0.46 did while
+    // walking apart still gets per-cell authorship. Measured 2026-08-09 over 4
+    // valid runs per arm of escape_cohesion: host authority took dual_drive 4/4
+    // vs 1/4 and world_parity 4/4 vs 1/4 with no smoothness cost, while the same
+    // A/B on split_far2 had the join keep a steady 11 NPCs at its own town under
+    // cell authority against 5/5/23 without it. Hence a rule that switches on
+    // separation rather than a global winner. A/B escape hatch.
+    bool         cellCollapse;      // KENSHICOOP_CELL_COLLAPSE        (on)
+
+    // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI, DEFAULT ON): the join
+    // suspends the local AI of a census-band body (census-present, unstreamed)
+    // that diverges past censusParkDist_, so a captive/working slave can't flee
+    // and aggro the join's guards while the host has it working. Divergence-
+    // gated; well-tracking census NPCs keep their local AI. A/B escape hatch.
+    bool         censusFreezeAi;     // KENSHICOOP_CENSUS_FREEZE_AI     (on)
+
+    // Camera-anchored interest (KENSHICOOP_CAM_INTEREST, DEFAULT ON,
+    // protocol 43): interestCenters grows from the two squad-tab-leader
+    // spheres to up to FOUR anchors - + the local camera center + the peer's
+    // ~1 Hz camera hint (PKT_CAM_HINT), deduped within ~100 u. NPCs where a
+    // player is LOOKING (but no PC stands) stay streamed/listed. A/B hatch.
+    bool         camInterest;        // KENSHICOOP_CAM_INTEREST         (on)
+
+    // Task-selection observation spike: passively hook CharBody::setCurrentAction
+    // (the AI/order selection->execution seam) and log the chosen task tuple per
+    // body. Off by default; a diagnostic for the "stream selection, not motion"
+    // design direction. Changes no behavior.
+    bool         taskSelectSpike;    // KENSHICOOP_TASK_SPIKE           (off)
+
+    // Jail put-to-work desync spike: emit correlated [jail] STATE traces for
+    // captive bodies (owned PC in publishOwned, driven copy in applyTargets) so
+    // the twitch (brief cage-exit then re-cage) can be pinned. Read-only.
+    bool         jailProbe;          // KENSHICOOP_JAIL_PROBE           (off)
+
+    // Jail put-to-work observation spike (Phase A): host stops driving/
+    // suspending/self-healing a peer-owned captive so its local sim runs
+    // unopposed and its trajectory ([jail] OBSERVE) reveals the guard's intent
+    // (relocate to a work spot vs walk a job round). Read-only diagnostic.
+    bool         jailObserve;        // KENSHICOOP_JAIL_OBSERVE         (off)
+
+    // Starved-replica guard hold: how long (ms) a driven body whose stream
+    // went stale keeps its AI-suspend + damage-guard before releasing to
+    // local simulation - a WAN stall must not become an authority transfer.
+    // 0 = legacy release-on-stale.
+    unsigned int starveHoldMs;      // KENSHICOOP_STARVE_HOLD_MS       (10000)
+
+    // Injected fake wall-clock skew (KENSHICOOP_FAKE_CLOCK_SKEW_MS, may be
+    // negative; join only in practice). Shifts coop::wallClockMs() - i.e. BOTH
+    // the log-line timestamps AND the wire time-sync - so a loopback run can
+    // validate that CLOCKSYNC offset estimation + oracle clock alignment recover
+    // a genuine two-machine clock disagreement. 0 = real clock.
+    long          fakeClockSkewMs;
+
+    // Step-2 pruning experiment (KENSHICOOP_NO_DETACH == "1", join only): skip the
+    // sitter detachFromTownAI in applyRest, betting that default AI-suspend alone
+    // stops town-AI re-tasking. Off by default; for manual A/B runs only.
+    bool          noDetach;
+
+    // Divergence-gated authority (KENSHICOOP_GATE_AUTHORITY != "0", join only,
+    // DEFAULT ON - promoted 2026-07-05 after the step-4 A/B): world NPCs whose
+    // local AI sustainedly agrees with the host's raw task are TRUSTED (not
+    // suspended, not driven) until they diverge or drift; divergence re-engages
+    // the drive the same tick. Doctrine 18 in INTENT_REPLICATION.md.
+    bool          gateAuthority;
+
+    // Damage guard, BOTH sides (KENSHICOOP_DAMAGE_GUARD != "0"; DEFAULT ON):
+    // detour Character::hitByMeleeAttack so locally-simulated (cosmetic) fights
+    // apply no damage to DRIVEN bodies - Kenshi's medical model is local-only,
+    // so cosmetic damage would diverge forever. The guard set is "every body
+    // this client drives": peer world-NPC copies on the join; peer SQUAD-member
+    // copies on the host (extended 2026-07-06 after phase-1 player_combat
+    // measured the host copy of a join victim bleeding 40+ while join copies
+    // stayed 0). Outcomes stay owner-authoritative (KO/death/revive events).
+    // "0" is the escape hatch.
+    bool          damageGuard;
+
+    // Peer-ready scenario arming (KENSHICOOP_ARM_TIMEOUT_MS). A scenario's clock
+    // (onStart + elapsedMs) does not begin at gameplay start; it begins when this
+    // client first RECEIVES a peer's owned-entity batch (Inbound::sawRemoteEntity
+    // - on the host that is exactly "the join is loaded + streaming"), so no
+    // host-side scripted action can fire before the join is in-game. This value
+    // is the fallback: arm anyway after this many ms of gameplay (covers a peer
+    // that never connects / host-only diagnostics). 0 = arm immediately at
+    // gameplay start (the legacy behaviour; spike runs use this).
+    unsigned long scenarioArmTimeoutMs;
+
+    // Bidirectional ownership partition (KENSHICOOP_OWN_SQUAD, CSV of unsigned ints;
+    // KENSHICOOP_OWN_RANK accepted as an alias). Both clients load the SAME save and
+    // thus the SAME player squad; each client OWNS a disjoint set of SQUAD TABS chosen
+    // by save-stable tab rank (distinct hand-containers, sorted; 0 = first tab). Every
+    // member of an owned tab is controlled locally + streamed; the peer's tabs are
+    // driven from its stream. Default: host owns {0}, join owns {1} - one squad tab
+    // each. On a single-tab save the join owns nothing (one-directional, as before).
+    std::set<unsigned int> ownRanks;
+    // True only when ownRanks came from KENSHICOOP_OWN_SQUAD/OWN_RANK. When false
+    // the ranks are the role default and must follow a mid-session role switch
+    // (F2 panel Host<->Join), so the client owns {1} and does not claim the
+    // host's rank-0 player squad (which would freeze that unit locally).
+    bool          ownRanksFromEnv;
+
+    // Phase 4a inventory sync (KENSHICOOP_INV_SYNC: "1" force on, "0" force off,
+    // unset = ON for real sessions [scenario == ""] and the inventory scenarios).
+    // When on, both clients stream the contents of every squad member they OWN
+    // (equipped slots included) plus the host's registered storage container; the
+    // peer reconciles its local copies. Promoted to a real-session default after
+    // the 2026-07-07 remote session: equipment changes never crossed with it off.
+    // Scripted test scenarios outside the auto-on list keep it off.
+    bool          invSync;
+
+    // Protocol 37 cross-owner transfer intents (KENSHICOOP_XFER_SYNC: "1" force on,
+    // "0" force off, unset = ON whenever invSync is on). When on, BOTH clients run
+    // the completed-drag detector over every tracked container (own + received) and
+    // author reliable PKT_INV_XFER intents for moves that cross the single-writer
+    // ownership boundary; receivers relocate the real item between their own copies
+    // (conservation: no fabrication or destruction, so traded gear survives).
+    // Protocol 50 completes the round trip: the receiver answers each intent with
+    // PKT_INV_XFER_ACK, so the author settles on the verdict (measured ~100 ms)
+    // instead of waiting out XFER_GRACE_MS, which is now only the backstop for a
+    // peer that never answers.
+    // SUPERSEDED by blockXfer: when blockXfer is on, cross-owner drags are refused
+    // at the engine (nothing to replicate), so xferSync is forced OFF.
+    bool          xferSync;
+
+    // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER: "1" force on, "0" force off,
+    // unset = OFF for real sessions - Protocol 37 replicate-the-trade is the
+    // real-session default - and auto-ON ONLY for the xfer_block scenario, which
+    // exists to keep the veto code exercised).
+    // When on, a UI inventory drag whose SOURCE and DESTINATION squad characters
+    // are owned by DIFFERENT clients is refused at the engine (Inventory::tryAddItem
+    // detour) - the item stays in the source bag and nothing crosses the ownership
+    // boundary. This makes ground-drop the only cross-client transfer path (the
+    // dupe/wipe/weapon-vanish class of drag bug can't happen if the drag can't
+    // complete). Same-owner drags (a player managing their own squads) are always
+    // allowed; world containers and the vendor buyItem path are untouched. Retires
+    // Protocol 37 (forces xferSync off). "0" is the escape hatch (restores the
+    // Protocol 37 replicate-the-trade behaviour).
+    bool          blockXfer;
+
+    // Phase W1/W2 world-item sync (KENSHICOOP_WORLD_SYNC: "1" force on, "0" force
+    // off, unset = ON for real sessions [scenario == ""] and the world_item_* /
+    // drop / limb_loss scenarios). When on, the HOST streams free GROUND items in
+    // the interest sphere (host-authoritative, netId-keyed proxies on the join)
+    // and BOTH clients author gear drop/pickup conservation intents (W2/W3).
+    // Promoted to a real-session default after the 2026-07-07 remote session:
+    // dropped gear was invisible cross-client with it off.
+    bool          worldSync;
+
+    // Phase-2 medical sync (KENSHICOOP_MED_SYNC != "0"; DEFAULT ON): owner-
+    // authoritative vitals stream for player-squad members (blood, bleed,
+    // per-limb flesh + bandaging onto the peer's driven copies, change-gated
+    // reliable) + treatment forwarding (first aid administered on a driven copy
+    // returns to the body's owner as a raise-only bandage delta). World NPCs
+    // stay on the events-only model. "0" is the A/B escape hatch.
+    bool          medSync;
+
+    // Consensus game-speed sync (KENSHICOOP_SPEED_SYNC != "0"; DEFAULT ON):
+    // each client's UI speed (pause/1x/2x/3x) is a REQUEST; the host arbitrates
+    // effective = min(requests), capped at 1x while either player squad is in
+    // combat, and broadcasts the result both engines apply. Divergent speeds
+    // diverge every rate-based local simulation (medical, hunger, cosmetic
+    // fights). Pause travels as speed 0. "0" is the A/B escape hatch.
+    bool          speedSync;
+
+    // The combat leg of that arbitration, separately defeatable
+    // (KENSHICOOP_SPEED_COMBAT_CAP != "0"; DEFAULT ON = capped, i.e. the shipped
+    // behaviour). Pinning the sim to 1x during a fight is right for players -
+    // nobody wants a battle resolved at 5x - but it is wrong for a scenario whose
+    // subject is DISTANCE. run_apart crosses ~121 k u of bandit country, and every
+    // encounter along the way stretched a 3-minute crossing toward 15 while the
+    // squad walked away from the fight anyway. Only run_apart clears this; a
+    // scenario that measures combat must leave it set, because the cap is what
+    // lets a fight resolve at a watchable rate.
+    bool          speedCombatCap;
+
+    // KENSHICOOP_TRACK_MOVE=1 (DEFAULT OFF): log-only 1 Hz position track, one
+    // line per player squad tab. Gates nothing. Used to RECORD a walked route at
+    // usable resolution - cell claims fire once per 4608 u cell, which proved far
+    // too sparse to reconstruct a path (see Plugin::trackMove).
+    bool          trackMove;
+
+    // Character stats sync (KENSHICOOP_STATS_SYNC != "0"; DEFAULT ON;
+    // protocol 17): owner-authoritative CharStats stream for player-squad
+    // members (attributes/skills/xp onto the peer's driven copies, change-
+    // gated reliable). Without it, driven copies keep save-load stats all
+    // session - and the peer's engine resolves REAL fights with those stale
+    // numbers. "0" is the A/B escape hatch.
+    bool          statsSync;
+
+    // Carried-body sync (KENSHICOOP_CARRY_SYNC != "0"; DEFAULT ON;
+    // protocol 18): reliable pickup/drop edges + self-healing carried state
+    // for player-squad members, executed engine-native on each machine's
+    // local pair. Without it the peer sees the KO'd body dragged/teleported
+    // along the ground behind its carrier. "0" is the A/B escape hatch.
+    bool          carrySync;
+
+    // KENSHICOOP_GLIDE / coop_config.json "glide" (default ON): squad copies that
+    // cannot keep up by walking (owner's clock catch-up, or a copy that stopped
+    // obeying move orders) follow the streamed path by placement instead of
+    // trailing to the 150 u snap. 0 = walk drive + snap gate only.
+    bool          glide;
+
+    // Developer tools (docs/DEVTOOLS.md), coop_config.json / env:
+    //   devtools (KENSHICOOP_DEVTOOLS)        master switch, default OFF
+    //   devOverlay (KENSHICOOP_DEV_OVERLAY)   in-world debug markers at start (Ctrl+F9 toggles)
+    //   devRecord (KENSHICOOP_DEV_RECORD)     record every session's packets to kc_records\
+    //   devWatchdog (KENSHICOOP_DEV_WATCHDOG) desync rules + dumps to kc_dumps\ (default on with devtools)
+    //   devPort (KENSHICOOP_DEV_PORT)         telemetry UDP target on 127.0.0.1 (default 27850)
+    bool          devtools;
+    bool          devOverlay;
+    bool          devRecord;
+    bool          devWatchdog;
+    int           devTelemetryPort;
+
+    // KENSHICOOP_FURN_SYNC (default ON): furniture-occupancy sync (protocol 19)
+    // - reliable bed/cage enter/exit edges + self-healing occupancy state,
+    // executed engine-native (setBedMode/setPrisonMode) between each machine's
+    // local pair. "0" is the A/B escape hatch.
+    bool          furnSync;
+
+    // KENSHICOOP_CHAIN_SYNC (default ON): chained/pole prisoner sync
+    // (protocol 41) - a captive shackled to a prisoner POLE is chained
+    // (Character::isChained + setChainedMode), a different engine system from a
+    // cage (inSomething==IN_PRISON). Rides the furniture pipeline as kind=3.
+    // Without it a poled unit never crosses the wire (the join leaves it at the
+    // last carried/KO stage). "0" is the A/B escape hatch (beds/cages keep
+    // working) if it ever freezes a walking slave.
+    bool          chainSync;
+
+    // KENSHICOOP_STEALTH_SYNC (default ON): stealth sync (protocol 20) -
+    // continuous BODY_SNEAK posture apply on driven copies (engine-native
+    // setStealthMode) + the host-authored detection-indicator feedback stream
+    // (PKT_STEALTH -> the sneaker's owner replays notifyICanSeeYouSneaking).
+    // "0" is the A/B escape hatch.
+    bool          stealthSync;
+
+    // KENSHICOOP_PRONE_SYNC (default ON): prone-posture sync (protocol 53) -
+    // the owner's exact ProneState rides bodyState bits 9-11 and driven copies
+    // are posed with Character::setProneState, so a crippled crawler is not
+    // driven as an upright walker. The MedicalSystem::crippled half (the cause
+    // the engine's crawl gait keys on) rides the medical channel. "0" is the A/B
+    // escape hatch.
+    bool          proneSync;
+
+    // KENSHICOOP_MONEY_SYNC (default ON): the shared money pool (protocol 52).
+    // Kenshi keeps ONE player wallet per save, so both players spend from one
+    // purse with the HOST as authority: the join reports each local change as a
+    // signed delta, the host folds it in and publishes the total. Without it
+    // every purchase / sale / bounty moves cats on one client only, and the
+    // join's economy is erased by the next save (the host's wallet is the one
+    // that persists). "0" is the A/B escape hatch.
+    bool          moneySync;
+
+    // KENSHICOOP_SPAWN_SYNC (default ON): runtime-spawn proxy replication
+    // (protocol 21) - the join requests a description (PKT_SPAWN_REQ) for any
+    // streamed hand it cannot resolve (a host RUNTIME spawn: roaming squad,
+    // dialog ambush) and mints a local proxy body from the host's reply
+    // (PKT_SPAWN_INFO). Without it the host fights enemies the join can't
+    // see. Forced OFF for spawn_probe (the diagnostic baselines the failure
+    // modes). "0" is the A/B escape hatch.
+    bool          spawnSync;
+
+    // KENSHICOOP_RECRUIT_SYNC (default ON): recruitment sync (protocol 23) -
+    // a detour on PlayerInterface::recruit authors a reliable EVT_RECRUIT
+    // (old hand -> new hand) for every successful local recruit; the peer
+    // RE-KEYS its existing local copy of the recruited body to the new
+    // stream key (no duplicate proxy), and recruited hands are owned by
+    // their RECRUITER regardless of tab rank. Without it a recruit exists
+    // on the recruiting client only (recruit_probe finding). Forced OFF for
+    // recruit_probe (the diagnostic baselines the unsynced behaviour).
+    // "0" is the A/B escape hatch.
+    bool          recruitSync;
+
+    // KENSHICOOP_FACTION_SYNC (default ON): faction-relation sync (protocol
+    // 24) - the host streams the player-faction relation table (keyed by
+    // faction GameData stringID, change-gated reliable) and the join applies
+    // it via FactionRelations::setRelation; join-side relation mutations
+    // (detoured affectRelations) forward to the host as reliable intents.
+    // Without it attacking a faction flips hostility on one client only.
+    // Forced OFF for faction_probe (the diagnostic baselines the unsynced
+    // relations). "0" is the A/B escape hatch.
+    bool          factionSync;
+
+    // KENSHICOOP_TIME_SYNC (default ON): game-clock sync (protocol 25) - the
+    // host broadcasts its absolute in-game clock (PKT_TIME, ~1 Hz reliable);
+    // the join measures the offset and corrects it (step if a writable clock
+    // base exists, otherwise slew by scaling its local sim speed QUIETLY on
+    // top of the arbitrated consensus speed). Without it each client
+    // integrates its own clock from its own load/pause moments and day/night
+    // diverges. Forced OFF for time_probe (with speedSync, so the probe
+    // measures raw unsynced drift and its speed burst isn't re-arbitrated).
+    // "0" is the A/B escape hatch.
+    bool          timeSync;
+
+    // KENSHICOOP_TIME_BRAKE (default ON): the HOST half of that correction.
+    // Catching up only works while there is room above the consensus speed,
+    // and the slew clamps at 5x - so at a travelling session's 5x the join
+    // saturates and the offset simply stands (run 20260806_153111: slew pinned
+    // at 2.00 for 168 s, both clocks advancing at the same rate, offset flat at
+    // 0.16 gh). Down has room at every speed, so the host slows its own sim -
+    // locally, never on the wire - while the join is behind and out of
+    // headroom. "0" restores join-catches-up-or-nothing.
+    bool          timeBrake;
+
+    // KENSHICOOP_DOOR_SYNC (default ON): door/gate state sync (protocol 26) -
+    // a symmetric change-gated channel: both clients sample nearby baked
+    // doors ~1 Hz and stream rows whose (open, locked) moved vs a per-hand
+    // baseline; received rows apply through the engine's own door actions.
+    // Without it one player walks through a gate the other sees closed.
+    // Forced OFF for door_probe (it measures the unsynced baseline). "0" is
+    // the A/B escape hatch.
+    bool          doorSync;
+
+    // KENSHICOOP_BUILD_SYNC (default ON): placed-building sync (protocol 27)
+    // - a placer-authoritative describe/mint channel: a local placement
+    // (UI commit detour or programmatic) streams its template sid +
+    // transform keyed by the PLACER's hand; the peer mints a local proxy
+    // site and applies streamed construction-progress rows through the
+    // engine's own setter. Without it a building one player places does not
+    // exist for the other. Forced OFF for build_probe (it measures the
+    // unsynced baseline). "0" is the A/B escape hatch.
+    bool          buildSync;
+
+    // KENSHICOOP_BDOOR_SYNC (default ON): placed-building door + dismantle
+    // sync (protocol 28) - door rows on session-placed buildings translated
+    // through the protocol-27 build maps (keyed by the placer's building
+    // hand + door index), and placer-authoritative building removal
+    // (PKT_BUILD_REMOVE) so a dismantled/destroyed placed building removes
+    // its proxy on the peer. Forced OFF for bdoor_probe (it measures the
+    // unsynced baseline with the mint channel still on). "0" is the A/B
+    // escape hatch.
+    bool          bdoorSync;
+
+    // KENSHICOOP_HUNGER_SYNC (default ON): hunger sync (protocol 29) - the
+    // owner-authoritative hunger/fed scalars ride the PKT_MEDICAL snapshot
+    // (a sub-gate of medSync: OFF sends/applies the fields as -1 = not
+    // carried while the rest of the medical stream is untouched). Without it
+    // each client decays every character's hunger locally and eating only
+    // happens on the owner's client, so driven copies starve in the peer's
+    // view. Forced OFF for hunger_probe (it measures the unsynced baseline).
+    // "0" is the A/B escape hatch.
+    bool          hungerSync;
+
+    // KENSHICOOP_SAVE_SYNC (default ON): coordinated save + session resume
+    // (protocol 31) - every local save on the HOST (menu, quicksave,
+    // autosave, programmatic) triggers the host-authoritative flow: wait for
+    // the save folder to quiesce, then stream the whole folder to the join
+    // (PKT_SAVE_BEGIN/FILE/DONE, staged + CRC-verified + atomically
+    // committed, PKT_SAVE_ACK back). A save initiated on the JOIN is
+    // suppressed locally and forwarded as PKT_SAVE_REQ (one authoritative
+    // save; the transfer delivers the join's copy). Resume = both clients
+    // load the identical file. Forced OFF for save_probe (it measures the
+    // raw save behaviour with the detour alone). "0" is the A/B escape
+    // hatch.
+    bool          saveSync;
+
+    // KENSHICOOP_LOAD_SYNC (default ON): coordinated load (protocol 32) -
+    // a mid-session load on the HOST (menu or programmatic - the
+    // SaveManager::load detour catches them all) broadcasts PKT_LOAD_GO
+    // (name + folder fingerprint); the join fingerprint-verifies its local
+    // copy and loads the identical save, falling back to the protocol-31
+    // SaveXfer transfer when its copy is missing/diverged (PKT_LOAD_NACK).
+    // A load initiated on the JOIN is suppressed locally and forwarded as
+    // PKT_LOAD_REQ (the host arbitrates). Both sides run a full session
+    // reset on their own world-reload edge. Forced OFF for load_probe (it
+    // measures the raw swap behaviour with the detour + edge detection
+    // alone). "0" is the A/B escape hatch.
+    bool          loadSync;
+
+    // KENSHICOOP_PROD_SYNC (default ON): production machine sync (protocol
+    // 33) - the HOST samples machine-class buildings (production / crafting /
+    // furnace / farm / research) in the interest spheres ~1 Hz and streams
+    // power state, production state, output/input buffer amounts and farm
+    // growth floats (change-gated reliable, keyed by hand with the
+    // protocol-27 translation for session-placed machines); the join applies
+    // through the engine's own levers (switchPowerOn / setProductionItem /
+    // direct amount writes). Without it every machine simulates per-client
+    // and stored output, fuel, power and crop growth silently fork. Forced
+    // OFF for prod_probe (it measures the unsynced baseline). "0" is the A/B
+    // escape hatch.
+    bool          prodSync;
+
+    // KENSHICOOP_RESEARCH_SYNC (default ON): research tech-tree sync
+    // (protocol 38; protocol 63: a grow-only UNION) - BOTH clients sample their
+    // Research store's known set ~1 Hz (Research::isKnown over the shared
+    // RESEARCH GameData enumeration) and stream one reliable PKT_RESEARCH row
+    // per known stringID (a join only its own research; the host everything,
+    // relaying); the receiver applies each row via Research::startResearch -
+    // idempotent against already-known sids. Protocol 63 also sends a join's
+    // research-bench changes (the tech cost the research UI pays out of the
+    // bench) to the host as protocol-60 deltas (upstream #84). Without it the
+    // tech tree is per-client (spike 401). Forced OFF for research_probe (it
+    // measures the unsynced baseline). "0" is the A/B escape hatch.
+    bool          researchSync;
+
+    // KENSHICOOP_JOINSTATE_SYNC (default ON): join-authored state sync
+    // (protocol 64, upstream #74.1). Only the host's world is ever saved, so
+    // whatever a join sets on its own squad that the engine keeps locally was
+    // lost on the next coordinated save: squad display names (Nameless_0),
+    // the player faction name and every permanent job assignment. BOTH clients
+    // sample ~1 Hz and stream reliable PKT_JOIN_STATE rows on change (the
+    // loaded save is the silent baseline): squad names from each tab's owner,
+    // faction renames via the host (its word final), job lists join -> host
+    // (rewritten on the join's body only when they differ; > JS_JOBS_MAX jobs
+    // on one body are not synced). "0" is the A/B escape hatch.
+    bool          joinStateSync;
+
+    // KENSHICOOP_DEED_SYNC (default ON): property-deed sync (protocol 54) -
+    // BOTH clients sample the player faction's owned-building set ~1 Hz and
+    // stream one reliable PKT_DEED row per owned hand (first sight is the
+    // session baseline, then a safety resend that doubles as the retry for a
+    // peer whose copy of the building was not loaded yet); the receiver applies
+    // a pure state write (setFaction + add/removeOwnedObject), never the buy
+    // path. Without it, buying a house or shop is invisible to the partner: the
+    // buyer owns it, the partner still sees it for sale. Forced OFF for
+    // deed_probe (it measures the unsynced baseline). "0" is the A/B escape
+    // hatch.
+    bool          deedSync;
+
+    // KENSHICOOP_FIXTURE_SYNC (default ON): runtime-fixture identity (protocol
+    // 55) - BOTH clients announce the container/machine-class fixtures near
+    // their interest centers (hand + position + template) and pair each
+    // announcement with their own copy. It carries no gameplay state; it exists
+    // because a MINE is instantiated per client for a terrain node, so the same
+    // mine has a different hand on each side and every channel that quotes that
+    // hand fails: the mining pose does not reproduce (the peer sees no swing
+    // animation) and the mine's output never crosses. "0" is the A/B escape
+    // hatch back to raw hands.
+    bool          fixtureSync;
+
+    // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
+    // (protocol 34) - the HOST censuses container-bearing buildings (storage
+    // chests + the machine classes) in the interest spheres ~1 Hz and
+    // registers each with the container-inventory channel, replacing the
+    // single-container v1 registration; contents stream as the existing
+    // change-gated PKT_INV_SNAPSHOT (hash + settle window + safety resend),
+    // keyed by hand with the protocol-27 translation for session-placed
+    // buildings. The join reconciles through applyContainerContents. Without
+    // it every chest and machine inventory forks per-client the moment items
+    // land in it. Layered on invSync (no container channel, no store sync).
+    // Forced OFF for store_probe (it measures the unsynced baseline). "0" is
+    // the A/B escape hatch.
+    bool          storeSync;
+
+    // KENSHICOOP_VENDOR_SYNC (default ON): shared vendor stock (protocol 60).
+    // A shop's goods live in its counters (BF_SHOP furniture, not storage),
+    // which no channel carried: every client bought from its own copy, so one
+    // player could empty a shop the other still saw full. The host censuses
+    // the counters with the storage chests and mirrors them (INV_FLAG_SHOP);
+    // a join reports each change a trade makes to a mirrored counter as a
+    // PKT_VENDOR_DELTA the host applies, and skips its own restock of those
+    // shops. Layered on invSync + storeSync. "0" is the A/B escape hatch.
+    bool          vendorSync;
+
+    // KENSHICOOP_CORPSE_SYNC (default ON): shared corpse inventories (protocol
+    // 62, upstream #40). A dead NPC's (or animal's) inventory was carried by no
+    // channel: looting it changed only the looter's copy, so every player could
+    // take the same items again. The host's container census also takes the
+    // DEAD non-squad characters near the interest centers and authors their
+    // inventories (INV_FLAG_CORPSE); a join's loot pairs as a protocol-37
+    // transfer like any drag out of a host-authored container. Layered on
+    // invSync + storeSync. "0" is the A/B escape hatch.
+    bool          corpseSync;
+
+    // KENSHICOOP_SQUAD_SYNC (default ON): squad management sync (protocol 35)
+    // - a squad-tab MOVE re-containers the body (its hand changes) exactly
+    // like a recruit, but no engine function owns the UI path, so the roster
+    // is POLLED ~1 Hz (pointer -> hand diff; the Character* survives the
+    // re-container). Each edge streams as EVT_SQUAD_MOVE (the EVT_RECRUIT
+    // shape); the peer re-keys its local body to the new stream key and the
+    // ownership pins keep the mover authoritative regardless of how the tab
+    // ranks shuffle. Without it a moved unit freezes/forks on the peer.
+    // Forced OFF for squad_probe (it measures the unsynced baseline). "0" is
+    // the A/B escape hatch.
+    bool          squadSync;
+
+    // KENSHICOOP_LATEJOIN_SYNC (default ON): late-join/reconnect resync
+    // (protocol 30, no wire change) - on the peer-connect edge the
+    // Replicator re-announces every live placed-building PLACE (+ REMOVE
+    // for removed ones) and forces an immediate full resend across all
+    // change-gated reliable channels. Without it, state that moved before
+    // the connect heals only per-channel safety resend (up to 10 s), and a
+    // building placed before the connect never exists on the peer at all.
+    // Forced OFF for latejoin_probe (it measures the unsynced baseline).
+    // "0" is the A/B escape hatch.
+    bool          latejoinSync;
+
+    // Transport selection (KENSHICOOP_TRANSPORT): "udp" (default) or "steam".
+    // "steam" tunnels the unchanged ENet protocol over Steam P2P (legacy
+    // ISteamNetworking in the game's own steam_api64.dll): connections are
+    // made BY STEAMID with automatic NAT punching and Valve-relay fallback -
+    // no port forwarding, no public IPs, immune to CGNAT. Requires
+    // steamPeer below; falls back to UDP (loudly) when Steam is unavailable.
+    std::string   transport;
+
+    // The co-op partner's steamid64 (KENSHICOOP_STEAM_PEER). Two-code
+    // exchange: EACH side is configured with the OTHER's SteamID (sending to
+    // a SteamID implicitly accepts its session - no Steam callback plumbing).
+    unsigned long long steamPeer;
+
+    // Steam reachability spike (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo
+    // that peer on P2P channel 1 every 2 s and log RTT + punch-vs-relay,
+    // independent of the transport in use. 0 = off.
+    unsigned long long steamPing;
+
+    // In-game co-op panel session control (2026-07-13). When the mod is driven
+    // by the F2 panel instead of the env launchers, networking is DEFERRED at
+    // load: the session (host listen / client connect) only starts when the
+    // player hits Connect in the panel, using the role/transport/peer chosen
+    // there. autoConnect (KENSHICOOP_AUTOCONNECT=1) restores the legacy behaviour
+    // - start the session immediately from the env/config role+transport+peer.
+    // A test scenario or KENSHICOOP_TEST_SECONDS ALWAYS auto-starts regardless
+    // (the unattended harness never touches the panel); see Plugin.cpp.
+    bool               autoConnect;
+};
+
+// Read every KENSHICOOP_* var into 'out', applying host/join defaults. Values in
+// coop_config.json (next to the DLL) are used as the defaults, so precedence is
+// env var > config file > hard-coded default.
+void loadConfig(Config& out);
+
+// Re-read only the connection target (steamPeer / ip / port) from
+// coop_config.json into 'c'. Called on the panel's Connect so a friend-code edit
+// applies without restarting the game. No-op for keys absent from the file.
+void reloadPeerFromFile(Config& c);
+
+// One-line summary of the RESOLVED (effective) config - every sync channel's
+// on/off state plus the key tuning knobs - for the startup log. Makes "which
+// config did this run actually use?" answerable from the log alone (real
+// sessions included), instead of having to reconstruct it from env + file.
+std::string describeConfig(const Config& c);
+
+} // namespace coop
+
+#endif // KENSHICOOP_CONFIG_H

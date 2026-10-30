@@ -1,0 +1,1948 @@
+// ReplicatorAuthority.cpp - host-authority enforcement on the join (monolith
+// split from Replicator.cpp, 2026-07-12): applyNpcCensus (protocol 36 census
+// intake), enforceHostAuthority (suppress/park/cull of local copies the host
+// does not corroborate, far-mint requests), parkDivergedCopy, and the debug
+// marker HUD plumbing (debugMark/pruneDebugMarkers).
+//
+// Shared hubs: owns census_ (+ the merged censusHands_ view) and suppressed_;
+// reads proxyByKey_ (minted by the spawn TU); writes life_ via lifeSet.
+// Must NOT: change any log string - log phrasing is the API consumed by the
+// PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
+
+#include "ReplicatorUtil.h"
+
+namespace coop {
+
+void Replicator::debugMark(Character* c, int colorId, const char* tag) {
+    static int en = -1;
+    if (en < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_MARKERS");
+        en = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (en != 1 || !c) return;
+    ObjectHand oh;
+    bool haveHand = engine::charHandOf(c, oh);
+    std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
+    // Two ways an entry found here can be somebody else's, both fatal if trusted:
+    // the address was recycled onto a different body, or the GUI has already
+    // destroyed the label. Either means forget the entry and mint a fresh label
+    // rather than re-caption a dead one.
+    if (it != debugMarkers_.end()) {
+        bool mine  = haveHand && it->second.index == oh.index &&
+                                 it->second.serial == oh.serial;
+        bool alive = engine::markerAlive(it->second.label);
+        if (!mine || !alive) {
+            if (alive) engine::markerDestroy(it->second.label);
+            debugMarkers_.erase(it);
+            it = debugMarkers_.end();
+            // Say so, rate-limited. Without this the guard is invisible and a run
+            // that does not crash proves nothing about whether it was needed -
+            // which is the whole question, since the bug it prevents took a mint
+            // burst to reach. reused = the engine handed a new body an address we
+            // still had a label for; dead = the GUI destroyed the label under us.
+            static unsigned int nStale = 0;
+            if (++nStale <= 20u) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[marker] stale entry dropped (%s) n=%u",
+                    !mine ? "address reused" : "label destroyed by GUI", nStale);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+    if (it != debugMarkers_.end() && it->second.color == colorId) return;
+    char nm[40];
+    engine::charName(c, nm, sizeof(nm));
+    char cap[64];
+    _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
+    cap[sizeof(cap) - 1] = '\0';
+    if (it == debugMarkers_.end()) {
+        // No hand means no way to tell this body from the next one to land on
+        // this address, so don't cache a label we could never re-identify.
+        if (!haveHand) return;
+        void* l = engine::markerCreate(c, cap, colorId);
+        if (l) {
+            DebugMarker m;
+            m.label = l; m.color = colorId;
+            m.index = oh.index; m.serial = oh.serial;
+            debugMarkers_[c] = m;
+        }
+    } else if (engine::markerUpdate(it->second.label, cap, colorId)) {
+        it->second.color = colorId;
+    }
+}
+
+void Replicator::applyNpcCensus(GameWorld* gw, Inbound& in) {
+    std::deque<InboundNpcCensus> got;
+    in.drainNpcCensus(got);
+    if (got.empty()) return;
+    // Each SENDER's latest packet, into its own slot. The two-player version
+    // took got.back() into one shared set - with several authors that dropped
+    // all but one census per drain and, across ticks, let each sender's set
+    // overwrite the last, so existence, park positions and freshness flipped
+    // between authors every half second. Within one sender, latest still wins
+    // (reliable-ordered channel, 1 Hz - normally one pending), and a superseded
+    // packet of the same drain is skipped exactly as before.
+    for (std::deque<InboundNpcCensus>::const_iterator gi = got.begin();
+         gi != got.end(); ++gi) {
+        const InboundNpcCensus& nc = *gi;
+        bool superseded = false;
+        for (std::deque<InboundNpcCensus>::const_iterator li = gi + 1;
+             li != got.end() && !superseded; ++li)
+            superseded = (li->ownerId == nc.ownerId);
+        if (superseded) continue;
+        PeerCensus& pc = census_[nc.ownerId];
+        pc.hands.clear();
+        // Keep the outgoing rows as the previous sample before they are
+        // overwritten: two consecutive census positions FROM THE SAME AUTHOR are
+        // the only evidence we have of how fast its copy of an unstreamed body
+        // is travelling, and the walk-converge band has to out-pace exactly that.
+        pc.prev.swap(pc.pos);
+        pc.prevMs = pc.recvMs;
+        pc.pos.clear();
+        unsigned int n = (unsigned int)(nc.hands.size() / 5);
+        bool havePos = nc.pos.size() >= (size_t)n * 3;
+        // PER-ROW ownership check (2026-08-08). A census is one message from one
+        // sender, so before this the sender's rows spoke for every cell we
+        // happened to resolve to that sender - including cells the sender does
+        // not own. The publish side already filters, but it filters against the
+        // SENDER's map, and the maps are only eventually equal: a claim reaches
+        // a peer a round trip after it reaches its author, so there is always a
+        // window in which two sides resolve a cell differently and both believe
+        // they author it. cellLastOwner_ can make such a window permanent (see
+        // Replicator.h), and rebuilding authority out of converged state to
+        // close it was measured strictly worse - so the receiver has to tolerate
+        // disagreement rather than the publisher having to avoid it.
+        //
+        // Judging each row against OUR map is what makes the window harmless: a
+        // row may only speak for a cell we agree the sender owns, so while the
+        // maps disagree, each side simply ignores the other's rows about the
+        // contested region and keeps authoring its own copies. Rejected rows are
+        // NOT culled or hidden - a rejection means we think the cell belongs to
+        // someone else, and authorHoldsBody already declines to judge anything
+        // in a cell we own, so the body stays ours to author and nobody else's
+        // to enforce against.
+        unsigned int nOff = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            Key k;
+            k.t  = nc.hands[i * 5 + 0];
+            k.c  = nc.hands[i * 5 + 1];
+            k.cs = nc.hands[i * 5 + 2];
+            k.i  = nc.hands[i * 5 + 3];
+            k.s  = nc.hands[i * 5 + 4];
+            CensusPos cp;
+            if (havePos) {
+                cp.x = nc.pos[i * 3 + 0];
+                cp.y = nc.pos[i * 3 + 1];
+                cp.z = nc.pos[i * 3 + 2];
+            }
+            // Positionless rows cannot be placed in a cell, so they cannot be
+            // judged and are taken at face value, as before.
+            if (cellAuth_ && gw && havePos &&
+                authorityFor(gw, cp.x, cp.z) != nc.ownerId) {
+                ++nOff;
+                continue;
+            }
+            pc.hands.insert(k);
+            if (havePos) pc.pos[k] = cp;
+        }
+        censusOffCell_ += nOff;
+        pc.recvMs = nowMs();
+        censusRecvMs_ = pc.recvMs;
+        static unsigned long logTick = 0;
+        if ((censusRecvMs_ - logTick) > 10000) {
+            logTick = censusRecvMs_;
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                      "[census] recv n=%u kept=%u offcell=%u culls=%lu (offcell=%lu "
+                      "cellYields=%lu hostRefus=%lu)",
+                      n, n - nOff, nOff, censusCulls_, censusOffCell_, cellYields_,
+                      hostDriveRefusals_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    rebuildCensusUnion();
+}
+
+void Replicator::rebuildCensusUnion() {
+    // Every sender's latest rows, stale or not (staleness is judged where it is
+    // consumed, per sender - see censusVouches). With one sender this is that
+    // sender's set verbatim, which is what censusHands_/censusPos_ always were.
+    // Ascending owner id with insert-if-absent: the lowest id wins a hand two
+    // senders both list (they should not, since rows are filtered by cell
+    // authority, but a stale row can linger until its sender re-publishes).
+    censusHands_.clear();
+    censusPos_.clear();
+    censusOwnerOf_.clear();
+    unsigned long newest = 0;
+    for (std::map<u32, PeerCensus>::const_iterator ci = census_.begin();
+         ci != census_.end(); ++ci) {
+        const PeerCensus& pc = ci->second;
+        if (pc.recvMs != 0 && (newest == 0 || (long)(pc.recvMs - newest) > 0))
+            newest = pc.recvMs;
+        for (std::set<Key>::const_iterator hi = pc.hands.begin();
+             hi != pc.hands.end(); ++hi) {
+            if (!censusHands_.insert(*hi).second) continue;
+            censusOwnerOf_[*hi] = ci->first;
+            std::map<Key, CensusPos>::const_iterator pi = pc.pos.find(*hi);
+            if (pi != pc.pos.end()) censusPos_[*hi] = pi->second;
+        }
+    }
+    censusRecvMs_ = newest;
+}
+
+bool Replicator::censusVouches(const Key& k, unsigned long now) const {
+    for (std::map<u32, PeerCensus>::const_iterator it = census_.begin();
+         it != census_.end(); ++it) {
+        if (it->second.recvMs == 0 ||
+            (now - it->second.recvMs) > (unsigned long)CENSUS_FRESH_MS) continue;
+        if (it->second.hands.find(k) != it->second.hands.end()) return true;
+    }
+    return false;
+}
+
+Replicator::Key Replicator::identityKeyOf(Character* c, const EntityState& st) const {
+    std::map<Character*, Key>::const_iterator ci = canonicalOf_.find(c);
+    return (ci != canonicalOf_.end()) ? ci->second : keyOf(st);
+}
+
+void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
+    if (!gw) return;
+    // Hysteresis (step 5, spike 18): a hard streamed/unstreamed edge churned
+    // boundary NPCs. Suppress only after a sustained unstreamed run (~1 s), and
+    // restore only after a sustained streamed dwell (~2 s), counted in frames.
+    const unsigned int SUPPRESS_AFTER_FRAMES = 75;
+    const unsigned int RESTORE_AFTER_FRAMES  = 150;
+
+    // Hands the host streamed a fresh sample for this tick = the authoritative set.
+    std::set<Key> keep;
+    for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
+        if (it->second.fresh) keep.insert(it->first);
+    }
+
+    // Proxy bodies are EXEMPT from authority judgment (2026-07-11 census-mint
+    // fix): a proxy's LOCAL hand never matches its streamed key, so the wide
+    // pass saw every far-minted proxy as a census-absent ghost and froze it
+    // ~1 s after binding (spawn_far run 124346: all four proxies culled at
+    // their mint position, then the drive's teleports no-opped on the frozen
+    // bodies forever). Their existence authority is the census entry for the
+    // STREAM key that minted them; drive/starve policy is applyTargets'.
+    // ...but exempt from EXISTENCE judgment only. The same exemption used to
+    // skip parkDivergedCopy too, and nothing else bounds a proxy's position:
+    // the drive corrects it only while the host is streaming it, and a proxy
+    // is by definition a body that was out of stream range when it was minted.
+    // Left alone it walks off on local AI - 561 u and still swinging in run
+    // 20260806_091951 - which is the field report's "an enemy attacking my
+    // character on the join, not on the host". Its census row is keyed by the
+    // STREAM key that minted it, never its local hand, so keep that mapping.
+    std::set<Character*> proxyChars;
+    std::map<Character*, Key> proxyKeyOf;
+    for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
+         it != proxyByKey_.end(); ++it) {
+        proxyChars.insert(it->second);
+        proxyKeyOf[it->second] = it->first;
+    }
+    // Un-hide anything suppressed before it became a proxy / driven body (the
+    // mint can land on a body a previous pass already judged).
+    for (std::map<Key, Character*>::iterator it = suppressed_.begin();
+         it != suppressed_.end(); ) {
+        if (proxyChars.find(it->second) != proxyChars.end() ||
+            drivenChars_.find(it->second) != drivenChars_.end()) {
+            engine::restoreNpc(gw, it->second);
+            ++authRestores_;
+            { char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[authority] restore NPC hand=%u,%u (proxy/driven exemption; supp=%u)",
+                (unsigned)it->first.i, (unsigned)it->first.s,
+                (unsigned)suppressed_.size() - 1);
+              b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            suppressed_.erase(it++);
+        } else ++it;
+    }
+
+    // Enumerate the join's local world NPCs (same interest query as the host).
+    const unsigned int MAX_NPCS = 256;
+    static Character*  chars[MAX_NPCS]; // main-thread only
+    static EntityState states[MAX_NPCS];
+    bool nearTrunc = false;
+    unsigned int n = engine::listNpcs(gw, chars, states, MAX_NPCS, &nearTrunc);
+
+    // Protocol 36 wide-radius existence pass: enumerate out to the census
+    // radius so local-only ghosts get culled at render range instead of at the
+    // ~200 u stream bubble (the 2026-07-09 field report). Only while the
+    // host's census is FRESH - a silent census (host lagging, channel down)
+    // DISABLES wide culling rather than mass-suppressing the loaded area.
+    static Character*  wChars[NPC_CENSUS_MAX]; // main-thread only
+    static EntityState wStates[NPC_CENSUS_MAX];
+    unsigned int wn = 0;
+    bool wideTrunc = false;
+    // Fresh = SOME author's census is current. Per-body judgment below asks
+    // whether a current census actually lists the body (censusVouches), so one
+    // author going silent never lets another's rows stand in for it.
+    const unsigned long nowE = nowMs();
+    bool censusFresh = censusRadius_ > 0.0f && censusRecvMs_ != 0 &&
+                       (nowE - censusRecvMs_) <= (unsigned long)CENSUS_FRESH_MS;
+    if (censusFresh)
+        wn = engine::listNpcsWide(gw, censusRadius_, wChars, wStates, NPC_CENSUS_MAX,
+                                  &wideTrunc);
+
+    // Phase 0.5: account the time wide culling spends DISABLED. Staleness is a
+    // deliberate fail-open (a silent host must not mass-suppress a loaded area),
+    // but it is also unbounded ghost accumulation: nothing is judged while it
+    // lasts, and a body that drifts outside censusRadius_ before the census
+    // returns is never judged again. Host-side zone streaming stalls the main
+    // thread, and travel is a continuous zone stream - so the window opens
+    // exactly when it does the most damage.
+    {
+        unsigned long nowF = nowMs();
+        if (censusFreshChkMs_ != 0 && !censusFresh)
+            censusStaleMs_ += (nowF - censusFreshChkMs_);
+        if (censusFreshChkMs_ != 0 && censusFreshPrev_ && !censusFresh) {
+            ++censusStaleEdges_;
+            char b[144]; _snprintf(b, sizeof(b) - 1,
+                "[census] STALE (wide culling disabled; last recv %lums ago, edges=%lu)",
+                censusRecvMs_ ? (nowF - censusRecvMs_) : 0ul, censusStaleEdges_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else if (censusFreshChkMs_ != 0 && !censusFreshPrev_ && censusFresh) {
+            char b[144]; _snprintf(b, sizeof(b) - 1,
+                "[census] fresh again (wide culling re-enabled; staleMs=%lu edges=%lu)",
+                censusStaleMs_, censusStaleEdges_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        censusFreshPrev_  = censusFresh;
+        censusFreshChkMs_ = nowF;
+    }
+
+    // Proxy divergence telemetry. A minted proxy is exempt from BOTH passes
+    // below (its local hand matches no other client, so the wide pass used to
+    // read every far-minted proxy as a ghost and freeze it at its mint spot),
+    // and that exemption also skips parkDivergedCopy - so nothing bounds how
+    // far a proxy's local copy can wander from the body it stands for. The
+    // 2026-08-05 field report is what that looks like from the outside: an
+    // enemy attacking on the join while the host, holding the same body 213 u
+    // away with nobody near it, had it at peace. Measure the gap before
+    // deciding what to do about it - one line per proxy per second, against
+    // the census position of the STREAM key that minted it.
+    if (censusFresh && !proxyChars.empty()) {
+        unsigned long nowD = nowMs();
+        if ((nowD - proxyDriftLogMs_) >= 1000) {
+            proxyDriftLogMs_ = nowD;
+            for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
+                 it != proxyByKey_.end(); ++it) {
+                std::map<Key, CensusPos>::iterator cp = censusPos_.find(it->first);
+                if (cp == censusPos_.end()) continue;
+                float lx = 0, ly = 0, lz = 0;
+                if (!engine::readPos(it->second, &lx, &ly, &lz)) continue;
+                float d = dist3(lx, ly, lz, cp->second.x, cp->second.y, cp->second.z);
+                // How far the OWNER's copy moved since the last sweep. The
+                // census is 1 Hz and the game can run at 5x, so a sprinting
+                // body's local copy sits a whole census tick behind - it reads
+                // as hundreds of units of "drift" while actually tracking
+                // faithfully (the giveaway: local lands on the host position
+                // from the previous sample). Only a body whose owner is
+                // roughly still can be judged on distance alone.
+                float hstep = -1.0f;
+                std::map<Key, CensusPos>::iterator pv =
+                    proxyDriftPrev_.find(it->first);
+                if (pv != proxyDriftPrev_.end())
+                    hstep = dist3(pv->second.x, pv->second.y, pv->second.z,
+                                  cp->second.x, cp->second.y, cp->second.z);
+                proxyDriftPrev_[it->first] = cp->second;
+                // streamed=1 means applyTargets has a fresh sample and IS
+                // driving it; the uncorrected case is the one that can run away.
+                std::map<Key, Driven>::iterator dt = targets_.find(it->first);
+                bool streamed = (dt != targets_.end()) && dt->second.fresh;
+                engine::CombatRead pc;
+                bool fighting = engine::readCombat(it->second, &pc) &&
+                                (pc.inCombat || pc.modeActive);
+                char b[208]; _snprintf(b, sizeof(b) - 1,
+                    "[proxy] drift hand=%u,%u d=%.0f local=%.0f,%.0f host=%.0f,%.0f "
+                    "streamed=%d fight=%d hstep=%.0f",
+                    (unsigned)it->first.i, (unsigned)it->first.s, d, lx, lz,
+                    cp->second.x, cp->second.z, streamed ? 1 : 0, fighting ? 1 : 0,
+                    hstep);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    // Under presence authority this pass runs on both sides, so the audit label
+    // has to follow the role rather than the pass. With cellAuth off it is
+    // join-only and this still reads "join".
+    const char* roleTag = isHostRole() ? "host" : "join";
+    if (auditRows_) {
+        notePlatoons(gw, states, n, roleTag);
+        notePlatoons(gw, wStates, wn, roleTag);
+    }
+
+    // Attention gate anchors, resolved once for both passes and the audit. A
+    // body that no anchor is within attentionRadius_ of is DORMANT: nobody is
+    // standing near it and nobody is looking at it, so the host deliberately
+    // leaves it out of the census - and census silence over a region the host
+    // is not speaking for must not be read as "this body does not exist".
+    // That misreading is the whole ghost mechanism: a legitimate local NPC in
+    // a place only this client cares about, hidden because the other client
+    // never mentioned it.
+    float rawAnch[3 * engine::MAX_INTEREST_ANCHORS];
+    unsigned int nRawLeaders = 0;
+    unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch, &nRawLeaders);
+    float attnAnch[3 * engine::MAX_INTEREST_ANCHORS];
+    unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, nRawLeaders,
+                                              attnAnch);
+    unsigned int authSkip = 0;   // bodies left alone because we author them
+
+    // Prune counters for hands the enumeration no longer sees (left interest),
+    // preserving suppressed entries (a hidden body may drop out of the query but
+    // must keep its counters so the restore dwell works when it returns).
+    // Keyed by each body's wire identity - its binding for a proxy, else
+    // identityKeyOf - which is what the passes below judge by and what the
+    // publish side's attention gate (observedByPeer) is keyed on, so neither
+    // prune wipes the other's state.
+    std::set<Key> seen;
+    for (int pass = 0; pass < 2; ++pass) {
+        const unsigned int cnt = (pass == 0) ? n : wn;
+        Character* const* cs = (pass == 0) ? chars : wChars;
+        const EntityState* sts = (pass == 0) ? states : wStates;
+        for (unsigned int i = 0; i < cnt; ++i) {
+            std::map<Character*, Key>::const_iterator pk = proxyKeyOf.find(cs[i]);
+            seen.insert(pk != proxyKeyOf.end() ? pk->second : identityKeyOf(cs[i], sts[i]));
+        }
+    }
+    for (std::map<Key, AuthCount>::iterator it = authCount_.begin(); it != authCount_.end(); ) {
+        if (seen.find(it->first) == seen.end() &&
+            suppressed_.find(it->first) == suppressed_.end()) authCount_.erase(it++);
+        else ++it;
+    }
+    pruneAttention(seen);
+
+    for (unsigned int i = 0; i < n; ++i) {
+        // Proxy bodies answer to their streamed key's census entry, not their
+        // local hand (which exists on no other client) - never judge them.
+        // Reconcile their POSITION against that same census row, though.
+        if (proxyChars.find(chars[i]) != proxyChars.end()) {
+            reconcileProxy(chars[i], states[i], proxyKeyOf);
+            continue;
+        }
+        Key k = identityKeyOf(chars[i], states[i]);
+        // Presence authority: not every body here answers to us.
+        if (authorHoldsBody(gw, localId, k, chars[i], states[i].x, states[i].z)) {
+            authCount_[k].unstreamed = 0;
+            ++authSkip;
+            continue;
+        }
+        // Streamed = the hand is in this tick's fresh set, OR the body pointer is
+        // one applyTargets drove this tick. The pointer check covers combat-
+        // detached NPCs: detachFromTownAI re-containers the body, so its LOCAL
+        // key differs from the streamed key and the hand lookup alone would
+        // suppress an actively-driven combatant (crowd copies froze mid-brawl).
+        bool streamed = (keep.find(k) != keep.end()) ||
+                        (drivenChars_.find(chars[i]) != drivenChars_.end());
+        // Pop-out fix (2026-07-11 field report): existence authority is the
+        // CENSUS, drive authority is the STREAM. An NPC at the ~200 u stream-
+        // bubble boundary flickers in/out of the host's fresh set (the two
+        // clients disagree slightly on its position), and the old streamed-only
+        // signal hid REAL host-present NPCs ('Saint'/'Kumo' measured churning
+        // suppress->restore->suppress every few seconds). While the census is
+        // fresh, a census-present NPC is never suppressed - its local AI copy
+        // may drift, but it EXISTS; only census-absent ghosts get hidden. With
+        // no fresh census (hatch off / host lagging) the legacy streamed-only
+        // behavior stands.
+        bool exists = streamed || (censusFresh && censusVouches(k, nowE));
+        std::map<Key, Character*>::iterator s = suppressed_.find(k);
+        AuthCount& ac = authCount_[k];
+        // Dormant and census-absent: neither client is speaking for this
+        // region, so there is nothing to judge. Hold the debounce at zero
+        // rather than letting it climb silently - when attention does arrive,
+        // the body gets a full SUPPRESS_AFTER_FRAMES to be corroborated
+        // instead of being hidden on the first frame someone looks at it.
+        if (!exists && !observedAt(k, attnAnch, nAttnAnch,
+                                   states[i].x, states[i].y, states[i].z)) {
+            ac.unstreamed = 0;
+            continue;
+        }
+        if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
+        else        { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
+        if (exists) {
+            // Host owns it again: hand it back once the stream has DWELLED (a
+            // boundary NPC that flickers into the set for a frame stays hidden).
+            if (s != suppressed_.end() && ac.streamed >= RESTORE_AFTER_FRAMES) {
+                engine::restoreNpc(gw, chars[i]);
+                suppressed_.erase(s);
+                s = suppressed_.end();
+                ++authRestores_;
+                lifeSet(k, LIFE_RESOLVED, "restore");
+                { char nm[48]; engine::charName(chars[i], nm, sizeof(nm));
+                  char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] restore NPC hand=%u,%u name='%s' (supp=%u churn=%lu/%lu)",
+                    states[i].hIndex, states[i].hSerial, nm,
+                    (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
+                  b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            }
+            if (s == suppressed_.end() && !streamed) {
+                // Driven bodies report their tier (and own their marker) from
+                // applyTargets; a census-present LOCAL copy is the park-
+                // fallback regime.
+                lifeSet(k, LIFE_PARKED, "census-local");
+                debugMark(chars[i], 2, lifeName(LIFE_PARKED));
+                // world_parity 2026-07-17: the bubble used to be a park-free
+                // zone outright (run 185524: sub-50 u seat divergence fought
+                // the local seat AI every frame). But a census-present body
+                // inside the JOIN's bubble that the HOST does not stream
+                // (interest sets only partially overlap - the edge class the
+                // manual sessions kept catching, Pao at a steady 451 u) had
+                // NO reconciliation at all. parkDivergedCopy's 120 u
+                // threshold already exempts the seat-schedule class, and the
+                // divergence freeze quiets the AI that used to fight the
+                // teleport - so the park now runs here with the exact same
+                // gates as the wide pass.
+                float drift = parkDivergedCopy(chars[i], states[i], k);
+                if (censusFreezeAi_ && drift >= 0.0f)
+                    censusFreezeDivergedAi(chars[i], k, drift);
+            }
+            // NOTE: census position parking below the 120 u threshold stays
+            // OFF inside the stream bubble (npc_sync regression, run 185524):
+            // a bar NPC whose two schedules seat it ~50 u apart is re-placed
+            // by its own seat AI the same frame, so the park never sticks and the fight
+            // wrecked tracking/march. Inside the bubble the stream owns
+            // position truth; parking is a WIDE-pass render-range tool.
+        } else {
+            // Host neither streams nor lists it (census-absent ghost): after
+            // the debounce, hide + freeze so the local AI can't run a divergent
+            // copy on top of the host-driven world.
+            if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
+                // Phase 2 hardening: only RECORD the suppression when the engine
+                // call actually landed. A faulted hide used to be booked as done,
+                // leaving the body visible forever with no evidence - the silent
+                // version of the join-only-enemies field report. On failure the
+                // unstreamed streak keeps climbing, so this retries every frame;
+                // log the miss once at the threshold crossing.
+                if (engine::suppressNpc(gw, chars[i])) {
+                    suppressed_[k] = chars[i];
+                    ++authSuppresses_;
+                    lifeSet(k, LIFE_CULLED, "suppress");
+                    debugMark(chars[i], 1, lifeName(LIFE_CULLED));
+                    { char nm[48]; engine::charName(chars[i], nm, sizeof(nm));
+                      char b[192]; _snprintf(b, sizeof(b) - 1,
+                        "[authority] suppress NPC hand=%u,%u name='%s' (streamed=%u local=%u supp=%u churn=%lu/%lu)",
+                        states[i].hIndex, states[i].hSerial, nm, (unsigned)keep.size(), n,
+                        (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                } else if (ac.unstreamed == SUPPRESS_AFTER_FRAMES) {
+                    char b[96]; _snprintf(b, sizeof(b) - 1,
+                        "[authority] suppress MISS hand=%u,%u (engine call failed; retrying)",
+                        states[i].hIndex, states[i].hSerial);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+    }
+
+    // Wide pass (protocol 36): an NPC beyond the stream bubble is never in
+    // this tick's fresh set, so its authority signal is EXISTENCE (its hand in
+    // the host's census) rather than streaming. NPCs the near pass already
+    // judged are skipped by pointer (its streamed logic is authoritative
+    // inside the bubble), as is anything applyTargets drove this tick. Same
+    // hysteresis counters so a census-boundary NPC doesn't churn.
+    if (censusFresh && wn > 0) {
+        unsigned long nowR = nowMs(); // recently-driven grace reference
+        std::set<Character*> nearSet;
+        for (unsigned int i = 0; i < n; ++i) nearSet.insert(chars[i]);
+        for (unsigned int i = 0; i < wn; ++i) {
+            if (nearSet.find(wChars[i]) != nearSet.end()) continue;
+            if (proxyChars.find(wChars[i]) != proxyChars.end()) {
+                reconcileProxy(wChars[i], wStates[i], proxyKeyOf);
+                continue;
+            }
+            // Phase 2 mid-band tier: a DRIVEN body used to skip this pass
+            // entirely - correct for parking/suppression (the stream owns its
+            // position, and hiding a driven body is self-defeating), but it
+            // also skipped RESTORE: a suppressed NPC whose hand starts
+            // arriving on the mid tier is driven every tick (drivenChars_)
+            // yet stays hidden+frozen forever - walk orders no-op on a body
+            // removed from the update list, the permanent-zombie shape of
+            // the old boundary flicker. Let a driven body reach the restore
+            // branch (same dwell), and skip only park/suppress for it.
+            // "Driven" includes a grace window (drivenSeen_): a mid-tier
+            // body's samples ride the round-robin, and a rotation hiccup
+            // must not let the cull streak run while the body is between
+            // samples (run 103044: 6 cull/restore cycles per hand).
+            bool driven = drivenChars_.find(wChars[i]) != drivenChars_.end();
+            if (!driven) {
+                std::map<Character*, unsigned long>::iterator ds =
+                    drivenSeen_.find(wChars[i]);
+                driven = ds != drivenSeen_.end() && (nowR - ds->second) < 8000;
+            }
+            Key k = identityKeyOf(wChars[i], wStates[i]);
+            if (authorHoldsBody(gw, localId, k, wChars[i], wStates[i].x, wStates[i].z)) {
+                authCount_[k].unstreamed = 0;
+                ++authSkip;
+                continue;
+            }
+            if (driven && suppressed_.find(k) == suppressed_.end()) continue;
+            bool exists = censusVouches(k, nowE) ||
+                          keep.find(k) != keep.end() || driven;
+            std::map<Key, Character*>::iterator s = suppressed_.find(k);
+            AuthCount& ac = authCount_[k];
+            // Dormancy, same as the near pass - and this is where it matters
+            // most. The wide pass reaches out to censusRadius_ (2000 u), far
+            // past anywhere either player is looking, so most of what it used
+            // to cull sat in regions nobody was watching at all.
+            if (!exists && !observedAt(k, attnAnch, nAttnAnch,
+                                       wStates[i].x, wStates[i].y, wStates[i].z)) {
+                ac.unstreamed = 0;
+                continue;
+            }
+            if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
+            else        { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
+            if (exists) {
+                if (s != suppressed_.end() && ac.streamed >= RESTORE_AFTER_FRAMES) {
+                    engine::restoreNpc(gw, wChars[i]);
+                    suppressed_.erase(s);
+                    s = suppressed_.end();
+                    ++authRestores_;
+                    lifeSet(k, LIFE_RESOLVED, "restore-wide");
+                    debugMark(wChars[i], 2, lifeName(LIFE_PARKED));
+                    { char nm[48]; engine::charName(wChars[i], nm, sizeof(nm));
+                      char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[census] restore NPC hand=%u,%u name='%s' (supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial, nm,
+                        (unsigned)suppressed_.size(), censusCulls_);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                }
+                // v38 parking, wide-radius flavor (this is where the pack-
+                // hidden class lives: census-present wilderness NPCs far
+                // outside the stream bubble, each side simulating its own).
+                // Driven bodies excluded: the mid/near stream owns them.
+                if (s == suppressed_.end() && !driven) {
+                    lifeSet(k, LIFE_PARKED, "census-wide");
+                    float drift = parkDivergedCopy(wChars[i], wStates[i], k);
+                    // Census-band AI freeze: quiesce a diverging body's local AI
+                    // so it can't flee/aggro the join's guards (the mining-slave
+                    // cascade). drift < 0 = no census row / parking off -> skip.
+                    if (censusFreezeAi_ && drift >= 0.0f)
+                        censusFreezeDivergedAi(wChars[i], k, drift);
+                }
+            } else if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
+                if (engine::suppressNpc(gw, wChars[i])) {
+                    suppressed_[k] = wChars[i];
+                    ++authSuppresses_;
+                    ++censusCulls_;
+                    lifeSet(k, LIFE_CULLED, "cull-wide");
+                    debugMark(wChars[i], 1, lifeName(LIFE_CULLED));
+                    { char nm[48]; engine::charName(wChars[i], nm, sizeof(nm));
+                      char b[192]; _snprintf(b, sizeof(b) - 1,
+                        "[census] cull NPC hand=%u,%u name='%s' pos=%.0f,%.0f,%.0f "
+                        "(census=%u wide=%u supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial, nm,
+                        wStates[i].x, wStates[i].y, wStates[i].z,
+                        (unsigned)censusHands_.size(), wn,
+                        (unsigned)suppressed_.size(), censusCulls_);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                } else if (ac.unstreamed == SUPPRESS_AFTER_FRAMES) {
+                    char b[96]; _snprintf(b, sizeof(b) - 1,
+                        "[census] cull MISS hand=%u,%u (engine call failed; retrying)",
+                        wStates[i].hIndex, wStates[i].hSerial);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+    }
+
+    // Phase 2 hardening: RE-ASSERT the hide on a ~2 s cadence. suppressNpc is a
+    // one-shot (remove-from-update + clearGoals + setVisible(false)), but the
+    // engine can undo it on its own: an ambush squad's dialog/combat package
+    // re-tasks the body and zone streaming can re-add it to the update list -
+    // exactly the field report ("join-only enemies started dialog then attacked
+    // and stayed visible"). The call is idempotent, so re-applying to a body the
+    // engine never touched is a no-op; keys the host started streaming again are
+    // skipped (the restore dwell owns those).
+    //
+    // Lifetime guard (2026-07-11 join crash): the engine owns every suppressed
+    // body and can despawn it at any time - the 17:53 session held 93 hidden
+    // wildlife bodies through a zone stream, and the dump shows the engine's
+    // own sensory update walking a freed body. Before ANY touch, prove each
+    // entry live with a hand round-trip: SEH-read the pointer's CURRENT hand
+    // and resolve it back - the same pointer proves the body is alive (this
+    // survives engine re-containering, which only changes the hand); anything
+    // else means despawned, and the entry + marker + counters are dropped
+    // without touching the pointer. A live body whose hand CHANGED (combat
+    // detach re-containered it while hidden) migrates its entry to the new key
+    // so the hide keeps re-asserting - the old key would never resolve again.
+    unsigned long now = nowMs();
+    if ((now - authReassertMs_) >= 2000) {
+        authReassertMs_ = now;
+        unsigned int pruned = 0;
+        std::map<Key, Character*> migrated;
+        for (std::map<Key, Character*>::iterator it = suppressed_.begin();
+             it != suppressed_.end(); ) {
+            unsigned int h[5];
+            Character* live = 0;
+            if (engine::readHand(it->second, h))
+                live = engine::resolveCharByHand(h[0], h[1], h[2], h[3], h[4]);
+            if (live != it->second) {
+                std::map<Character*, DebugMarker>::iterator mi =
+                    debugMarkers_.find(it->second);
+                if (mi != debugMarkers_.end()) {
+                    engine::markerDestroy(mi->second.label);
+                    debugMarkers_.erase(mi);
+                }
+                authCount_.erase(it->first);
+                ++pruned; ++authPruned_;
+                suppressed_.erase(it++);
+                continue;
+            }
+            Key ck; ck.i = h[0]; ck.s = h[1]; ck.t = h[2];
+            ck.c = h[3]; ck.cs = h[4];
+            // ...re-keyed to the key the passes judge it by (identityKeyOf): a
+            // body driven under a peer key is hidden under that key, and moving
+            // its entry to the local hand would strand it where no pass looks.
+            std::map<Character*, Key>::const_iterator cn = canonicalOf_.find(it->second);
+            if (cn != canonicalOf_.end()) ck = cn->second;
+            if (ck < it->first || it->first < ck) {
+                migrated[ck] = it->second;
+                authCount_.erase(it->first);
+                suppressed_.erase(it++);
+                continue;
+            }
+            if (keep.find(it->first) != keep.end()) { ++it; continue; }
+            // A combat-detached body is driven under a DIFFERENT streamed key
+            // (pointer identity survives the re-containering); never re-hide a
+            // body applyTargets drove this tick.
+            if (drivenChars_.find(it->second) != drivenChars_.end()) { ++it; continue; }
+            engine::suppressNpc(gw, it->second);
+            ++it;
+        }
+        for (std::map<Key, Character*>::iterator it = migrated.begin();
+             it != migrated.end(); ++it) {
+            if (suppressed_.find(it->first) != suppressed_.end()) continue;
+            suppressed_[it->first] = it->second;
+            if (keep.find(it->first) == keep.end() &&
+                drivenChars_.find(it->second) == drivenChars_.end())
+                engine::suppressNpc(gw, it->second);
+        }
+        if (pruned > 0) {
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[authority] pruned %u stale suppressed entries (despawned; supp=%u total=%lu)",
+                pruned, (unsigned)suppressed_.size(), authPruned_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Marker map hygiene on the same cadence: drop labels whose Character*
+        // wasn't vouched live this pass (this tick's enumerations, driven and
+        // proxy sets, plus the just-validated suppressed bodies). A pruned
+        // body that comes back into judgment simply gets a fresh label.
+        if (!debugMarkers_.empty()) {
+            std::set<Character*> vouched;
+            for (unsigned int i = 0; i < n; ++i)  vouched.insert(chars[i]);
+            for (unsigned int i = 0; i < wn; ++i) vouched.insert(wChars[i]);
+            vouched.insert(drivenChars_.begin(), drivenChars_.end());
+            vouched.insert(proxyChars.begin(), proxyChars.end());
+            for (std::map<Key, Character*>::iterator it = suppressed_.begin();
+                 it != suppressed_.end(); ++it) vouched.insert(it->second);
+            pruneDebugMarkers(vouched);
+        }
+    }
+
+    // Existence-audit probe (pack-hidden investigation, 2026-07-11): a 5 s
+    // census of what THIS client's world holds vs what the host vouches for,
+    // classifying every enumerated NPC into exactly one bucket:
+    //   drv   - streamed/driven this tick (host actively drives it)
+    //   cen   - census-present, unstreamed (legit local-sim copy, host has it)
+    //   hid   - booked suppressed (we hid it)
+    //   dorm  - census-absent and unobserved (attention gate): no anchor is
+    //           within attentionRadius_, so the host is not speaking for this
+    //           region and we are not judging it. Deliberately NOT a ghost -
+    //           these are the bodies the gate exists to leave alone.
+    //   ghost - census-absent, observed, NOT suppressed (the visible-on-join-
+    //           only class: either inside the suppress debounce, judged only
+    //           while the census was stale, or escaping judgment entirely)
+    // ghost is the bucket the field reports live in - it should only ever be
+    // transient (one debounce, ~1 s). Test-ExistenceParity gates on it.
+    // KENSHICOOP_DEBUG_CENSUS=1 additionally dumps a row per ghost.
+    static unsigned long auditMs = 0; // main-thread only
+    if ((now - auditMs) >= 5000) {
+        auditMs = now;
+        unsigned int cDrv = 0, cCen = 0, cHid = 0, cGhost = 0, cDorm = 0;
+        unsigned int cMine = 0;   // bodies in cells WE author (presence authority)
+        // Safety check on the attention gate. The design rests on a squad
+        // never going dormant just because no camera is on it: every squad-tab
+        // LEADER is an interest anchor, so bodies beside a leader are observed
+        // by construction. What is NOT covered by construction is a squad
+        // member that walked away from its leader - nothing anchors it.
+        // dormPc counts dormant bodies within attentionRadius_ of ANY player
+        // character, i.e. bodies standing next to somebody's squad that we
+        // stopped judging anyway. It must read 0.
+        const unsigned int MAX_PC = 32;
+        static EntityState pcStates[MAX_PC];  // main-thread only
+        unsigned int nPc = 0;
+        if (attentionRadius_ > 0.0f)
+            nPc = engine::captureSquad(gw, /*leaderOnly*/ false, pcStates, MAX_PC);
+        unsigned int cDormPc = 0;
+        unsigned int dormPcRows = 0;   // offender dumps this sample (see below)
+        static int dumpGhost = -1;
+        if (dumpGhost < 0) {
+            const char* e = getenv("KENSHICOOP_DEBUG_CENSUS");
+            dumpGhost = (e && e[0] == '1') ? 1 : 0;
+        }
+        std::set<Character*> counted;
+        std::set<Key> emittedKeys; // world_parity: hands already dumped
+        unsigned int ghostRows = 0;
+        // Phase 0.5 horizon probe: how far out do ghosts actually sit? Anything
+        // past censusRadius_ is never enumerated at all, so it cannot appear in
+        // ANY bucket here - the ghost count silently stops at the horizon while
+        // the player keeps seeing bodies past it. If ghostMax rides up against
+        // the radius (and ghostEdge is non-zero), the cull horizon is the
+        // binding constraint and KENSHICOOP_CENSUS_RADIUS is the lever; if
+        // ghosts cluster close in, the cause is debounce/staleness/caps instead.
+        // Distances are measured against the RAW anchors - how far out ghosts
+        // sit, regardless of who can speak for the region - while the
+        // classification below re-uses the vetoed set the passes judged with.
+        const float* anch = rawAnch;
+        unsigned int nAnch = nRawAnch;
+        float ghostMaxD = -1.0f;
+        unsigned int ghostEdge = 0;
+        const float EDGE_BAND = censusRadius_ * 0.8f;
+        for (int pass = 0; pass < 2; ++pass) {
+            unsigned int cnt = (pass == 0) ? n : wn;
+            Character**  cs  = (pass == 0) ? chars : wChars;
+            EntityState* sts = (pass == 0) ? states : wStates;
+            for (unsigned int i = 0; i < cnt; ++i) {
+                if (!counted.insert(cs[i]).second) continue;
+                Key k = identityKeyOf(cs[i], sts[i]);
+                const char* cls;
+                if (proxyChars.find(cs[i]) != proxyChars.end() ||
+                    keep.find(k) != keep.end() ||
+                    drivenChars_.find(cs[i]) != drivenChars_.end()) {
+                    cls = "drv"; ++cDrv;
+                } else if (suppressed_.find(k) != suppressed_.end()) {
+                    cls = "hid"; ++cHid;
+                } else if (cellAuth_ &&
+                           authorityFor(gw, sts[i].x, sts[i].z) == localId) {
+                    // Ours to author - it is not a ghost for lacking a census
+                    // row, because nobody but us was ever going to write one.
+                    cls = "mine"; ++cMine;
+                } else if (censusFresh && censusVouches(k, nowE)) {
+                    cls = "cen"; ++cCen;
+                } else if (!observedAt(k, attnAnch, nAttnAnch,
+                                       sts[i].x, sts[i].y, sts[i].z)) {
+                    cls = "dorm"; ++cDorm;
+                    for (unsigned int p = 0; p < nPc; ++p) {
+                        float dPc = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                          pcStates[p].x, pcStates[p].y,
+                                          pcStates[p].z);
+                        if (dPc > attentionRadius_) continue;
+                        ++cDormPc;
+                        // A count alone cannot be acted on, because the two ways
+                        // to get here need opposite fixes. Either an anchor that
+                        // WOULD have covered this body was vetoed (the body is
+                        // within reach of a raw anchor but not a surviving one),
+                        // or the player character it stands next to is not an
+                        // anchor at all - a squad member strung out behind its
+                        // tab leader, which is the gap the design notes call out
+                        // as uncovered by construction. Measuring the body
+                        // against both anchor sets says which, without needing a
+                        // theory: raw <= attnR while attn > attnR is the veto,
+                        // both > attnR is the straggler. run_apart 20260804
+                        // reported dormPc=16 with no way to tell them apart.
+                        if (dormPcRows < 3) {
+                            ++dormPcRows;
+                            float dAttn = -1.0f, dRaw = -1.0f;
+                            for (unsigned int a = 0; a < nAttnAnch; ++a) {
+                                float d = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                                attnAnch[a * 3 + 0],
+                                                attnAnch[a * 3 + 1],
+                                                attnAnch[a * 3 + 2]);
+                                if (dAttn < 0.0f || d < dAttn) dAttn = d;
+                            }
+                            for (unsigned int a = 0; a < nRawAnch; ++a) {
+                                float d = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                                rawAnch[a * 3 + 0],
+                                                rawAnch[a * 3 + 1],
+                                                rawAnch[a * 3 + 2]);
+                                if (dRaw < 0.0f || d < dRaw) dRaw = d;
+                            }
+                            // Is the PC in question one of the anchors? A leader
+                            // sits ON its anchor, so ~0 means this body's
+                            // neighbour anchors attention and something else is
+                            // wrong; a large value means it anchors nothing.
+                            float dPcAnchor = -1.0f;
+                            for (unsigned int a = 0; a < nRawAnch; ++a) {
+                                float d = dist3(pcStates[p].x, pcStates[p].y,
+                                                pcStates[p].z,
+                                                rawAnch[a * 3 + 0],
+                                                rawAnch[a * 3 + 1],
+                                                rawAnch[a * 3 + 2]);
+                                if (dPcAnchor < 0.0f || d < dPcAnchor) dPcAnchor = d;
+                            }
+                            // Three causes, told apart by the two distances and
+                            // the anchor counts. Same count but a body inside
+                            // toRaw and outside toAttn is the cache replaying
+                            // stale POSITIONS (the run_apart finding); a smaller
+                            // count with the body inside toRaw means the veto
+                            // dropped an anchor that covered it; anything else is
+                            // a player character that anchors nothing.
+                            bool inRaw  = dRaw  >= 0.0f && dRaw  <= attentionRadius_;
+                            bool inAttn = dAttn >= 0.0f && dAttn <= attentionRadius_;
+                            const char* cause =
+                                (inRaw && !inAttn && nAttnAnch == nRawAnch)
+                                    ? "stale anchor positions"
+                                : (inRaw && nAttnAnch < nRawAnch)
+                                    ? "anchor vetoed"
+                                    : "pc anchors nothing";
+                            char b[288]; _snprintf(b, sizeof(b) - 1,
+                                "[audit] dormPc hand=%u,%u toPc=%.0f toAttn=%.0f "
+                                "toRaw=%.0f pcToAnchor=%.0f attnR=%.0f "
+                                "anchors=%u/%u cause=%s",
+                                sts[i].hIndex, sts[i].hSerial, dPc, dAttn, dRaw,
+                                dPcAnchor, attentionRadius_, nAttnAnch, nRawAnch,
+                                cause);
+                            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        }
+                        break;
+                    }
+                } else {
+                    cls = "ghost"; ++cGhost;
+                    float nearest = -1.0f;
+                    for (unsigned int a = 0; a < nAnch; ++a) {
+                        float d = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                        anch[a * 3 + 0], anch[a * 3 + 1],
+                                        anch[a * 3 + 2]);
+                        if (nearest < 0.0f || d < nearest) nearest = d;
+                    }
+                    if (nearest > ghostMaxD) ghostMaxD = nearest;
+                    if (EDGE_BAND > 0.0f && nearest >= EDGE_BAND) ++ghostEdge;
+                    if (dumpGhost == 1 && ghostRows < 10) {
+                        ++ghostRows;
+                        char nm[48]; engine::charName(cs[i], nm, sizeof(nm));
+                        char r[192]; _snprintf(r, sizeof(r) - 1,
+                            "[audit] ghost hand=%u,%u name='%s' pos=%.0f,%.0f,%.0f "
+                            "unstreak=%u",
+                            sts[i].hIndex, sts[i].hSerial, nm,
+                            sts[i].x, sts[i].y, sts[i].z, authCount_[k].unstreamed);
+                        r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+                    }
+                }
+                // travel_parity worldstate rows (join side): one row per
+                // enumerated NPC with its authority class, same schema as the
+                // host's census dump so the oracle can cross-match by hand.
+                if (auditRows_) { emittedKeys.insert(k); emitWnpcRow(cs[i], sts[i], cls); }
+            }
+        }
+        if (auditRows_) {
+            // world_parity third pass: a driven body that is locally IN
+            // FURNITURE (bed/cage/chained at the join's fixture) drops out of
+            // the spatial character query, so the two passes above never list
+            // it and the parity oracle scored it "missing" (guard escorting
+            // the arrested PC: 16/25 samples absent while rendering fine).
+            // The drive targets are keyed by hand; emit any that resolve but
+            // were not enumerated. captureNpcByHand's resolve round-trip is
+            // the liveness proof; player-squad members are covered by
+            // emitPcRows below.
+            for (std::map<Key, Driven>::iterator ti = targets_.begin();
+                 ti != targets_.end(); ++ti) {
+                const Key& tk = ti->first;
+                if (emittedKeys.find(tk) != emittedKeys.end()) continue;
+                EntityState ts;
+                if (!engine::captureNpcByHand(gw, tk.i, tk.s, tk.t, tk.c,
+                                              tk.cs, &ts)) continue;
+                Character* tc = engine::resolveCharByHand(tk.i, tk.s, tk.t,
+                                                          tk.c, tk.cs);
+                if (!tc) continue;
+                // Row keyed by the STREAMED hand (what the host dumps): a
+                // combat-detached body's local handle differs, and captureOne
+                // read that local one - overwrite so the oracle can pair it.
+                ts.hIndex = tk.i; ts.hSerial = tk.s; ts.hType = tk.t;
+                ts.hContainer = tk.c; ts.hContainerSerial = tk.cs;
+                emittedKeys.insert(tk);
+                if (counted.insert(tc).second) ++cDrv;
+                emitWnpcRow(tc, ts, "drv");
+            }
+            // ...and the same for every census-vouched hand (a host-side
+            // barracks of SLEEPING guards is contained in beds on the join
+            // too - resolving fine, rendering fine, invisible to the spatial
+            // query, and not driven so the targets_ pass can't list them
+            // either; a re-containered ex-slave answers to a DIFFERENT local
+            // hand, so its enumerated row can't pair with the host's - emit
+            // it under the census hand too). The resolve round-trip IS the
+            // existence answer the parity oracle wants; a hand that fails it
+            // here is genuinely absent from this client.
+            for (std::set<Key>::iterator ci = censusHands_.begin();
+                 ci != censusHands_.end(); ++ci) {
+                if (emittedKeys.find(*ci) != emittedKeys.end()) continue;
+                EntityState ts;
+                if (!engine::captureNpcByHand(gw, ci->i, ci->s, ci->t, ci->c,
+                                              ci->cs, &ts)) continue;
+                Character* tc = engine::resolveCharByHand(ci->i, ci->s, ci->t,
+                                                          ci->c, ci->cs);
+                if (!tc) continue;
+                ts.hIndex = ci->i; ts.hSerial = ci->s; ts.hType = ci->t;
+                ts.hContainer = ci->c; ts.hContainerSerial = ci->cs;
+                emittedKeys.insert(*ci);
+                bool sup = suppressed_.find(*ci) != suppressed_.end();
+                if (counted.insert(tc).second) { if (sup) ++cHid; else ++cCen; }
+                emitWnpcRow(tc, ts, sup ? "hid" : "cen");
+            }
+            // world_parity: PC rows on the join too (the peer-driven copies) -
+            // the host/join cls=pc pairs are what the PC position gate judges.
+            emitPcRows(gw);
+            // Phase 0.5 fields are APPENDED: Get-WorldRows' regex stops at
+            // ghost= and tolerates any trailing text (fresh= already rides
+            // past it), so the oracle contract is unchanged.
+            char w[256]; _snprintf(w, sizeof(w) - 1,
+                "SCENARIO WORLD n=%u cls=%s drv=%u cen=%u hid=%u ghost=%u fresh=%d "
+                "cap=%d ghostMax=%.0f ghostEdge=%u dorm=%u mine=%u",
+                (unsigned)counted.size(), roleTag, cDrv, cCen, cHid, cGhost,
+                censusFresh ? 1 : 0, (nearTrunc || wideTrunc) ? 1 : 0,
+                ghostMaxD, ghostEdge, cDorm, cMine);
+            w[sizeof(w) - 1] = '\0'; coop::logLine(w);
+        }
+        // Phase 0.5 fields appended after parks= (existing prefix untouched):
+        //   nearCap/wideCap - the enumeration hit its buffer and judged an
+        //                     INCOMPLETE world; absence stopped meaning absent
+        //   staleMs/edges   - how long wide culling has been disabled, and how
+        //                     often it dropped out (each edge leaks ghosts)
+        //   ghostMax/Edge   - how far ghosts reach, and how many sit in the
+        //                     outer 20% band next to the un-enumerable horizon
+        //   dorm/attnR      - bodies the attention gate left alone, and the
+        //                     radius it used (0 = gate off, so dorm is always
+        //                     0 and every bucket reads as it did before)
+        //   dormPc/pcs      - gate safety violation count: dormant bodies
+        //                     within attnR of a player character (must be 0),
+        //                     over the pcs squad members it was measured
+        //                     against - pcs=0 makes the zero vacuous
+        char b[448]; _snprintf(b, sizeof(b) - 1,
+            "[audit] exist near=%u wide=%u drv=%u cen=%u hid=%u ghost=%u "
+            "supp=%u census=%u fresh=%d parks=%lu walks=%lu "
+            "nearCap=%d wideCap=%d staleMs=%lu edges=%lu ghostMax=%.0f ghostEdge=%u "
+            "dorm=%u attnR=%.0f dormPc=%u pcs=%u mine=%u skip=%u cells=%u",
+            n, wn, cDrv, cCen, cHid, cGhost,
+            (unsigned)suppressed_.size(), (unsigned)censusHands_.size(),
+            censusFresh ? 1 : 0, censusParks_, censusWalks_,
+            nearTrunc ? 1 : 0, wideTrunc ? 1 : 0,
+            censusStaleMs_, censusStaleEdges_, ghostMaxD, ghostEdge,
+            cDorm, attentionRadius_, cDormPc, nPc,
+            cMine, authSkip, (unsigned)claimedCells_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Phase 3 lifecycle upkeep: prune left-interest records + self-audit
+    // mintable hands stuck in DISCOVERED (the invisible-raid failure).
+    lifeSweep(gw, now);
+    measureAttach(now);
+}
+
+// Phase C capability veto: drop any anchor whose zone this engine has not
+// loaded, so we never claim existence-authority over ground we cannot see.
+//
+// The first two raw anchors are the squad-tab LEADERS (interestCenters fills
+// them before the camera anchors and only ever drops camera ones), which is the
+// safety property the gate rests on - an unwatched squad still anchors its own
+// surroundings. The veto can in principle remove a leader too, but only when
+// its zone is unloaded here, and an unloaded zone holds no enumerable bodies to
+// go dormant. Measured: hostZoneUnloaded=0 at 5,200 u separation, and dormPc=0
+// (dormant bodies next to a player character) across every gated run.
+//
+// THROTTLED, and not for CPU cost. `isZoneLoadedAt` reaches into ZoneManager,
+// whose members are boost shared_mutex-protected and written by the engine's own
+// zone-loader thread. Before this veto the query ran ~1 Hz from the census
+// diagnostics; the authority pass runs every tick, so calling it here put
+// hundreds of acquisitions per second of main-thread traffic onto a lock the
+// loader thread holds while streaming. Nothing measured proves that stalls the
+// game loop - the stall signature in the logs predates this code by six weeks -
+// but the trade is one-sided: the answer only changes as zones stream, on a
+// multi-second scale, so a cached verdict costs nothing and a permanently
+// wedged main thread costs the session. Re-query on the interval, or at once if
+// an anchor jumped (a camera cut or teleport can cross a zone edge instantly).
+//
+// The cache holds the VERDICT ONLY. It used to hold the surviving anchors'
+// coordinates too, which quietly turned a zone-loading throttle into a 500 ms
+// delay on where the players are - harmless while everything measured stood
+// still, and 285 u of error once run_apart ran at 570 u/s. attnVetoMask_ carries
+// the full account.
+unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
+                                          unsigned int nRaw, unsigned int nLeaders,
+                                          float* out) {
+    if (!raw || !out) return 0;
+    const unsigned long ATTN_VETO_MS  = 500;
+    const float         ATTN_VETO_JUMP = 100.0f;
+    unsigned long nowV = nowMs();
+    const unsigned int MAX_A = engine::MAX_INTEREST_ANCHORS;   // <= 32 mask bits
+    if (nRaw > MAX_A) nRaw = MAX_A;
+    bool reuse = (attnVetoMs_ != 0) && ((nowV - attnVetoMs_) < ATTN_VETO_MS)
+                 && (attnVetoRawN_ == nRaw);
+    for (unsigned int a = 0; reuse && a < nRaw; ++a)
+        if (dist3(raw[a * 3 + 0], raw[a * 3 + 1], raw[a * 3 + 2],
+                  attnVetoRaw_[a * 3 + 0], attnVetoRaw_[a * 3 + 1],
+                  attnVetoRaw_[a * 3 + 2]) > ATTN_VETO_JUMP) reuse = false;
+    // Re-query the zones, or reuse the verdict - but ALWAYS emit the anchors'
+    // current positions. Replaying cached positions is what made a body beside
+    // its own squad dormant (see attnVetoMask_).
+    unsigned int keepMask;
+    if (reuse) {
+        keepMask = attnVetoMask_;
+    } else {
+        keepMask = 0;
+        for (unsigned int a = 0; a < nRaw; ++a) {
+            const float* p = raw + a * 3;
+            if (attentionRadius_ > 0.0f &&
+                !engine::isZoneLoadedAt(gw, p[0], p[1], p[2])) continue;
+            keepMask |= (1u << a);
+        }
+        attnVetoMs_   = nowV;
+        attnVetoRawN_ = nRaw;
+        attnVetoMask_ = keepMask;
+        for (unsigned int i = 0; i < nRaw * 3; ++i) attnVetoRaw_[i] = raw[i];
+    }
+    unsigned int nOut = 0;
+    unsigned int vetoMask = 0;   // which raw indices were dropped
+    for (unsigned int a = 0; a < nRaw; ++a) {
+        if (!(keepMask & (1u << a))) { vetoMask |= (1u << a); continue; }
+        const float* p = raw + a * 3;
+        out[nOut * 3 + 0] = p[0];
+        out[nOut * 3 + 1] = p[1];
+        out[nOut * 3 + 2] = p[2];
+        ++nOut;
+    }
+    if (nOut < nRaw && !reuse) {
+        static unsigned long vetoLogMs = 0; // main-thread only
+        if (vetoLogMs == 0 || (nowV - vetoLogMs) >= 10000) {
+            vetoLogMs = nowV;
+            // WHICH anchor, and where. interestCenters fills tab leaders first
+            // and cameras after (nLeaders of them), and the difference matters
+            // completely. Dropping ANOTHER player's tab leader is the veto
+            // working: on run_apart the join holds a driven copy of the host's
+            // leader 138,000 u away, in ground it has never loaded and cannot
+            // speak for. Dropping OUR OWN leader would mean the gate stopped
+            // reconciling a player's own surroundings, which is the failure
+            // dormPc exists to catch. The old line counted vetoes without saying
+            // which, so the two were indistinguishable.
+            char idx[200]; unsigned int w = 0;
+            for (unsigned int a = 0; a < nRaw && w + 16 < sizeof(idx); ++a) {
+                if (!(vetoMask & (1u << a))) continue;
+                int k = _snprintf(idx + w, sizeof(idx) - w - 1, "%s%u%s",
+                                  w ? "," : "", a, a < nLeaders ? "(leader)" : "(cam)");
+                if (k <= 0) break;
+                w += (unsigned int)k;
+            }
+            idx[w] = '\0';
+            char b[288]; _snprintf(b, sizeof(b) - 1,
+                "[attn] anchor veto %u/%u (zone not loaded here) dropped=%s",
+                nRaw - nOut, nRaw, idx[0] ? idx : "?");
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    return nOut;
+}
+
+void Replicator::rebuildClaimedCells() {
+    claimedCells_.clear();
+    for (std::map<std::pair<u32, u32>, CellClaim>::const_iterator it = claimSlots_.begin();
+         it != claimSlots_.end(); ++it) {
+        std::pair<int, int> cell(it->second.cx, it->second.cz);
+        u32 owner = it->first.first;
+        std::map<std::pair<int, int>, u32>::iterator ex = claimedCells_.find(cell);
+        if (ex == claimedCells_.end()) claimedCells_[cell] = owner;
+        else if (owner < ex->second) ex->second = owner;  // lowest id (host) wins ties
+    }
+    // CO-LOCATION COLLAPSE. Splitting authorship by cell exists so the host does
+    // not have to author bodies it cannot enumerate, which is a real problem
+    // only while the squads are apart. Standing in one camp, the clients have
+    // the same bodies loaded and the split just runs a contested boundary
+    // through the middle of the shared area - so hand the lot to the lowest id
+    // standing there (the host, when it is one of them) and let the others
+    // drive, exactly as v0.46 did.
+    //
+    // The rewrite below covers the CLAIMED cells; authoritySrc short-circuits
+    // the rest while collapsed_ holds (and remaps vacated cells through
+    // collapseTo_ for a partial collapse). Both are needed. Rewriting only the
+    // claimed map left the vacated ones (AUTHSRC_VACATE) still pointing at the
+    // join, and a travelling pair leaves a trail of those behind it - so the
+    // host went on deferring to the join for the ground they had just walked
+    // over, while the join, collapsed, published no census for it. Nothing
+    // authored those bodies, and the host froze them as census-absent: 428
+    // freezes in a session where the collapse was otherwise engaged 90% of the
+    // time (manual session 2026-08-09 15:14).
+    collapseTo_.clear();
+    collapsed_ = cellCollapse_ && resolveCollapse();
+    if (collapsed_) {
+        for (std::map<std::pair<int, int>, u32>::iterator it = claimedCells_.begin();
+             it != claimedCells_.end(); ++it) {
+            it->second = (u32)CELL_OWNER_HOST;
+        }
+    } else if (cellCollapse_ && !collapseTo_.empty()) {
+        for (std::map<std::pair<int, int>, u32>::iterator it = claimedCells_.begin();
+             it != claimedCells_.end(); ++it) {
+            std::map<u32, u32>::const_iterator ct = collapseTo_.find(it->second);
+            if (ct != collapseTo_.end()) it->second = ct->second;
+        }
+    }
+    // Remember it, so walking out of a cell does not hand it to the host.
+    for (std::map<std::pair<int, int>, u32>::const_iterator it = claimedCells_.begin();
+         it != claimedCells_.end(); ++it) {
+        cellLastOwner_[it->first] = it->second;
+    }
+}
+
+bool Replicator::resolveCollapse() {
+    // Each player's claimed cells, complete before any player is judged:
+    // "every cell o claims, m claims too" needs m's set whole.
+    std::map<u32, std::set<std::pair<int, int> > > cellsOf;
+    for (std::map<std::pair<u32, u32>, CellClaim>::const_iterator it = claimSlots_.begin();
+         it != claimSlots_.end(); ++it)
+        cellsOf[it->first.first].insert(std::make_pair(it->second.cx, it->second.cz));
+    // Silence from either side is not co-location. Before a player's first
+    // claim arrives there is nothing to collapse ONTO, and collapsing anyway
+    // would hand another player's own cell to someone who has not spoken yet -
+    // so only players that HOLD claims take part, on both ends.
+    //
+    // THE SAME cell, not merely a touching one. Chebyshev 1 was tried first, on
+    // the reasoning that a camp straddling a boundary puts two tabs in adjacent
+    // cells - and split_far2 refuted it on the first run: its two towns, a
+    // cross-country march apart, are cells 21,31 and 21,32. A cell is thousands
+    // of units wide, so "touching cells" says nothing about whether the squads
+    // can see each other, and the collapse stayed on through the entire
+    // separated leg the split exists to serve (gate 0/3, the join's own cell
+    // resolving to the host).
+    //
+    // Sharing a cell is a weaker statement than being in arm's reach, but it
+    // errs the safe way: a false negative is merely today's behaviour, while a
+    // false positive hands a whole region to a client that cannot enumerate it.
+    // The straddling camp is the accepted miss - the alternative, comparing
+    // squad POSITIONS, cannot be used here, because those differ per client and
+    // a threshold over them would flip independently on each side. One
+    // straggler tab of o's is enough to keep o split.
+    bool total = cellsOf.find((u32)CELL_OWNER_HOST) != cellsOf.end();
+    bool anyOther = false;
+    for (std::map<u32, std::set<std::pair<int, int> > >::const_iterator o = cellsOf.begin();
+         o != cellsOf.end(); ++o) {
+        if (o->first == (u32)CELL_OWNER_HOST) continue;
+        anyOther = true;
+        bool placed = false;
+        // Ascending ids, so the first match is the LOWEST qualifying m.
+        for (std::map<u32, std::set<std::pair<int, int> > >::const_iterator m = cellsOf.begin();
+             m != cellsOf.end() && m->first < o->first && !placed; ++m) {
+            bool together = true;
+            for (std::set<std::pair<int, int> >::const_iterator c = o->second.begin();
+                 c != o->second.end() && together; ++c)
+                together = m->second.find(*c) != m->second.end();
+            if (together) { collapseTo_[o->first] = m->first; placed = true; }
+        }
+        if (!placed || collapseTo_[o->first] != (u32)CELL_OWNER_HOST) total = false;
+    }
+    return total && anyOther;
+}
+
+u32 Replicator::authorityFor(GameWorld* gw, float x, float z) const {
+    int cx = 0, cz = 0, src = 0;
+    return authoritySrc(gw, x, z, &cx, &cz, &src);
+}
+
+u32 Replicator::authoritySrc(GameWorld* gw, float x, float z,
+                             int* cx, int* cz, int* src) const {
+    *cx = 0; *cz = 0; *src = AUTHSRC_NOMAP;
+    if (!cellAuth_ || !engine::cellAt(gw, x, z, cx, cz)) {
+        return (u32)CELL_OWNER_HOST;
+    }
+    // Collapsed: the host authors EVERY cell, not merely the claimed ones. A
+    // vacated cell answering "join" behind a pair walking together is a cell
+    // nobody ends up authoring, because the join publishes nothing while
+    // collapsed - see rebuildClaimedCells.
+    if (collapsed_) { *src = AUTHSRC_COLLAPSE; return (u32)CELL_OWNER_HOST; }
+    std::pair<int, int> cell(*cx, *cz);
+    std::map<std::pair<int, int>, u32>::const_iterator it = claimedCells_.find(cell);
+    if (it != claimedCells_.end()) { *src = AUTHSRC_CLAIM; return it->second; }
+    // Nobody is standing here now; the last client that was still speaks for it
+    // - or, while that client stands together with a lower id (a partial
+    // collapse), the one it collapsed onto, for the same trail-of-vacated-cells
+    // reason as the total collapse above.
+    std::map<std::pair<int, int>, u32>::const_iterator lo = cellLastOwner_.find(cell);
+    if (lo != cellLastOwner_.end()) {
+        std::map<u32, u32>::const_iterator ct = collapseTo_.find(lo->second);
+        if (ct != collapseTo_.end()) { *src = AUTHSRC_COLLAPSE; return ct->second; }
+        *src = AUTHSRC_VACATE;
+        return lo->second;
+    }
+    *src = AUTHSRC_OPEN;
+    return (u32)CELL_OWNER_HOST;
+}
+
+bool Replicator::authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
+                                 Character* c, float x, float z) {
+    if (!cellAuth_) return false;
+    u32 owner = authorityFor(gw, x, z);
+    // Ours to author, or nobody's we have heard from: either way this body is
+    // not ours to judge. The second case matters as much as the first - a cell
+    // whose owner has sent no census is unspoken-for, not empty, and treating
+    // silence as absence is the whole ghost mechanism. Asked of THAT owner's
+    // census (census_ holds one per sender): with several authors, "the last
+    // census we got" is usually somebody else's.
+    if (owner != localId && census_.find(owner) != census_.end()) return false;
+    // INCUMBENT HOLDS. A body the peer's stream is already writing is the peer's,
+    // whatever this cell verdict says, because the verdict is not a shared fact:
+    // each side evaluates it against ITS OWN copy's position, and the two copies
+    // of a fighting NPC drift apart. Measured 2026-08-03 on a 'Hungry bandit'
+    // whose copies sat 163 u apart (gap=163.4, task agreement 58%) astride the
+    // z=0 boundary between cells 21,31 and 21,32: the host's copy was in the
+    // host's cell and the join's copy in the join's, so BOTH sides concluded the
+    // body was theirs - each correctly, by its own premise.
+    //
+    // This used to release the drive and author from the next tick, to avoid two
+    // writers on one Character. But releasing is what created the fight: the peer
+    // has no idea we did it and keeps streaming, so we release again, 531 times
+    // for that one bandit, and each release dropped the body out of the streamed
+    // set long enough for the ordinary pass to suppress it (151 suppress/restore
+    // pairs, which is what turned up as suppress_churn).
+    //
+    // Yielding instead is what converges. A stream is an assertion of authorship,
+    // so the receiver defers to it and handover happens only when the author
+    // STOPS streaming - a decision one side makes alone, needing no agreement
+    // about whose cell a drifting body is standing in.
+    bool peerDrives = false;
+    if (c) peerDrives = drivenChars_.find(c) != drivenChars_.end() ||
+                        drivenSeen_.find(c)  != drivenSeen_.end();
+    // Say so once per body rather than per tick: the old line was 30% of this
+    // scenario's log and said the same thing every frame.
+    if (peerDrives && cellYield_.insert(k).second) {
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[cell] yield hand=%u,%u owner=%u - the peer's stream holds this body; "
+            "not authoring it while they drive it",
+            (unsigned)k.i, (unsigned)k.s, owner);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    if (!peerDrives) cellYield_.erase(k);
+    // Either way the body is not the ordinary pass's business, so it must be
+    // VISIBLE: authority moving to us, or a drive starting over something we hid
+    // on the old author's word, both have to undo that suppression or a handover
+    // leaves a town permanently invisible.
+    std::map<Key, Character*>::iterator sp = suppressed_.find(k);
+    if (sp != suppressed_.end()) {
+        engine::restoreNpc(gw, c ? c : sp->second);
+        suppressed_.erase(sp);
+        ++authRestores_;
+        lifeSet(k, LIFE_RESOLVED, "author-restore");
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[cell] restore NPC hand=%u,%u owner=%u (%s; supp=%u)",
+            (unsigned)k.i, (unsigned)k.s, owner,
+            peerDrives ? "the peer drives this body" : "we author here",
+            (unsigned)suppressed_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    return true;
+}
+
+void Replicator::syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId) {
+    // Drain unconditionally: with the feature off the queue must still not grow
+    // (a peer running with it on would otherwise back up against us forever).
+    std::deque<InboundCellClaim> got;
+    in.drainCellClaims(got);
+    if (!cellAuth_ || !gw) {
+        if (!claimSlots_.empty()) {
+            claimSlots_.clear(); claimedCells_.clear(); cellLastOwner_.clear();
+        }
+        collapsed_ = false;   // no claims, nothing to collapse onto
+        collapseTo_.clear();
+        return;
+    }
+    unsigned long now = nowMs();
+    bool changed = false;
+    for (std::deque<InboundCellClaim>::const_iterator it = got.begin();
+         it != got.end(); ++it) {
+        const CellClaimPacket& p = it->pkt;
+        if (p.ownerId == ownerId) continue;   // our own broadcast, echoed back
+        std::pair<u32, u32> slot(p.ownerId, p.tabRank);
+        std::map<std::pair<u32, u32>, CellClaim>::iterator s = claimSlots_.find(slot);
+        // Signed difference so a wrapped seq still orders correctly.
+        if (s != claimSlots_.end() && (int)(p.seq - s->second.seq) <= 0) continue;
+        bool moved = (s == claimSlots_.end()) ||
+                     s->second.cx != p.cellX || s->second.cz != p.cellY;
+        CellClaim cc;
+        cc.cx = p.cellX; cc.cz = p.cellY; cc.seq = p.seq; cc.recvMs = now;
+        claimSlots_[slot] = cc;
+        if (moved) {
+            changed = true;
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[cell] RECV owner=%u rank=%u cell=%d,%d seq=%u",
+                p.ownerId, p.tabRank, p.cellX, p.cellY, p.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // Publish our own tabs' cells at 1 Hz.
+    if (claimSendMs_ == 0 || (now - claimSendMs_) >= 1000) {
+        claimSendMs_ = now;
+        bool assertDue = (claimAssertMs_ == 0) ||
+                         (now - claimAssertMs_) >= (unsigned long)CELL_ASSERT_MS;
+        if (assertDue) claimAssertMs_ = now;
+        const unsigned int MAX_SQ = 96;
+        static EntityState raw[MAX_SQ];   // main-thread only
+        unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_SQ);
+        std::vector<std::pair<u32, u32> > ctnrs;
+        ctnrs.reserve(nSquad);
+        for (unsigned int i = 0; i < nSquad; ++i)
+            ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
+        std::sort(ctnrs.begin(), ctnrs.end());
+        ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+        for (unsigned int ci = 0; ci < ctnrs.size(); ++ci) {
+            unsigned int rank = tabRankFor(ctnrs[ci], ctnrs);
+            if (!ownsTab(ctnrs[ci], rank)) continue;
+            // The tab's leader stands for the tab: presence is about where the
+            // squad IS, and a scattered squad still has one home cell.
+            const EntityState* lead = 0;
+            for (unsigned int i = 0; i < nSquad && !lead; ++i)
+                if (raw[i].hContainer == ctnrs[ci].first &&
+                    raw[i].hContainerSerial == ctnrs[ci].second) lead = &raw[i];
+            if (!lead) continue;
+            int cx = 0, cz = 0;
+            if (!engine::cellAt(gw, lead->x, lead->z, &cx, &cz)) continue;
+            std::pair<u32, u32> slot(ownerId, (u32)rank);
+            std::map<std::pair<u32, u32>, CellClaim>::iterator cur = claimSlots_.find(slot);
+            // Spatial hysteresis: keep the claimed cell while the leader is
+            // still within CELL_HYST_U of it. cell_auth_together 20261022_125313:
+            // the join's leader paced x=-50703..-50565 across the 20,32 / 21,32
+            // line, cleared the 3 s dwell on every crossing, and moved its claim
+            // 13 times in 3 minutes - each move flipped the collapse, and with it
+            // the author of every body in 21,32, so both clients took turns
+            // following the same bandits ~6 s apart (dual_drive: 2 bodies,
+            // 23 s and 14 s). Probing the claimed cell from the leader's
+            // position needs no grid geometry, only cellAt; cells are thousands
+            // of units wide, so eight probes at the margin cover the approach.
+            if (cur != claimSlots_.end() &&
+                (cur->second.cx != cx || cur->second.cz != cz)) {
+                static const float PX[8] = { 1, -1, 0, 0, 0.7071f, 0.7071f, -0.7071f, -0.7071f };
+                static const float PZ[8] = { 0, 0, 1, -1, 0.7071f, -0.7071f, 0.7071f, -0.7071f };
+                const float H = (float)CELL_HYST_U;
+                for (int pi = 0; pi < 8; ++pi) {
+                    int px = 0, pz = 0;
+                    if (engine::cellAt(gw, lead->x + PX[pi] * H, lead->z + PZ[pi] * H, &px, &pz) &&
+                        px == cur->second.cx && pz == cur->second.cz) {
+                        cx = px; cz = pz;
+                        break;
+                    }
+                }
+            }
+            bool same = (cur != claimSlots_.end()) &&
+                        cur->second.cx == cx && cur->second.cz == cz;
+            // Dwell: a boundary walker must settle before authority moves.
+            CellDwell& d = claimDwell_[(u32)rank];
+            if (d.n == 0 || d.cx != cx || d.cz != cz) { d.cx = cx; d.cz = cz; d.n = 1; }
+            else if (d.n < 0xFFFFu) ++d.n;
+            if (same) { if (!assertDue) continue; }
+            else if (d.n < (unsigned int)CELL_DWELL_N) continue;
+            u32 seq = ++claimSeqOut_[(u32)rank];
+            CellClaimPacket p;
+            memset(&p, 0, sizeof(p));
+            p.type    = (u8)PKT_CELL_CLAIM;
+            p.ownerId = ownerId;
+            p.tabRank = (u32)rank;
+            p.seq     = seq;
+            p.cellX   = cx;
+            p.cellY   = cz;
+            net.queueCellClaim(p);
+            CellClaim cc;
+            cc.cx = cx; cc.cz = cz; cc.seq = seq; cc.recvMs = now;
+            claimSlots_[slot] = cc;
+            if (!same) {
+                changed = true;
+                char b[144]; _snprintf(b, sizeof(b) - 1,
+                    "[cell] CLAIM rank=%u cell=%d,%d seq=%u dwell=%u pos=%.0f,%.0f",
+                    rank, cx, cz, seq, d.n, lead->x, lead->z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    if (changed) rebuildClaimedCells();
+    // Dump the resolved map on change AND on a slow cadence. split_far2's
+    // central claim - that both clients resolve the SAME owner for the same
+    // cell - can only be read by diffing the two logs, so the line has to
+    // carry the pairs, and it has to appear in every camera phase rather than
+    // only at the edges where something moved.
+    if (changed || claimMapMs_ == 0 || (now - claimMapMs_) >= 5000) {
+        claimMapMs_ = now;
+        char b[256];
+        // collapse= is the verdict the last rebuild actually applied, not a
+        // fresh evaluation, so the line can never disagree with the authority
+        // the same tick handed out. Appended AFTER slots= so the oracle's map
+        // parser is unaffected - Get-CellMap takes the tail with (.*)$ and then
+        // scans it for 'x,z=owner' triples, which 'collapse=1' cannot match.
+        int off = _snprintf(b, sizeof(b) - 1, "[cell] MAP cells=%u slots=%u collapse=%u",
+                            (unsigned)claimedCells_.size(),
+                            (unsigned)claimSlots_.size(),
+                            collapsed_ ? 1u : 0u);
+        if (off < 0) off = 0;
+        for (std::map<std::pair<int, int>, u32>::const_iterator mi = claimedCells_.begin();
+             mi != claimedCells_.end() && off < (int)sizeof(b) - 32; ++mi) {
+            int w = _snprintf(b + off, sizeof(b) - 1 - off, " %d,%d=%u",
+                              mi->first.first, mi->first.second, mi->second);
+            if (w < 0) break;
+            off += w;
+        }
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+unsigned int Replicator::peerAnchors(GameWorld* gw, float* out) {
+    if (!gw || !out) return 0;
+    unsigned int nOut = 0;
+    const unsigned int MAX_SQ = 96;
+    static EntityState raw[MAX_SQ];   // main-thread only
+    unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_SQ);
+    std::vector<std::pair<u32, u32> > ctnrs;
+    ctnrs.reserve(nSquad);
+    for (unsigned int i = 0; i < nSquad; ++i)
+        ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
+    std::sort(ctnrs.begin(), ctnrs.end());
+    ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+    // EVERY tab leader, ours included - this has to model what the PEER's
+    // attentionAnchors will compute, and that anchors on all tab leaders
+    // because a body standing next to any player character must never be
+    // dormant (the dormPc safety property). Restricting this to the peer's own
+    // tabs was a wrong model of the peer's attention, and the two predicates
+    // disagreeing is exactly the failure this channel exists to prevent: on
+    // split_far2 the host stopped censusing its own town because the join's
+    // TAB was 5200 u away, while the join went on attending it through its
+    // local copy of the host's leader - and suppressed 26 real bodies against
+    // the resulting silence.
+    for (unsigned int ci = 0; ci < ctnrs.size() && nOut < MAX_PLAYERS; ++ci) {
+        for (unsigned int i = 0; i < nSquad; ++i) {
+            if (raw[i].hContainer != ctnrs[ci].first ||
+                raw[i].hContainerSerial != ctnrs[ci].second) continue;
+            out[nOut * 3 + 0] = raw[i].x;
+            out[nOut * 3 + 1] = raw[i].y;
+            out[nOut * 3 + 2] = raw[i].z;
+            ++nOut;
+            break;
+        }
+    }
+    // Every remote player's fresh camera hint (one each, ascending id).
+    nOut += engine::peerCamAnchors(out + nOut * 3,
+                                   engine::MAX_INTEREST_ANCHORS - nOut);
+    return nOut;
+}
+
+bool Replicator::observedAt(const Key& k, const float* anchors,
+                            unsigned int nAnchor, float x, float y, float z) {
+    return observedIn(attnObs_, /*countFlips*/ true, k, anchors, nAnchor, x, y, z);
+}
+
+bool Replicator::observedByPeer(const Key& k, const float* anchors,
+                                unsigned int nAnchor, float x, float y, float z) {
+    return observedIn(attnObsPeer_, /*countFlips*/ false, k, anchors, nAnchor, x, y, z);
+}
+
+bool Replicator::observedIn(std::map<Key, bool>& obs, bool countFlips, const Key& k,
+                            const float* anchors, unsigned int nAnchor,
+                            float x, float y, float z) {
+    if (attentionRadius_ <= 0.0f) return true;   // gate off
+    // No anchors at all means no players in gameplay (interestCenters returns
+    // 0 before the squads exist). Fail OPEN - a startup tick must not declare
+    // the whole world dormant.
+    if (!anchors || nAnchor == 0) return true;
+    // Leaving costs 25% more reach than entering. Both clients run this over
+    // anchor sets that agree only approximately, so a body parked on the
+    // threshold would flip out of phase between them without the deadband.
+    const float ATTN_LEAVE_SCALE = 1.25f;
+    std::map<Key, bool>::iterator it = obs.find(k);
+    bool was = (it != obs.end()) && it->second;
+    float r = was ? attentionRadius_ * ATTN_LEAVE_SCALE : attentionRadius_;
+    bool now = false;
+    for (unsigned int a = 0; a < nAnchor && !now; ++a) {
+        float d = dist3(x, y, z, anchors[a * 3 + 0], anchors[a * 3 + 1],
+                        anchors[a * 3 + 2]);
+        now = (d <= r);
+    }
+    if (countFlips && now && !was) ++attnFlips_;   // Phase B: an attach to pay for
+    if (it != obs.end()) it->second = now;
+    else                 obs[k] = now;
+    return now;
+}
+
+void Replicator::measureAttach(unsigned long now) {
+    // Phase B, measurement only: what does an attach actually cost? Open a
+    // window on the first one and report the suppressions, culls and proxy
+    // mints that landed inside it. A window with nothing to show for it stays
+    // silent - bodies drift across the threshold constantly as squads walk,
+    // and one line per quiet crossing would bury the bursts this exists to
+    // find.
+    const unsigned long ATTN_WIN_MS = 3000;
+    if (attnFlips_ > 0 && attnWinMs_ == 0) {
+        attnWinMs_     = now;
+        attnBaseSupp_  = authSuppresses_;
+        attnBaseCull_  = censusCulls_;
+        attnBaseProxy_ = (unsigned int)proxyByKey_.size();
+    }
+    if (attnWinMs_ == 0 || (now - attnWinMs_) < ATTN_WIN_MS) return;
+    unsigned long dSupp = authSuppresses_ - attnBaseSupp_;
+    unsigned long dCull = censusCulls_ - attnBaseCull_;
+    int dProxy = (int)proxyByKey_.size() - (int)attnBaseProxy_;
+    if (attnFlips_ >= 4 || dSupp || dCull || dProxy) {
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[attn] attach bodies=%lu hid=+%lu culled=+%lu minted=%+d winMs=%lu",
+            attnFlips_, dSupp, dCull, dProxy, (unsigned long)ATTN_WIN_MS);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    attnFlips_ = 0;
+    attnWinMs_ = 0;
+}
+
+void Replicator::pruneAttention(const std::set<Key>& seen) {
+    for (std::map<Key, bool>::iterator it = attnObs_.begin();
+         it != attnObs_.end(); ) {
+        if (seen.find(it->first) == seen.end()) attnObs_.erase(it++);
+        else ++it;
+    }
+    for (std::map<Key, bool>::iterator it = attnObsPeer_.begin();
+         it != attnObsPeer_.end(); ) {
+        if (seen.find(it->first) == seen.end()) attnObsPeer_.erase(it++);
+        else ++it;
+    }
+}
+
+void Replicator::reconcileProxy(Character* c, const EntityState& st,
+                                const std::map<Character*, Key>& keyOf) {
+    std::map<Character*, Key>::const_iterator pk = keyOf.find(c);
+    if (pk == keyOf.end()) return;
+    // st carries the LOCAL enumeration's hand; the census row answers to the
+    // stream key, so the drift is measured and the park keyed by that.
+    //
+    // ...and only while the stream is NOT driving it, the same rule the near
+    // pass (!streamed) and the wide pass (!driven) apply to every other body.
+    // A proxy the host streams this tick belongs to applyTargets; correcting it
+    // here as well put two controllers on one body (mint_aggro 20261022_123528:
+    // [census] FREEZE - AI suspend + haltMovement every tick - on proxies that
+    // were streamed=1 and being walked by the drive the whole fight). The
+    // exemption this exists for is the UNSTREAMED proxy, which still lands here.
+    if (drivenChars_.find(c) != drivenChars_.end()) return;
+    float drift = parkDivergedCopy(c, st, pk->second);
+    if (censusFreezeAi_ && drift >= 0.0f)
+        censusFreezeDivergedAi(c, pk->second, drift);
+}
+
+float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key& k) {
+    // v38 pack-hidden fix: existence culling exempts census-present NPCs, but
+    // both clients then run INDEPENDENT sims of the same body - the join's
+    // copy can stand somewhere the host's copy isn't (the "pack hidden" save:
+    // a pack visible on the join with no host counterpart at that spot).
+    // The census now carries the host position per row; reconcile a local
+    // copy that drifted past the park distance with a halt+teleport onto the
+    // host's spot. 120 u default: ABOVE town-schedule divergence (two sims
+    // seating the same bar NPC ~50 u apart - run 185524), so only genuinely
+    // divergent wanderers (measured 500-900 u) trip it.
+    if (censusParkDist_ <= 0.0f) return -1.0f;
+    // A body on someone's shoulder is transform-owned by its local carry
+    // attach - the drive's DR_CARRIED carve-out, for the same reason. Parking
+    // it teleports it off the shoulder, and halting it every tick under the
+    // divergence freeze left both of mint_aggro 20261022_123528's carried
+    // proxies to be LAUNCHED by their drop (Jakku +690 u, Streak +120 u, while
+    // the host's copies lay on the ground). -1 skips the freeze as well.
+    {
+        engine::CarryRead cr;
+        if (engine::readCarry(c, &cr) && cr.valid && cr.beingCarried) return -1.0f;
+    }
+    std::map<Key, CensusPos>::iterator it = censusPos_.find(k);
+    if (it == censusPos_.end()) return -1.0f;
+    // HORIZONTAL divergence only (2026-08-06). This was dist3, and height is the
+    // one axis a park cannot correct: park writes the transform, then the engine
+    // settles the body onto whatever is underfoot LOCALLY, so a copy the two
+    // clients disagree about vertically lands straight back where it started.
+    // Walking into Bad Teeth measured one - a Holy Priest at an IDENTICAL x/z,
+    // 129 u higher on the join than on the host (582 against 453: two engines
+    // disagreeing about a floor) - parked once a second for the whole run at an
+    // unchanging d=129, and took 84 of that run's 221 teleports on its own.
+    // Ground position is ours to reconcile; height belongs to the collision that
+    // owns it, and measuring an axis we cannot move only manufactures work.
+    float ddx = st.x - it->second.x, ddz = st.z - it->second.z;
+    float d  = std::sqrt(ddx * ddx + ddz * ddz);
+    float dv = std::fabs(st.y - it->second.y);
+    unsigned long nowP = nowMs();
+    // One threshold to start correcting, a closer one to stop. A single line
+    // would make the walk band below stutter for exactly the reason it exists:
+    // the body walks until it is a hair inside the line, we stop ordering, the
+    // freeze halts it, and a counterpart that is still walking re-opens the gap
+    // within the second - so the body would spend the town walking half a second
+    // and standing still half a second. Converging PAST the line and only
+    // re-arming at it lets one order cover several census rows.
+    std::map<Key, CensusFix>::iterator cf = censusFix_.find(k);
+    bool walkingNow = cf != censusFix_.end() && cf->second.walkMs != 0 &&
+                      (nowP - cf->second.walkMs) < 1500;
+    if (d <= (walkingNow ? censusParkDist_ * 0.5f : censusParkDist_)) {
+        // Converged. Drop the walk destination so the next real divergence
+        // issues a fresh one, and clear the futile streak - a body that closed
+        // the gap is not stuck.
+        if (cf != censusFix_.end()) { cf->second.haveDest = false;
+                                      cf->second.fails = 0;
+                                      cf->second.walkMs = 0; }
+        return d;
+    }
+    // WALK THE GAP instead of jumping it (2026-08-06). Teleporting is the only
+    // correction this path had, and for anything that WALKS it is the wrong one.
+    // A patrol's two copies cannot help diverging: the host's walks its route,
+    // the join's is AI-frozen the moment it crosses this threshold and so cannot
+    // follow, and the census position keeps advancing - so the gap re-opens as
+    // fast as it is closed and the only tool available is another teleport. Bad
+    // Teeth measured the result: 137 of one run's 221 teleports were patrol
+    // templates (Holy Sentinel, Servant, Paladin), median hop 154 u, one body
+    // jumping every two seconds for the length of the run. Nothing was broken;
+    // the correction itself was the artefact the player sees.
+    //
+    // A body that is merely BEHIND its counterpart should catch up the way it
+    // would in the world, on its feet. walkTo routes through the engine's own
+    // locomotion, so the body paths around what is in the way, grounds itself,
+    // and plays a real walk clip - and it costs nothing extra, since the census
+    // position it is already being corrected onto is the destination.
+    //
+    // The teleport stays for the class it was written for. The pack-hidden case
+    // is a copy that is not behind its counterpart but somewhere else entirely
+    // (measured 500-900 u), where there is nothing to converge to on foot: it
+    // would spend a minute walking a route its counterpart never took, through
+    // whatever lies between. Past the band ceiling, jump.
+    if (censusWalkDist_ > 0.0f && d <= censusWalkDist_) {
+        CensusFix& f = censusFix_[k];
+        // What the counterpart is doing, from the step between the last two
+        // census rows OF THE AUTHOR THAT LISTS IT - the only thing we can know
+        // about an unstreamed body's motion, since the census carries position
+        // and nothing else.
+        float stepX = 0.0f, stepZ = 0.0f, hostSpd = 0.0f;
+        std::map<Key, u32>::const_iterator co = censusOwnerOf_.find(k);
+        std::map<u32, PeerCensus>::const_iterator pc =
+            (co != censusOwnerOf_.end()) ? census_.find(co->second) : census_.end();
+        if (pc != census_.end()) {
+            const PeerCensus& src = pc->second;
+            std::map<Key, CensusPos>::const_iterator pv = src.prev.find(k);
+            if (pv != src.prev.end() && src.prevMs && src.recvMs > src.prevMs) {
+                stepX = it->second.x - pv->second.x;
+                stepZ = it->second.z - pv->second.z;
+                float dt = (float)(src.recvMs - src.prevMs) / 1000.0f;
+                // Converted OUT of world units per second and INTO the engine's
+                // speed scale: the step is real displacement and so already
+                // carries the game-speed multiplier, while walkTo commands a
+                // speed the multiplier is then applied to. Miss that and a 5x
+                // session orders five times the intended sprint.
+                float mult = (speedLastSet_ > 1.0f) ? speedLastSet_ : 1.0f;
+                hostSpd = std::sqrt(stepX * stepX + stepZ * stepZ) / dt / mult;
+            }
+        }
+        // Walk to where the counterpart is GOING, not where it was. A census row
+        // is already up to a second old when it arrives, so a body sent to the
+        // reported spot arrives at a place its counterpart has left and stops
+        // there to wait for the next row. Leading by the last step - the
+        // distance it covered over exactly one row - keeps the destination
+        // roughly one row ahead, which is where it will be when the order runs
+        // out. A counterpart that stopped has a zero step and so is never led,
+        // which is what keeps the lead from overshooting a body at rest.
+        float tx = it->second.x + stepX, tz = it->second.z + stepZ;
+        // Re-issue only when the destination actually moved (the locomotion-
+        // drive lesson: a per-frame walkTo restarts the path and renders as
+        // stutter). Census rows arrive at ~1 Hz, so in practice this is one
+        // order per row for a moving target and one in total for a still one.
+        float moved = f.haveDest
+            ? std::sqrt((tx - f.dx) * (tx - f.dx) + (tz - f.dz) * (tz - f.dz))
+            : (REISSUE_DIST + 1.0f);
+        if (moved > REISSUE_DIST) {
+            // Speed has to EXCEED the pace of what it is chasing or the gap
+            // never closes - the body would trail at a fixed distance forever,
+            // permanently over the threshold.
+            float base = (hostSpd > 1.0f) ? hostSpd : 12.0f;
+            float spd  = base + d;          // wider gap, harder catch-up
+            float cap  = base * 2.5f;       // ...but never a teleport on legs
+            if (spd > cap) spd = cap;
+            engine::walkTo(c, tx, it->second.y, tz, spd);
+            f.haveDest = true; f.dx = tx; f.dz = tz;
+            ++censusWalks_;
+            static unsigned long walkLogTick = 0; // main-thread only, ~1 line/s
+            if ((nowP - walkLogTick) >= 1000) {
+                walkLogTick = nowP;
+                char nm[48]; engine::charName(c, nm, sizeof(nm));
+                char b[224]; _snprintf(b, sizeof(b) - 1,
+                    "[census] walk hand=%u,%u name='%s' d=%.0f hostSpd=%.0f "
+                    "lead=%.0f spd=%.0f band=%.0f (walks=%lu parks=%lu)",
+                    k.i, k.s, nm, d, hostSpd,
+                    std::sqrt(stepX * stepX + stepZ * stepZ), spd,
+                    censusWalkDist_, censusWalks_, censusParks_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        // Refreshed every tick, not just on re-issue: this is what tells the
+        // divergence freeze below that the body is under a walk order of ours
+        // and its per-tick haltMovement would cancel the very correction in
+        // progress.
+        f.walkMs = nowP;
+        f.fails  = 0;
+        return d;
+    }
+    // TELEPORT. A body that reaches this point failed the walk band above, so
+    // it is not behind its counterpart, it is somewhere else.
+    //
+    // Per-key cooldown (npc_sync regression, run 185524): the engine's own
+    // schedule AI can re-place the body the same frame (a seated copy), so an
+    // unthrottled park re-teleported every frame and wrecked tracking. One
+    // park per key per cooldown bounds the fight; a free wanderer sticks on
+    // the first try.
+    // A FROZEN body (AI suspended for repeat divergence) reparks on a 1 s
+    // cooldown: run 014948 showed a frozen slave still re-pathed to ~600 u
+    // between 5 s parks (an in-flight movement goal survives the suspend),
+    // so the clamp must out-pace the walk. Unfrozen bodies keep the 5 s
+    // cooldown that protects seat-schedule NPCs from park thrash.
+    unsigned long cool = censusFrozen_.count(k) ? 1000 : 5000;
+    // Futile-park backoff. A park that lands and a park that silently does
+    // nothing look identical from the call site, so the only evidence is the
+    // next tick's position: a body still standing where we last teleported it
+    // was not moved BY us either. Repeating a correction that demonstrably does
+    // not take is pure cost, and it is not hypothetical - the vertical case
+    // above spun at 1 Hz for an entire run, and the chained Nutto (parks=543 at
+    // a constant d=381) needed its own anchor-break fix to escape the same loop.
+    // This is the general form of both: keep retrying, because a zone reload or
+    // an unchaining can make it work later, but a minute apart instead of a
+    // second. Deliberately NOT a give-up - a body that is genuinely diverged
+    // still deserves the occasional attempt.
+    const float         PARK_MOVED_EPS   = 5.0f;
+    const unsigned int  PARK_FUTILE_MAX  = 3;
+    const unsigned long PARK_FUTILE_COOL = 60000;
+    std::map<Key, CensusFix>::iterator fs = censusFix_.find(k);
+    bool unmoved = fs != censusFix_.end() && fs->second.fails > 0 &&
+                   std::fabs(st.x - fs->second.px) < PARK_MOVED_EPS &&
+                   std::fabs(st.z - fs->second.pz) < PARK_MOVED_EPS;
+    if (unmoved && fs->second.fails >= PARK_FUTILE_MAX) cool = PARK_FUTILE_COOL;
+    std::map<Key, unsigned long>::iterator pm = parkMs_.find(k);
+    if (pm != parkMs_.end() && (nowP - pm->second) < cool) return d;
+    parkMs_[k] = nowP;
+    {
+        CensusFix& f = censusFix_[k];
+        // A first park has nothing to compare against, so the streak starts at
+        // 1 and the entry records where we are about to move the body from.
+        bool same = f.fails > 0 &&
+                    std::fabs(st.x - f.px) < PARK_MOVED_EPS &&
+                    std::fabs(st.z - f.pz) < PARK_MOVED_EPS;
+        f.fails = same ? f.fails + 1 : 1;
+        if (same && f.fails == PARK_FUTILE_MAX) {
+            char nm[48]; engine::charName(c, nm, sizeof(nm));
+            char b[208]; _snprintf(b, sizeof(b) - 1,
+                "[census] park FUTILE hand=%u,%u name='%s' d=%.0f dv=%.0f "
+                "(unmoved across %u parks; retrying every %lus)",
+                k.i, k.s, nm, d, dv, PARK_FUTILE_MAX,
+                PARK_FUTILE_COOL / 1000);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        f.px = st.x; f.pz = st.z;
+        f.haveDest = false; // a teleport invalidates any walk destination
+    }
+    // Anchor break (world_parity 2026-07-17): a census copy chained/caged at
+    // the WRONG fixture (cross-client furniture identity is unreliable) is
+    // position-anchored - every park teleport snapped straight back (Nutto:
+    // parks=543, local pos constant at d=381 all run). Release the local
+    // furniture first, then park. A chained body is NOT re-chained here:
+    // kind-3 re-entry (setChainedMode with the LOCAL slaveOwner) snapped the
+    // body straight back to that owner's spot ~500 u away (run 012555:
+    // Lungrot re-anchored kind=3 at d~450-520 on EVERY 5 s park, forever).
+    // The divergence freeze below keeps the parked body inert instead; the
+    // lock-state stream still owns the shackle item itself.
+    engine::FurnitureRead lfr;
+    bool anchored = engine::readFurniture(c, &lfr) && lfr.valid && lfr.kind != 0;
+    if (anchored) {
+        engine::applyFurniture(0, c, lfr.furn, lfr.kind, false);
+        engine::endAction(c);
+        char nm[48]; engine::charName(c, nm, sizeof(nm));
+        char b[144]; _snprintf(b, sizeof(b) - 1,
+            "[census] park ANCHOR-BREAK hand=%u,%u name='%s' kind=%d d=%.0f",
+            k.i, k.s, nm, lfr.kind, d);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    if (engine::park(c, it->second.x, it->second.y, it->second.z, st.heading)) {
+        ++censusParks_;
+        static unsigned long logTick = 0; // main-thread only, ~4 lines/s
+        unsigned long now = nowMs();
+        if ((now - logTick) >= 250) {
+            logTick = now;
+            char nm[48]; engine::charName(c, nm, sizeof(nm));
+            char b[208]; _snprintf(b, sizeof(b) - 1,
+                "[census] park hand=%u,%u name='%s' d=%.0f dv=%.0f "
+                "local=%.0f,%.0f,%.0f host=%.0f,%.0f,%.0f (parks=%lu)",
+                k.i, k.s, nm, d, dv, st.x, st.y, st.z,
+                it->second.x, it->second.y, it->second.z, censusParks_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    return d;
+}
+
+// Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI, join only): the position
+// park above teleports a diverged census-band body back to the host's spot, but
+// its LOCAL AI kept re-deciding to flee/fight (a captive/working slave with no
+// supervisor on the join), so it ran off and aggroed the join's guards while the
+// host had it working. Suspend its AI while it is diverging. Divergence-gated so
+// well-tracking census NPCs (bar-seaters ~50 u apart) keep their local AI: only
+// a body that crossed censusParkDist_ is frozen, HELD ~5 s past the last over-
+// threshold tick (so the park zeroing its drift can't oscillate it back into
+// fleeing), then re-checked (released if it settled, re-frozen if it diverges
+// again). Runs AFTER applyTargets' per-tick clearAiSuspend(), so the suspend
+// added here stands for the tick; addAiSuspend is a no-op if the AI-suspend
+// detour is not installed (KENSHICOOP_AI_SUSPEND=0).
+void Replicator::censusFreezeDivergedAi(Character* c, const Key& k, float drift) {
+    if (!c) return;
+    // 20 s hold (was 5 s): a diverged working slave released after only 5 s
+    // below-threshold walked back toward its local job spot / owner and was
+    // over the 120 u park line again before the next 5 s park cooldown fired
+    // (run 012555: Lungrot oscillated 300-500 u every park, all run). The
+    // longer hold keeps a repeat offender inert across several park cycles;
+    // a genuinely settled body still releases and never re-arms.
+    const unsigned long HOLD_MS = 20000;
+    unsigned long now = nowMs();
+    bool over = (drift > censusParkDist_); // censusParkDist_ > 0 implied (drift >= 0)
+    std::map<Key, unsigned long>::iterator it = censusFrozen_.find(k);
+    bool wasFrozen = (it != censusFrozen_.end());
+    if (over) {
+        censusFrozen_[k] = now;                 // (re)arm / refresh the hold
+        if (!wasFrozen) engine::endAction(c);   // drop the in-progress flee/attack once
+    } else if (wasFrozen) {
+        if ((now - it->second) >= HOLD_MS) {    // settled: release, resume local AI
+            censusFrozen_.erase(it);
+            return;
+        }
+    } else {
+        return;                                 // never diverged: leave local AI alone
+    }
+    engine::addAiSuspend(c);                     // quiesce AI decisions this tick
+    // A destination committed BEFORE the suspend keeps the body running (run
+    // 014948: frozen slave re-pathed ~600 u between parks); kill it per tick.
+    //
+    // UNLESS the destination is OURS. That same survival is what makes the
+    // walk-converge band work at all - the suspend stops the body deciding
+    // where to go while our order carries it where the host's copy is - and
+    // halting it every tick would cancel the correction in progress and leave
+    // the teleport as the only way home, which is the loop the band exists to
+    // break. The AI stays suspended either way, so what walks is only ever us.
+    std::map<Key, CensusFix>::iterator wf = censusFix_.find(k);
+    bool walking = wf != censusFix_.end() && wf->second.walkMs != 0 &&
+                   (now - wf->second.walkMs) < 1500;
+    if (!walking) engine::haltMovement(c);
+    static unsigned long logTick = 0;           // main-thread only, ~4 lines/s
+    if ((now - logTick) >= 250) {
+        logTick = now;
+        char nm[48]; engine::charName(c, nm, sizeof(nm));
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[census] FREEZE hand=%u,%u name='%s' d=%.0f (frozen=%u)",
+            k.i, k.s, nm, drift, (unsigned)censusFrozen_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::pruneDebugMarkers(const std::set<Character*>& live) {
+    for (std::map<Character*, DebugMarker>::iterator it = debugMarkers_.begin();
+         it != debugMarkers_.end(); ) {
+        // A green DRV label is only ever written while a body is being driven,
+        // and nothing re-captions it when the drive stops: the body stays
+        // enumerated, so it stays 'live' here, and the label outlives the fact
+        // it asserts. That turns the HUD into a record of everything this client
+        // has EVER driven, which reads on screen as both clients driving the
+        // same body - the thing the tag exists to let you rule out. Drop it as
+        // soon as the body leaves the driven set; a resumed drive re-creates it
+        // on the next tick.
+        bool staleDrive = (it->second.color == 0) &&
+                          (drivenChars_.find(it->first) == drivenChars_.end());
+        if (staleDrive || live.find(it->first) == live.end()) {
+            engine::markerDestroy(it->second.label);
+            debugMarkers_.erase(it++);
+        } else ++it;
+    }
+}
+
+
+} // namespace coop

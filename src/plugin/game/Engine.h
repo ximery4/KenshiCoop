@@ -1,0 +1,2570 @@
+// Engine - SEH-guarded access to Kenshi engine state.
+//
+// Every call here either reads or pokes live game memory, so it is the ONLY
+// place allowed to touch the engine, and only ever from the main (game) thread.
+// Each guarded call wraps the engine call in __try/__except so a transient bad
+// pointer (e.g. mid-load) degrades to a no-op instead of crashing the game.
+//
+// Stage 0 surface is intentionally tiny: detect "gameplay is live" and drive the
+// save auto-load. Later stages extend this module with entity resolve/apply.
+
+#ifndef KENSHICOOP_ENGINE_H
+#define KENSHICOOP_ENGINE_H
+
+#include <string>
+#include <vector>
+#include "../../netproto/Wire.h"
+
+class GameWorld;
+class Character;
+class RootObject;
+class Faction;
+
+namespace coop {
+namespace engine {
+
+// Resolve engine function addresses used by the plugin. Call once at load.
+void resolve();
+
+// SEH-guarded: is live gameplay running (the local player squad exists)?
+bool gameplayLive(GameWorld* gw);
+
+// SEH-guarded: issue a deferred save load by name. Returns false if the save
+// subsystem isn't ready yet (caller retries next frame) or the call faulted.
+bool loadSave(const std::string& name);
+
+// SEH-guarded: overwrite SaveManager::currentGame in place. The engine's
+// load(name) path does NOT refresh currentGame, so loadSave() calls this to keep
+// getCurrentGame()/saveInfo() truthful - otherwise the host connect-push saves
+// the loaded world over a STALE save name (the fixture-clobber bug).
+bool setCurrentGameName(const std::string& name);
+
+// SEH-guarded readiness probe: does the save subsystem report it is up? Returns
+// true when the probe symbol is unavailable (so it never blocks auto-load).
+bool savesReady();
+
+// SEH-guarded: save the running game under 'name' via SaveManager::save (the
+// same path the in-game save menu takes; autosave=false). Used to BAKE fixture
+// saves without a manual menu round-trip. Main-thread only.
+bool saveGameAs(const std::string& name);
+
+// ---- Protocol 31: coordinated save + session resume -------------------------
+
+// SEH-guarded: read SaveManager::getCurrentGame() and getSavePath() (spike 39
+// RVAs, runtime-validated by save_probe) into the caller's buffers. Either
+// output may be null. Returns true if at least one string was read; on false
+// the caller falls back to the %LOCALAPPDATA%\kenshi\save convention.
+bool saveInfo(char* curGame, unsigned int curLen,
+              char* savePath, unsigned int pathLen);
+
+// One local save edge captured by the SaveManager::save detour (menu save,
+// quicksave, autosave timer, or the mod's own saveGameAs).
+struct SaveEdge { char name[48]; int autosave; int suppressed; };
+// Detour SaveManager::save: every local save (any path) logs a "[save]
+// LOCAL-SAVE" line and queues a SaveEdge the Plugin drains once per tick -
+// the coordination trigger for the host-authoritative save transfer.
+bool installSaveHook();
+// JOIN under save-sync: suppress the LOCAL write entirely (the host's save is
+// authoritative; a manual edge is forwarded as PKT_SAVE_REQ instead).
+void setSaveSuppress(bool on);
+unsigned int drainSaveEdges(SaveEdge* out, unsigned int maxOut);
+
+// ---- Protocol 32: coordinated load ------------------------------------------
+// One local load edge captured by the SaveManager::load detour (in-game load
+// menu, title-screen load, or the mod's own loadSave).
+struct LoadEdge { char name[48]; int suppressed; };
+// Detour SaveManager::load: every local load (any path) logs a "[load]
+// LOCAL-LOAD" line and queues a LoadEdge the Plugin drains once per tick -
+// the coordination trigger for the host-authoritative load broadcast.
+bool installLoadHook();
+// JOIN under load-sync: swallow the LOCAL load entirely (the host arbitrates;
+// a manual edge is forwarded as PKT_LOAD_REQ instead). The bypass lever lets
+// the mod's own coordinated loadSave pass through while suppression is on.
+void setLoadSuppress(bool on);
+// One-shot: the NEXT load passes through the detour even under suppression
+// (the join's coordinated load issued on PKT_LOAD_GO / post-transfer).
+void setLoadBypassOnce();
+unsigned int drainLoadEdges(LoadEdge* out, unsigned int maxOut);
+// Monotonic count of loads that actually proceeded (any entry point). Unchanged
+// across a world becoming live = that world came from New Game, not a save.
+unsigned int loadEdgeSerial();
+
+// Protocol 32 probe: the deferred-signal mechanism's state. SaveManager::load
+// sets signal=LOADGAME(2) + a frame delay; SOMETHING must then call
+// execute() to perform the swap. load_probe found the title-screen loop is
+// that something - mid-session the signal just sits there. Returns signal
+// (0=idle, 1=SAVEGAME, 2=LOADGAME, 3=IMPORT, 4=NEWGAME; -1 unknown) and
+// optionally the remaining frame delay.
+int saveMgrSignal(int* outDelay);
+// Call SaveManager::execute() once (SEH-guarded) - the engine's own deferred-
+// action consumer, driven manually to fire a pending mid-session load. Call
+// from the END of the main-loop tick (post engine tick): execute() tears the
+// whole world down and rebuilds it synchronously.
+bool saveMgrExecute();
+
+// ---- Entity capture / resolve / apply (Stage 1+) ---------------------------
+
+// SEH-guarded: capture the local player's squad into 'out' (up to maxOut),
+// filling hand + transform + locomotion. When leaderOnly is true, only
+// playerCharacters[0] is captured. Returns the number written.
+unsigned int captureSquad(GameWorld* gw, bool leaderOnly,
+                          EntityState* out, unsigned int maxOut);
+
+// SEH-guarded: resolve a received entity's hand to this machine's local
+// Character*, or 0 if it isn't loaded here / doesn't resolve.
+Character* resolve(const EntityState& e);
+
+// SEH-guarded: resolve a Character* from raw hand fields (same path as resolve()).
+Character* resolveCharByHand(unsigned int idx, unsigned int ser, unsigned int type,
+                             unsigned int cont, unsigned int contSer);
+
+// ---- Canonical typed hand capture/resolve (Phase 5b: ObjectHand) ------------
+// Typed replacements for the raw-array read*/resolve*ByHand helpers. They own
+// the engine's hand-ctor arg order in ONE place, so no caller hand-indexes a
+// u32[5]. The raw-array helpers (readObjectHand/readHand/resolveObjectByHand/
+// resolveCharByHand) are thin adapters over these, using ObjectHand's from*/to*
+// converters for the two legacy array orders. Migrate call sites to these to
+// drop the [3]/[4]/[0]... remaps entirely.
+//
+// SEH-guarded: read obj/char ->handle into a typed ObjectHand. Returns false on
+// null/fault (out is left untouched); the id/serial name the object.
+bool handOf(RootObject* obj, ObjectHand& out);
+bool charHandOf(Character* c, ObjectHand& out);
+// SEH-guarded: resolve a typed hand to this machine's local Character*/RootObject*
+// (same engine hand path as resolve(EntityState)). 0 if unloaded here /
+// unresolvable / faulted.
+Character* resolveChar(const ObjectHand& h);
+RootObject* resolveObject(const ObjectHand& h);
+// SEH-guarded: the body's template (its GameData record) as an opaque identity.
+// Stable for the session and untouched by re-containering, so it tells a renamed
+// body from a different one that inherited its address. 0 if unreadable.
+const void* templateOf(Character* c);
+
+// SEH-guarded RAW apply: teleport the body to the entity transform via the
+// movement controller (no interpolation). Stage 1 apply path.
+bool applyRaw(Character* c, const EntityState& e);
+// ---- MoveSync: SEH-guarded position nudge keeping the body's current facing
+// (error bleed for a trailing walk-driven squad copy). ----
+bool nudgePos(Character* c, float x, float y, float z);
+
+// SEH-guarded: read a character's current world position (for SCENARIO logging).
+bool readPos(Character* c, float* x, float* y, float* z);
+
+// SEH-guarded: read a character's hand into out[5] = {index, serial, type,
+// container, containerSerial} (the SCENARIO hand-key field order).
+bool readHand(Character* c, unsigned int out[5]);
+
+// SEH-guarded: order a character to walk to an absolute destination (host-side
+// scenario motion). Routes through the engine's normal locomotion.
+bool orderMoveTo(Character* c, float x, float y, float z);
+
+// ---- Stage 3 walk-drive primitives -----------------------------------------
+
+// SEH-guarded: walk the body toward an absolute destination at 'speed' through
+// the engine's locomotion (player move-order path, so a player-controlled body
+// obeys), so the engine grounds it and plays a real walk/run clip. Re-issued each
+// frame toward the moving target; the engine acts on the next tick.
+bool walkTo(Character* c, float x, float y, float z, float speed);
+
+// SEH-guarded: halt + teleport to an exact transform (a clean stop at rest).
+bool park(Character* c, float x, float y, float z, float heading);
+// Halt an in-flight movement goal without teleporting (census-freeze upkeep:
+// the AI-suspend hook blocks new decisions, not a committed destination).
+bool haltMovement(Character* c);
+
+// SEH-guarded: mirror the source's locomotion state onto the movement controller
+// (drives the AnimationClass walk/idle/run selection). Written as the last word.
+bool applyMotion(Character* c, bool moving, float speed, float mx, float my, float mz);
+
+// SEH-guarded: read the body's live locomotion truth (the float-bug oracle):
+// currentlyMoving + currentSpeed. Returns false on fault / missing controller.
+bool readMotion(Character* c, bool* moving, float* speed);
+// Locomotion internals for diagnosing a body that takes move orders but does
+// not translate (havok character present? animation-tracking mode? ...).
+struct MoveDiag {
+    bool  valid;
+    bool  havok;          // CharMovement::havokCharacter != 0
+    bool  tracer;         // CharMovement::tracer != 0
+    bool  animOverride;   // CharMovement::animationOverride
+    bool  trackingAnim;   // isTrackingAnimationMode()
+    int   mode;           // movementMode
+    bool  moving;         // currentlyMoving
+    float speed, desired;
+    float dx, dy, dz;     // destination
+};
+bool readMoveDiag(Character* c, MoveDiag* out);
+// Where the MODEL is: world position of the rendered skeleton's pelvis bone
+// (CharMovement::pos, which getPosition/the nameplate follow, can move while the
+// mesh stays behind), plus the left-right foot distance - it swings while a gait
+// clip plays and stays constant on a body that slides without animation.
+struct MeshProbe {
+    bool  valid;
+    float px, py, pz;
+    float footSep;        // -1 = feet not readable
+};
+bool readMeshProbe(Character* c, MeshProbe* out);
+
+// SEH-guarded: fetch the local player's squad leader (playerCharacters[0]) or 0.
+Character* leader(GameWorld* gw);
+
+// SEH-guarded: write the local player's controllable characters (playerCharacters)
+// into out (up to maxOut). Returns the count. Used to register the combat-report
+// attacker set (the join's owned melee that the host should apply authoritatively).
+unsigned int listPlayerChars(GameWorld* gw, Character** out, unsigned int maxOut);
+
+// SEH-guarded: read the LOCAL camera's world center into out[3] (x,y,z).
+// Returns false when the camera is absent or not yet initialised (pre-load).
+// Camera-anchored interest lever (spike 35): purely local read; the join
+// forwards its value to the host at ~1Hz via PKT_CAM_HINT.
+bool cameraCenter(GameWorld* gw, float out[3]);
+
+// SEH-guarded: point the LOCAL camera at a character (the engine's own
+// focusCameraOnObject - select-and-look-at, and it keeps following).
+// Automated scenarios teleport bodies with park(), which does NOT move the
+// camera, so before this existed a split-squad run left BOTH clients watching
+// whichever squad the save started on - measured in run 20260802_112449, where
+// the host and join cameras sat on the same point ~5200 u from the join's own
+// characters for the entire window. That is not a configuration anyone plays
+// in, and it matters: what a player SEES is camera-driven, and the camera also
+// contributes an interest anchor. Returns false if the lever is unresolved.
+bool cameraFocusOn(GameWorld* gw, Character* c);
+
+// Interest anchors (protocol 43, sized for N players in protocol 56): one per
+// squad-tab leader (up to MAX_PLAYERS) plus the local camera and every remote
+// player's camera hint (up to MAX_PLAYERS cameras in all).
+const unsigned int MAX_INTEREST_ANCHORS = 2 * MAX_PLAYERS;
+
+// Camera-anchored interest anchor stores (protocol 43). The sync layer
+// publishes the LOCAL camera center and every remote player's (fresh) camera
+// hint each tick; interestCenters folds them in as extra anchors, deduped
+// against the squad-tab leader spheres. valid=false clears the local anchor
+// (camera not up); n=0 clears the remote hints (all stale). Main-thread only.
+void setLocalCamAnchor(bool valid, float x, float y, float z);
+// xyz = n packed x,y,z triples (n is clamped to MAX_PLAYERS - 1), in the
+// order interestCenters should consider them (ascending player id).
+void setPeerCamHints(const float* xyz, unsigned int n);
+// Read the remote camera hints back out, for predicates that must reason about
+// where THEY are looking rather than about the merged anchor set. Writes up to
+// maxOut triples into out; returns the count (0 when no fresh hint arrived).
+unsigned int peerCamAnchors(float* out, unsigned int maxOut);
+// KENSHICOOP_CAM_INTEREST master enable: when off, interestCenters ignores
+// the camera anchors (squad-tab leaders only - the pre-43 behavior).
+void setCamInterest(bool on);
+
+// SEH-guarded: expose the current interest anchors (up to MAX_INTEREST_ANCHORS
+// x,y,z triples into out) to the sync layer - the mid-band nearest-first
+// ordering prioritizes by distance to the closest ANCHOR (tab leaders +
+// cameras), so camera-watched NPCs get mid-band drive slots too. Returns the
+// anchor count; nLeaders (optional) receives how many leading entries are
+// squad-tab leaders (the rest are cameras).
+unsigned int interestAnchors(GameWorld* gw, float out[3 * MAX_INTEREST_ANCHORS],
+                             unsigned int* nLeaders = 0);
+
+// ---- Stage 4 NPC replication primitives ------------------------------------
+
+// SEH-guarded: enumerate characters near the local player and capture every one
+// that is NOT a member of the local player squad (i.e. host-authoritative world
+// NPCs) into 'out' (up to maxOut), filling hand + transform + locomotion. Returns
+// the number written. The same EntityState shape used for squad members, so the
+// receiver drives them through the identical resolve/walk-drive path. outChars
+// (optional, maxOut entries) receives the captured Character* parallel to out,
+// for callers that must name a row by its body rather than its local hand.
+unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut,
+                         Character** outChars = 0);
+
+// SEH-guarded (Phase 2 mid-band tier): resolve a hand (i,s,t,c,cs order like
+// resolveCharByHand) and capture it into an EntityState. Returns false when
+// the hand no longer resolves (despawned since the census walk that listed
+// it) or the body is a player-squad member (never streamed from the NPC
+// tiers). The resolve round-trip is the pointer-liveness proof.
+bool captureNpcByHand(GameWorld* gw, unsigned int hIndex, unsigned int hSerial,
+                      unsigned int hType, unsigned int hContainer,
+                      unsigned int hContainerSerial, EntityState* out);
+
+// SEH-guarded: clear a character's autonomous AI goals so it stops wandering /
+// re-pathing on its own. The body is kept IN the engine update list (removing it
+// freezes the movement controller and makes our walk-drive/teleport no-op), so
+// we quiet it here and let the network transform drive it instead.
+void clearGoals(Character* c);
+
+// SEH-guarded: is 'c' a member of the LOCAL player squad (shared-save squad)?
+// The join drives a squad member through the player move-order walk-drive (the
+// body is inert when uncontrolled), but a world NPC is fully AI-simulated locally
+// and must instead be driven kinematically (teleport wins over the local AI).
+bool isLocalPlayerChar(GameWorld* gw, Character* c);
+
+// SEH-guarded: pull an NPC OUT of the engine's main AI update list (and clear its
+// goals) so the engine stops simulating it autonomously - its local AI would
+// otherwise run its own schedule (sit/patrol/jobs) and diverge from the host.
+// We then own its transform via kinematic teleport. Returns true on success.
+bool suppressNpc(GameWorld* gw, Character* c);
+
+// SEH-guarded: hand a previously-suppressed NPC back to the engine's local AI
+// (when the host stops streaming it), so the world keeps living rather than
+// leaving a frozen body behind. Also makes the body visible again.
+void restoreNpc(GameWorld* gw, Character* c);
+
+// True if 'obj' is one of THIS client's player-squad members. Caller holds the
+// SEH frame. Exposed to the sync layer for the recruit membership audit (a
+// re-keyed recruit binds + drives as a proxy but is NOT in the join's squad).
+bool isPlayerSquad(GameWorld* gw, RootObject* obj);
+
+// SEH-guarded: enumerate nearby world NPCs (excluding the local player squad),
+// writing each live Character* into outChars and its hand-bearing snapshot into
+// outStates. Returns the count. Used by the join to find NPCs the host is NOT
+// streaming so it can suppress them (host-authoritative world).
+// *outTruncated (optional) is set when the enumeration hit maxOut with candidates
+// still pending - the result is then an INCOMPLETE view of the local world, and a
+// caller that treats absence as authority (suppress/cull) would judge bodies it
+// never saw. A bare count cannot express this: n == maxOut is indistinguishable
+// from a list that happened to fit exactly.
+unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outStates,
+                      unsigned int maxOut, bool* outTruncated = 0);
+
+// SEH-guarded: WIDE-radius world-NPC enumeration (protocol 36 census). Same
+// exclusions as listNpcs (never the local player squad) but the query reaches
+// 'radius' units around every interest center instead of the ~200 u stream
+// bubble - the host builds its 1 Hz existence census from this, and the join
+// scans the same radius to find local-only ghosts to cull. States are hand +
+// position only in spirit (captureOne fills everything; callers use the hand).
+// *outTruncated: see listNpcs. It matters more here - a truncated HOST census
+// silently reports "these NPCs do not exist" for everything past the cap, and
+// the join culls real bodies against it.
+unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
+                          EntityState* outStates, unsigned int maxOut,
+                          bool* outTruncated = 0);
+
+// SEH-guarded: how many world NPCs (never the local player squad) sit within
+// 'radius' of ONE point. Deliberately NOT anchor-driven: listNpcs/listNpcsWide
+// sweep every interest center under a shared output budget, so a scenario that
+// used them to measure the population at a specific place would inherit the
+// very budgeting and horizon behaviour it is trying to characterise. Counts
+// only - no capture, no dedupe (one sphere cannot repeat a body). 0 on fault.
+unsigned int countNpcsNear(GameWorld* gw, float x, float y, float z,
+                           float radius);
+
+// SEH-guarded: copy a character's display name into 'out' (always NUL-
+// terminated; empty string on any fault). Diagnostics only - cull/suppress
+// logs need a human-readable identity to classify pop-out reports.
+void charName(Character* c, char* out, unsigned int cap);
+
+// Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS, spike-47 substrate): mint
+// a colored text label pinned to a character; the engine's own projection
+// tracks the body every frame. colorId: 0 = green (host-driven), 1 = red
+// (hidden/suppressed), 2 = yellow (local-only ghost). Returns an opaque
+// ScreenLabel handle (null on fault / GUI not up). Main-thread only.
+void* markerCreate(Character* c, const char* text, int colorId);
+bool  markerUpdate(void* label, const char* text, int colorId);
+void  markerDestroy(void* label);
+// True while the GUI still owns this label. A ScreenLabel belongs to
+// ForgottenGUI, which destroys labels on its own schedule and tells nobody, so
+// every handle we cache can die under us; markerUpdate/markerDestroy consult
+// this before dereferencing and callers holding a handle across ticks should
+// too. Cheap (a pointer scan of the GUI's own label registry).
+bool  markerAlive(void* label);
+// Dev overlay labels (devtools/DevOverlay.cpp). Same ScreenLabel substrate and
+// lifetime rules as the marker* family above (every call re-asks markerAlive;
+// markerUpdate/markerDestroy/markerAlive work on these handles too).
+// markerCreateTracked: markerCreate with the head offset chosen by the caller.
+// markerCreateFixed: an UNTRACKED label at world (x,y,z); ScreenLabel::setPosition
+//   detaches it from any hand, so it never self-destroys for a missing target.
+// markerPlace: move a label to (x,y,z) (this also untracks it) and show/hide it;
+//   false when the label is dead or faulted.
+// markerCaptionIs: alive AND its caption equals text exactly. An identity check
+//   for handles held across ticks: a recycled label address passes markerAlive
+//   but not this, so callers can drop the handle without touching a stranger's.
+void* markerCreateTracked(Character* c, const char* text, int colorId, float offY);
+void* markerCreateFixed(const char* text, int colorId, float x, float y, float z);
+bool  markerPlace(void* label, float x, float y, float z, bool visible);
+bool  markerCaptionIs(void* label, const char* text);
+
+// ---- In-game co-op session panel ---------------------------------------------
+// Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
+// CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)
+// includes EngineUi.h directly; the adapter (EngineInternal.h) re-includes it.
+
+// ---- Deterministic test-scene setup (host-side; baked into a save) ---------
+// Moved to EngineScenario.h (Phase 5a domain split): spawnSeatInFront,
+// spawnNpcInFront, spawnMachineInFront, orderWorkAt, findFurnitureNear,
+// orderUseBed, setupCraftScene, rearmCraftScene, setupDownScene, rearmDownScene,
+// setupSquadScene, pickDownSubject, holdSubjectUpright, orderDownSubject,
+// killSubject, woundSubject. The scenario harness (ScenarioSupport.h) + auto-bake
+// (Plugin.cpp) include EngineScenario.h; the adapter (EngineInternal.h) re-includes it.
+
+// ---- Down-state drive primitives (SYNC; used by the Replicator down path) ---
+// knockDown drops a Character into (on=true) / out of (on=false) full-body
+// ragdoll - the join calls it to reproduce a host-authoritative down edge.
+bool knockDown(Character* c, bool on);
+// Maintain an already-down body each tick by topping the KO timer (no re-collapse).
+// Prevents the get-up/flop flicker without re-triggering the ragdoll fall. Join-side.
+bool holdDown(Character* c);
+
+// ---- Protocol 21: runtime-spawn proxy replication ---------------------------
+// NPC sync resolves bodies by save-stable hand, so a squad the host's spawn
+// manager mints at RUNTIME (roaming bandits, dialog ambushes) has a host-only
+// hand the join can never resolve. The join asks (PKT_SPAWN_REQ), the host
+// describes (these reads), and the join mints a LOCAL proxy body (this spawn)
+// that the ordinary world-NPC drive path then owns.
+
+// SEH-guarded (host): describe the runtime spawn at 'c' - template GameData
+// stringID, faction stringID (via Faction::getData; "" when unreadable),
+// world transform, dead flag, and age (Character::getAge; animals derive body
+// SCALE from it - protocol 39 creature-size sync; 0 when unreadable). Returns
+// false when the template stringID is unreadable (nothing to describe ->
+// negative reply).
+bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
+                       char* facSid, unsigned int facSidLen,
+                       float* x, float* y, float* z, float* heading, bool* dead,
+                       float* age);
+
+// SEH-guarded (join): mint a LOCAL proxy body from a host description: template
+// by CHARACTER stringID, faction by FACTION stringID (FactionManager::
+// getFactionByStringID; falls back to a nearby non-player faction when the sid
+// doesn't resolve), parked at the host transform, created at the host's 'age'
+// (animals scale body size by age; <= 0 or non-finite falls back to the adult
+// default). Appearance/equipment are the template's (randomized gear) -
+// cosmetic; combat outcomes stay host-authoritative + damage-guarded. Returns
+// the proxy Character* or 0.
+Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
+                         float x, float y, float z, float heading, float age);
+
+// SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
+// (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block
+// every baked shared-save NPC resolves by hand, so an unresolvable census hand
+// positioned there is a genuine host RUNTIME spawn - safe to proxy-mint at any
+// distance. resolveZoneQuery() is called from engine::resolve().
+bool isZoneLoadedAt(GameWorld* gw, float x, float y, float z);
+void resolveZoneQuery();
+
+// One position mapped through EVERY sector function ZoneManager exposes, plus
+// the rect of the zone containing it. Measurement instrument, not an authority
+// key: the engine has three separate position->coord mappings at (presumably)
+// three resolutions, and which one the .zone filenames - and therefore a
+// cross-client cell identity - correspond to is not knowable from the headers.
+//
+// A cell is only useful as an authority key if it is COARSE enough that a town
+// sits in one (otherwise ownership changes hands mid-settlement) and FINE enough
+// that two separated squads sit in different ones (otherwise everything collapses
+// to a single cell and authority never moves). Both are answered by comparing
+// coords across positions, which is what the cell_probe scenario does. The have*
+// flags distinguish "mapping returned 0,0" from "mapping never resolved".
+struct CellProbe {
+    int mapX, mapY;         // ZoneManager::getMapSector(x,z) - the zone.X.Y coord
+    int subX, subY;         // ZoneManager::getSubMapSector(x,z)
+    int resX, resY;         // ZoneManager::getZoneMapFromResolutionCoord(x,z)
+    int haveMap, haveSub, haveRes;
+};
+
+// SEH-guarded (game/ZoneQuery.cpp, same quarantined TU as isZoneLoadedAt).
+// False only on a fault or a missing ZoneManager; a mapping that failed to
+// resolve leaves its have* flag at 0 and still returns true.
+bool cellProbe(GameWorld* gw, float x, float y, float z, CellProbe* out);
+
+// SEH-guarded: the engine's own sector coordinate for a world position - the
+// ZoneManager::getMapSector mapping, which cell_probe measured (2026-08-03) to be
+// the coordinate the save's zone.X.Y files are named after. That is what makes it
+// usable as a cross-client cell identity: it is the engine's own partition of a
+// SHARED save, so both clients compute the same coord for the same point without
+// exchanging anything. Y is not an input - the grid is 2D, x/z only.
+bool cellAt(GameWorld* gw, float x, float z, int* outCx, int* outCz);
+
+// SEH-guarded (Phase 1 spawn parity): destroy a previously-minted proxy body
+// (GameWorld::destroy, true destruction). Used when the proxy's original hand
+// later resolves to a REAL engine body (baked block finished loading) - the
+// proxy is a duplicate standing next to the authoritative original. The
+// pointer is DEAD after this returns true.
+bool despawnProxyNpc(GameWorld* gw, Character* proxy);
+
+// SEH-guarded (join, mint duplicate guard): return a world NPC with the SAME
+// template stringID within 'radius' of (x,y,z), skipping any pointer in
+// 'excl' (bound proxies / suppressed culls the caller already accounts for),
+// or 0. A hit means the census-missing hand is probably that body under a
+// hand we cannot correlate - minting would double it.
+Character* sameTemplateNear(GameWorld* gw, const char* charSid,
+                            float x, float y, float z, float radius,
+                            Character* const* excl, unsigned int exclCount);
+
+// SEH-guarded (join, census ADOPTION): the NEAREST world NPC matching the host's
+// template - and its faction, when the host could read one - within 'radius' of
+// (x,y,z), reporting the distance in *outDist. 0 if none.
+//
+// Same question sameTemplateNear asks, for a different purpose, which is why it is
+// a separate entry point rather than a flag. sameTemplateNear answers "is
+// something already standing here" in order to DEFER a mint, so the first hit will
+// do. This answer gets BOUND to the host's census row, so it has to be the best
+// hit: a town crowd is many bodies off one template, and pairing them in whatever
+// order the spatial query yields would cross-pair bodies standing metres apart.
+//
+// 'radius' is the SEARCH reach, which the caller sets wider than the reach it is
+// willing to bind at: the returned distance on a candidate it then rejects is the
+// only honest measurement of how far a row's twin actually was, and that number is
+// what the bind radius has to be chosen from. Deciding the search by the bind
+// radius would only ever confirm whatever radius was already set.
+Character* adoptCandidateNear(GameWorld* gw, const char* charSid,
+                              const char* facSid,
+                              float x, float y, float z, float radius,
+                              Character* const* excl, unsigned int exclCount,
+                              float* outDist);
+
+// SEH-guarded: does the CHARACTER / ANIMAL_CHARACTER template 'charSid' carry
+// the editor's "unique" flag (named world NPCs: Griffin '19643-Dialogue.mod',
+// the Bard '41325-Dialogue.mod')? The factory creates at most one body per
+// unique template per world, so a second one cannot be minted - and the one
+// this world already has IS the body the peer means, wherever it stands.
+// False when the template is unknown here.
+bool isUniqueTemplate(GameWorld* gw, const char* charSid);
+
+// spawn_probe / spawn_sync scenario scaffold (SEH-guarded): reproduce a runtime
+// squad spawn locally - 'count' world characters in a nearby NON-PLAYER faction
+// (findNearbyNonPlayerFaction; leader-faction fallback on a blank save), spread
+// in front of the leader, each detached from town-AI so the squad doesn't
+// immediately disband to jobs. Fills outHands (readObjectHand layout) up to
+// 'count'; returns the number spawned. Their hands are RUNTIME hands - exactly
+// the unresolvable-cross-client identity the probe/proxy path exercises.
+unsigned int spawnRuntimeSquad(GameWorld* gw, unsigned int count,
+                               unsigned int (*outHands)[5]);
+
+// The same runtime squad, but ANGRY and still thinking: the spawn faction's
+// relation row with the player is set to 'relation' (both directions, the
+// probe-24 finding that their row is the one their AI consults) and the bodies
+// are NOT detached from town AI. Detaching is what makes spawnRuntimeSquad's
+// bodies inert - they ignore movement orders entirely and never aggro - which
+// is fine for an identity fixture and useless for a fight the enemy has to
+// START. Fills outHands; returns the number spawned.
+unsigned int spawnHostileSquad(GameWorld* gw, unsigned int count, float relation,
+                               unsigned int (*outHands)[5]);
+
+// ---- Combat (Phase 3c, L5) -------------------------------------------------
+
+// Read-only snapshot of a Character's combat state (the L5 probe). POD so it can be
+// filled inside an SEH frame. target[] is the attack target's hand in readObjectHand
+// layout [type,container,containerSerial,index,serial]; all-zero if no target.
+struct CombatRead {
+    bool         valid;       // at least one field read succeeded
+    bool         inCombat;    // isInCombatMode(melee=true, ranged=true)
+    bool         modeActive;  // CombatClass::combatModeActive - STABLE across the
+                              // slot rotations/combo gaps that flicker inCombat
+    bool         ranged;      // isInRangedCombatMode()
+    bool         underMelee;  // isLiterallyUnderMeleeAttackRightNowForSure()
+    bool         fleeing;     // isFleeing()
+    bool         hasTarget;   // attack target is non-null
+    bool         waiting;     // engaged but QUEUED (no attack slot): sword state is
+                              // CIRCLE_MENACINGLY / WAIT_MENACINGLY / HESITATE
+    int          swordState;  // raw swordStateEnum (-1 = unreadable)
+    unsigned int target[5];   // attack target hand (or zeros)
+};
+// SEH-guarded read of c's combat state into *out. Returns out->valid.
+bool readCombat(Character* c, CombatRead* out);
+
+// readCombat via a hand (readObjectHand layout). Scenario diagnostics.
+bool readCombatByHand(const unsigned int hand[5], CombatRead* out);
+
+// Join-side combat apply: e.task is a combat stance (TASK_COMBAT_MELEE or
+// TASK_COMBAT_WAIT) and its subject is the attack target; 'target' is that
+// subject's LOCAL body, resolved by the caller (Replicator::bodyForKey - the
+// subject is a WIRE key and may be a minted proxy or a re-keyed body here, so a
+// raw hand lookup is not a translation). Orders THIS body to focus-melee it, so
+// the join's own engine animates the fight (replicate the cause, not the
+// animation).
+// breakOrder=true additionally routes the attack through the player-ORDER path
+// (addOrder clear=true) FIRST: a seat-injected copy holds a player order at its
+// stool which outranks the AI goal, so the goal alone never starts the fight.
+// Returns 2 ordered / 1 target not loaded (target == 0) / 0 no-op (not a combat
+// intent) / -1 fault.
+int applyCombat(Character* c, Character* target, const EntityState& e, bool breakOrder);
+
+// Engagement escalation (world_parity camp): both the goal and order attack
+// paths are silently dropped by the running local AI when the target is a
+// locally player-owned body of a non-hostile faction (escaped-prisoner
+// recapture: host guards fight, join guards idle). Character::attackTarget is
+// the AI's own commit-an-attack entry and bypasses that validation. 'target' as
+// for applyCombat. Returns 2 forced / 1 target not loaded / 0 no-op / -1 fault.
+int forceAttack(Character* c, Character* target, const EntityState& e);
+
+// duel test scene: spawn two mutually-hostile non-squad NPCs in front of the leader
+// from the SAME nearby faction so they are PEACEFUL on spawn (no attack issued here).
+// Hands are stashed so startDuel/rearmDuelScene can trigger/re-issue the fight at
+// runtime. Used both to BAKE a neutral 'duel1' save and as the baseline for the live
+// combat_order transition test (peaceful->fighting after the join has loaded).
+bool setupDuelScene(GameWorld* gw);
+// combat_order LIVE-transition pin: after loading a baked 'duel1', re-find the two
+// baked duelists (the two non-squad NPCs nearest the leader) and stash their hands so
+// startDuel/rearmDuelScene/holdDuelistsPeaceful operate on them. Latches a fixed
+// per-duelist anchor for the baseline hold. Returns true if two distinct subjects pin.
+bool pickDuelSubjects(GameWorld* gw, unsigned int outA[5], unsigned int outB[5]);
+// Hold both pinned duelists peaceful + in range at their latched anchors (clearGoals +
+// park) during the combat_order baseline. Returns true if at least one was held.
+bool holdDuelistsPeaceful(GameWorld* gw);
+// Trigger the fight: order each pinned duelist to melee the other. Returns the number
+// of attack orders issued (0 if the duelists aren't known/resolvable).
+int  startDuel(GameWorld* gw);
+// Re-issue the attack goals on the two pinned duelists if they've disengaged. Returns
+// the number of (re-)issued orders, or -1 if the duelists aren't resolvable.
+int  rearmDuelScene(GameWorld* gw);
+// Fill outA/outB (each [5], readObjectHand layout) with the pinned duelists' hands.
+// Returns true if both are known (setupDuelScene ran this session).
+bool getDuelHands(unsigned int outA[5], unsigned int outB[5]);
+// Host diagnostic: resolve the two pinned duelists and log a "COMBAT ..." line for
+// each (inCombat/ranged/underMelee/fleeing/target). Returns the number logged.
+int  logDuelCombat(GameWorld* gw);
+
+// LIVE-order test support. pickCraftWorker identifies the worker to drive (non-squad
+// NPC nearest the baked fixture) and returns its hand so a scenario can PIN it for
+// the whole run; orderCraftWorker then hands THAT pinned worker a work goal mid-run.
+// workerHand is in readObjectHand layout: [type,container,containerSerial,index,serial].
+bool pickCraftWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask);
+bool orderCraftWorker(GameWorld* gw, const unsigned int workerHand[5], int task);
+// The mine_pose equivalents. The miner is a PLAYER SQUAD member rather than a
+// world NPC (a resource node is in the wilderness, and the join drives rank 0 as
+// a copy - the path the pose must survive); the fixture is class-matched by
+// findMineNear rather than name-matched.
+bool pickMineWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask);
+bool orderMineWorker(GameWorld* gw, const unsigned int workerHand[5], int task);
+// Hold the pinned worker untasked + parked at the prop during the baseline (an idle
+// world NPC patrols out of capture range otherwise). Call each baseline tick.
+bool holdWorkerAtFixture(GameWorld* gw, const unsigned int workerHand[5]);
+
+// SEH-guarded: read a RootObject's save-stable hand into out[5] (type, container,
+// containerSerial, index, serial). Used to log spawned objects.
+bool readObjectHand(RootObject* obj, unsigned int out[5]);
+
+// Squad tab naming (protocol 59). Rename the player squad tab whose members' hand
+// container is (cont, contSerial) to 'name' - only while its current name is the
+// player faction's default ("<faction>" / "<faction>_<digits>") or a name this
+// mod gave earlier (an entry of 'replaceable', optionally + " <digits>"); a name
+// a player typed is never touched. Returns 1 renamed, 0 left as is, -1 no such
+// tab / fault. curOut gets the tab's name before the call.
+int renameSquadTab(GameWorld* gw, u32 cont, u32 contSerial, const std::string& name,
+                   const std::vector<std::string>& replaceable, std::string* curOut);
+
+// ---- Phase 4a: container-contents (inventory) replication ------------------
+// World objects carry the same save-stable hand as Characters, so a container that
+// EXISTS in the shared save resolves cross-client. But runtime-minted items (craft
+// output, loot) have host-only hands, so we do NOT drive item objects by hand:
+// instead the host streams a container's CONTENTS (template stringID + itemType +
+// quantity + quality) keyed by the CONTAINER's hand, and the join reconstructs items
+// locally to match (createItem/addItem, removeItemAutoDestroy). Host-authoritative,
+// idempotent, loss-tolerant; rides the reliable channel on content change.
+
+// SEH-guarded: resolve a save-stable object hand (cHand layout = type, container,
+// containerSerial, index, serial) to this machine's local RootObject*, or 0.
+RootObject* resolveObjectByHand(const unsigned int cHand[5]);
+
+// SEH-guarded: capture the contents of the container identified by cHand into out[]
+// (up to maxOut), filling template stringID + itemType + quantity + quality per item.
+// EQUIPPED gear is captured FIRST, then loose items, so an overflowing container sheds
+// clutter rather than the irreplaceable worn kit. *outHash receives an order-independent
+// content fingerprint (0 == empty) so the caller only re-sends on real change.
+// *outTruncated (optional) is set when the container did not fit in maxOut - the result
+// is then an INCOMPLETE description and must not be reconciled against destructively.
+// includeNested (protocol 48) also captures what worn CONTAINERS hold, tagged with
+// parentIdx. Only the inventory PUBLISHER wants that: a nested entry describes a DIFFERENT
+// inventory, so anything that counts or reconciles against the result must leave it off or
+// it reads a bagged item as a loose one.
+// Returns the number of item entries written.
+unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                                      InvItemEntry* out, unsigned int maxOut,
+                                      unsigned int* outHash, bool* outTruncated = 0,
+                                      bool includeNested = false);
+
+// SEH-guarded: reconcile the local container (cHand) to the desired item multiset:
+// add any shortfall (createItem of the template + tryAddItem) and remove any excess
+// (removeItemAutoDestroy), per (stringID, itemType) key. count==0 empties it.
+// When `truncated` is true the desired list is known to be an INCOMPLETE description
+// of the author's container, so the reconcile is ADDITIVE-ONLY: shortfalls are still
+// filled but nothing is ever destroyed (an absent entry means "unknown", not "gone").
+// Containers (backpacks) are never fabricated unless `allowContainerCreate`: the real bag
+// should arrive over the conservation channel with its nesting intact, so the caller only
+// sets it once a shortfall has outlived that channel. *outContainerShort (optional) reports
+// a container shortfall that was left unfilled.
+// Returns true if anything changed.
+bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                            const InvItemEntry* items, unsigned int count,
+                            bool truncated = false, bool allowContainerCreate = false,
+                            bool* outContainerShort = 0);
+
+// SEH-guarded (protocol 48): create `qty` of (sid,type) INSIDE the container the character at
+// cHand carries - a worn backpack's own private inventory, which is a different Inventory from
+// the character's and the only place a "bagged" item actually lives. `which` selects among
+// several carried containers, in carry order. Returns the number added.
+int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                            unsigned int typeCat, int qty, unsigned int which = 0);
+
+// SEH-guarded: drop `qty` of (sid,type) out of a CARRIED CONTAINER onto the ground, searching
+// every container the character holds in carry order. Returns the number dropped and reports
+// the last grounded object via outLastDropped (optional) so the conservation channel can track
+// that exact instance. dropItemFromInventory is top-level-only ON PURPOSE; this is the separate
+// reach the drop MIRROR needs, because a bulk pickup overflows the grid into the worn backpack
+// and a mirror that cannot see in there fabricates a duplicate instead of relocating.
+int dropItemFromNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                                unsigned int typeCat, int qty, void** outLastDropped = 0);
+
+// SEH-guarded (protocol 48): summed quantity of (sid,type) INSIDE carried container `which`.
+// Returns -1 when the character carries no such container, so a caller can distinguish "the
+// bag has not arrived yet" from "the bag is here and the item is missing".
+int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                           unsigned int typeCat, unsigned int which = 0);
+
+// SEH-guarded (protocol 48): how many CONTAINERS the character at cHand carries, worn or
+// loose. Two bags of the SAME template are the case the apply side can confuse, so a gate
+// needs to assert they are both present before it can assert where their contents landed.
+int nestedContainerCount(GameWorld* gw, const unsigned int cHand[5]);
+
+// 'inventory' setup scene (Phase 4a bake): spawn a save-stable storage container in
+// front of the leader and seed it with a couple of items, so both clients load an
+// identical container with a resolvable hand. Falls back to seeding the leader's own
+// inventory if no storage-building template is found. Host-only; user SAVEs (inv1).
+// On success, fills outHand[5] with the anchored container's hand. Returns true if a
+// container (or the leader fallback) was prepared.
+bool setupInventoryScene(GameWorld* gw, unsigned int outHand[5]);
+
+// Bed+cage scene (bed/cage occupancy sync, protocol 19): spawn one BED and one
+// PRISON CAGE near the leader so the user (or the auto-bake) can SAVE a fixture
+// save ('bedcage1') both clients load - save-stable furniture hands are what
+// let the occupancy events resolve the same bed/cage on both machines.
+// Templates are found by keyword over the BUILDING GameData set (camp bed /
+// prisoner cage preferred). Returns true when both spawned; hands logged.
+bool setupBedCageScene(GameWorld* gw);
+
+// Prisoner-pole scene (protocol 19 kind=4 / engine IN_PRISON): spawn one standing
+// prisoner POLE in front of the leader so both clients load a save-stable pole
+// hand. A pole is the SAME containment system as a cage (setPrisonMode), just a
+// different model - the pole_put controlled test uses it to visibly show a body
+// tied to a pole. Auto-baked into 'pole1'. Returns true when the pole spawned.
+bool setupPoleScene(GameWorld* gw);
+
+// Resolve the baked inventory container again after load (host + join): v1 anchors on
+// the leader's own inventory (a save-stable container that accepts arbitrary items).
+// Fills outHand[5]; returns true if found. Used by the scenario + the replicator.
+bool pickInventoryContainer(GameWorld* gw, unsigned int outHand[5]);
+
+// SEH-guarded (host-side): add `qty` of a common, general-inventory-friendly item
+// template to the container identified by cHand. Writes the chosen template stringID
+// to outStringID (so the scenario/oracle knows what to look for). Returns the number
+// added (0 on failure). Used both to seed the bake and to perform the live add.
+int addTestItemsToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
+                            char* outStringID, unsigned int outLen);
+
+// SEH-guarded: remove up to `qty` of the SAME common template addTestItemsToContainer
+// adds, from the container identified by cHand. Returns the number removed (0 on
+// failure). Used by the bidirectional inventory scenario to prove that REMOVALS (not
+// just adds) propagate cross-client without loss.
+int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int qty);
+
+// SEH-guarded: report the deterministic common test-item template (the one
+// addTestItemsToContainer uses) WITHOUT adding anything, so both clients can track the
+// same probe sid independently (same gamedata -> same template). Returns 1 on success.
+int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
+                      unsigned int* outType);
+
+// SEH-guarded: read the two numbers people conflate, off the first (sid, typeCat) the
+// container at cHand holds. They are DIFFERENT AXES and a test that wants the grade must
+// read the second:
+//   *outBucket   = Item::quality * 100 - CONDITION, not grade, on a 0..100 scale (a
+//                  brand-new item reads 100.0, so this is 10000). Replicated and hashed
+//                  since the start, so it agrees across clients even when the item is
+//                  visibly the wrong grade - which is why asserting on it proved nothing.
+//   *outLevel    = getLevel() - Kenshi's 1..100 craft level (Prototype 5 ... Masterwork
+//                  95), what the item's stats and its grade label derive from. Set at
+//                  construction from the factory's levelOverride and never written
+//                  afterwards, so this is the number a lost grade shows up in.
+//   *outLevel100 = Gear::level_0_100, the raw member behind getLevel() (diagnostic).
+// Level outputs stay -1 for a non-Gear item - a stack of food has no craft level, and so
+// does a piece of gear the peer rebuilt badly enough that isGear() returns null.
+// Returns 1 when a matching item was found, else 0.
+int readGearGradeBySid(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                       unsigned int typeCat, int* outBucket, int* outLevel,
+                       int* outLevel100 = 0);
+
+// SEH-guarded (protocol 37 fallback): create `qty` of the template (sid, typeCat) and
+// add it to the container at cHand - the fabricate path for a transfer whose local
+// source copy is missing (desync). Weapons need the manufacturer (and optionally the
+// material) sid - the spike-451 recipe inside createItemAndAdd consumes them; other
+// types ignore both. KENSHICOOP_WEAPON_FAB=0 disables the weapon branch entirely.
+// `level` is the wire's craft GRADE (protocol 51); GRADE_NA means the author had none to
+// report, so the rebuilt item keeps the factory default.
+// Returns the number added.
+int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
+                             const char* sid, unsigned int typeCat, int qty,
+                             int qualityBucket, const char* manufacturer,
+                             const char* material, unsigned char level = GRADE_NA);
+// SEH-guarded (protocol 60): remove and destroy up to `qty` units of (sid,
+// typeCat) from the container at cHand, loose stacks first. Returns the number
+// removed.
+int removeItemsFromContainerBySid(GameWorld* gw, const unsigned int cHand[5],
+                                  const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded (trade_probe / cross-owner transfers): move up to `qty` of (sid, typeCat)
+// from the container at srcHand into the container at dstHand by RELOCATING the real
+// Item* (removeItemDontDestroy + tryAddItem) - never fabricates or destroys, so it is
+// exactly the engine-level mutation the co-op UI drag performs, and it works for gear
+// the factory cannot rebuild (weapons). Loose stacks move first, then worn copies (the
+// "drag out of an equip slot" case). If the destination refuses the item it is put BACK
+// into src (never leaked). Returns the number moved.
+// suspendVeto (default true): sanctioned sync relocations keep the trade veto
+// suspended so it never refuses them. The xfer_block test passes false to drive
+// the engine primitives EXACTLY like a UI drag (subject to the veto), so it can
+// assert a cross-owner move is refused (returns 0, item conserved in src).
+int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
+                              const unsigned int dstHand[5],
+                              const char* sid, unsigned int typeCat, int qty,
+                              bool suspendVeto = true);
+
+// ---- Cross-owner trade veto (block direct squad-to-squad transfers) --------
+// The engine has no single "drag" entry point (the squad-move problem), so a
+// UI item drag is remove-then-add: Inventory::removeItemDontDestroy_returnsItem
+// on the source, Inventory::tryAddItem on the destination. We detour both to
+// REFUSE a move whose source and destination squad characters are owned by
+// DIFFERENT clients - forcing players to transfer via ground drops. The veto is
+// purely LOCAL (only the dragging client sees the drag), so no packet is needed.
+
+// Owner-classification callback the Replicator supplies (ownHands_ + the full
+// player-squad set). Given a save-stable owner hand (readObjectHand layout
+// [type,container,containerSerial,index,serial]), returns:
+//   0 = not a player-squad member (world NPC / container / vendor - never blocked)
+//   1 = a squad member owned by THIS client
+//   2 = a squad member owned by the PEER
+// A move is cross-owner iff one end is 1 and the other is 2.
+typedef int (*InvOwnerClassFn)(const unsigned int ownerHand[5]);
+void setInvOwnerClassifier(InvOwnerClassFn fn);
+
+// Enable/disable the cross-owner drag veto (KENSHICOOP_BLOCK_XFER). Off by
+// default until set; the veto only fires when a classifier is also registered.
+void setBlockXfer(bool on);
+
+// Detour Inventory::tryAddItem + removeItemDontDestroy_returnsItem for the veto
+// (and for diagnostic drag-sequence logging under KENSHICOOP_INV_DUMP=1).
+// Returns true if both detours installed.
+bool installXferBlockHook();
+
+// SEH-guarded (store_probe): like addTestItemsToContainer, but walks the common
+// stackable templates until the container ACCEPTS one - storage buildings are
+// usually item-type-limited (a Fabric Chest refuses iron plates), which the fixed
+// first-template add trips over. Writes the accepted template's stringID to
+// outStringID. Returns the number added (0 = every candidate refused / no inv).
+int probeAddAnyToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
+                           char* outStringID, unsigned int outLen);
+
+// ---- Phase W0: world-item (ground drop) diagnostic hooks -------------------
+// SEH-guarded: drop `qty` of the LOOSE (sid,type) the object at cHand holds onto the
+// ground (Inventory::dropItem). Lets a scenario produce a real world item without UI.
+// Returns the number dropped.
+// outLastDropped (optional): receives the Item* of the last item dropped (the now-grounded
+// object), so the conservation channel can track that real handle for a later pickup.
+// allowEquipped: also accept a WORN item as the victim, dropping it straight from its slot
+// to the ground. Off by default so existing callers keep the loose-only meaning. Needed for
+// a worn CONTAINER (backpack): unequip-to-loose cannot stage it first, because no loose
+// section has room for a bag that large, and the fallback add re-equips it - yet the UI
+// drags a worn backpack to the ground just fine, so dropItem accepts a worn item directly.
+// pickLast: drop the LAST matching copy in the inventory's listing order (worn copies count
+// when allowEquipped) - a player dragging out a copy other than the first one listed.
+int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
+                          const char* sid, unsigned int typeCat, int qty,
+                          void** outLastDropped = 0, bool allowEquipped = false,
+                          bool pickLast = false);
+
+// SEH-guarded DIAGNOSTIC: enumerate WEAPON/ARMOUR/ITEM/CONTAINER world objects near the
+// local leader and log each (itemType / sid / hand / pos), so we can characterize what a
+// dropped item becomes and whether the interest query enumerates it. The log IS the
+// deliverable for the W0 drop_probe (no protocol changes).
+void dumpWorldItems(GameWorld* gw);
+
+// SEH-guarded: count loose world items (WEAPON+ARMOUR+ITEM) within `radius` of the
+// leader. Oracle cross-check that a drop produced an enumerable ground item.
+int countWorldItemsNear(GameWorld* gw, float radius);
+
+// ---- Phase W1: world-item (ground drop) replication ------------------------
+// A free ground item captured from the host's interest sphere. `hand` is the host's
+// LOCAL engine hand (index/serial) - a stable per-item identity the host's tracker maps
+// to a synthetic netId; it is NOT sent on the wire (the join can't resolve it). `hash`
+// is a content+position fingerprint so the tracker only re-streams on real change.
+struct WorldItemRaw {
+    unsigned int   hand[5];     // host-local hand [type,container,containerSerial,index,serial]
+    char           stringID[48];// template identity
+    unsigned int   itemType;    // GameData::type category
+    unsigned short quantity;
+    unsigned short quality;     // quality*100 (0 if n/a)
+    float          x, y, z;     // world position
+    unsigned int   hash;        // content+pos fingerprint
+};
+
+// SEH-guarded (host): enumerate free GROUND items within `radius` of the local leader
+// (interest scope) into out[] (up to maxOut), deduped by hand. Items inside inventories
+// are NOT enumerated by the engine's sphere query (confirmed by the W0 drop_probe), so
+// every result is a real world item. Returns the number written.
+unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
+                               float radius);
+
+// ---- Phase W1b: query-free ground-drop capture (town reliability) ----------
+// The W1 stream above discovers ground items with getObjectsWithinSphere, which
+// fails in towns (a dropped item then never appears / flickers on the peer). To
+// discover a drop WITHOUT the spatial query we detour the engine drop primitive
+// (Inventory::dropItem): every drop records the exact grounded Item* + its owner
+// + description + world position at the drop frame. The Replicator seeds its
+// world-item tracker from these edges (query-free) and culls by HANDLE liveness
+// (below), so a town drop is streamed reliably.
+struct ItemDropEdge {
+    unsigned int   ownerHand[5]; // inventory owner that dropped it (readObjectHand layout)
+    unsigned int   itemHand[5];  // the now-grounded item's local engine hand
+    char           stringID[48];
+    unsigned int   itemType;     // GameData::type category
+    unsigned short quantity;
+    unsigned short quality;      // quality*100 (0 if n/a)
+    float          x, y, z;      // world position at the drop frame
+};
+// Detour Inventory::dropItem so every drop is recorded (drained once per tick).
+// Returns true if installed.
+bool installItemDropHook();
+// Drain captured drop edges into out[] (up to maxOut); clears the queue. Returns
+// the number written.
+unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut);
+
+// ---- Conservation channel item types (single source of truth) --------------
+// itemType 2 = WEAPON, 3 = ARMOUR/clothing, 46 = worn CONTAINER (backpack). All
+// are non-stackable EQUIPPABLE gear, so each unit is a distinct object the peer
+// already mirrors via the shared save - the real object can be relocated
+// bag<->ground on every client and re-homed on pickup WITHOUT fabrication. The
+// W1 template-proxy stream handles everything else (stacks, loot) and skips
+// these. Defined here, in the engine layer, because BOTH the engine capture
+// (captureWeaponPtrs) and the Replicator census must agree; two copies of this
+// predicate drifted before and silently excluded backpacks from conservation.
+inline bool isConservedItemType(unsigned int t) {
+    return t == 2u || t == 3u || t == 46u;
+}
+
+// A worn CONTAINER (backpack) carries a NESTED inventory that no channel
+// replicates. Relocating the real object bag<->ground preserves those contents;
+// FABRICATING one from the template produces an EMPTY bag, so a fabrication
+// backstop must never fire for it (that trades a missing item for a silently
+// emptied backpack plus a duplicate). Callers that fabricate must check this.
+inline bool isContainerItemType(unsigned int t) { return t == 46u; }
+
+// Handle-based liveness of a tracked ground item (query-free cull): resolve the
+// item's local engine hand and return 1 if it is still a FREE ground item (it
+// exists AND is not inside an inventory), filling outPos[3] with its current
+// world position; return 0 if it is gone (destroyed) or has been picked up (now
+// in an inventory). Replaces the "vanished from the spatial scan" cull test.
+int groundItemLiveness(const unsigned int itemHand[5], float outPos[3]);
+
+// Object-level half of groundItemLiveness, for a ground item we already know is
+// LIVE (the caller re-resolved its hand). Returns 1 while the object is still a
+// FREE ground item, filling outPos[3]; 0 once it is destroyed or has entered an
+// inventory. outPickedUp (optional) separates those two: true ONLY when the
+// object still reads but is now inside a bag, which is the single case that
+// licenses a W1 claim - claiming because a proxy was merely destroyed would
+// delete the author's item for no reason.
+// The pointer must be live: a stored RootObject* whose zone has since unloaded is
+// freed memory, and freed memory often still READS, so this would report a
+// plausible-looking isInInventory off a dead object. Validate through the hand
+// (spawnWorldItemProxy hands one back) before calling.
+int groundObjectLiveness(RootObject* obj, float outPos[3], bool* outPickedUp);
+
+// SEH-guarded (protocol 61): the nearest FREE ground item of template `sid` within
+// `tol` of pos, skipping the objects in excl[] (0 if none). Sphere-query based, so
+// it can miss in towns: callers that hold a handle-tracked copy try that first.
+RootObject* nearestFreeGroundItemAt(GameWorld* gw, const float pos[3], const char* sid,
+                                    float tol, RootObject* const* excl, unsigned int nExcl);
+
+// SEH-guarded (TEST): number of FREE ground items of template `sid` within radius of pos.
+int countFreeGroundItemsAt(GameWorld* gw, const float pos[3], const char* sid, float radius);
+
+// SEH-guarded (TEST): put the nearest FREE ground item of `sid` within tol of pos into
+// the inventory at cHand through the engine's own tryAddItem (the UI pickup path).
+// Returns 1 on success.
+int pickupGroundItemAt(GameWorld* gw, const unsigned int cHand[5], const float pos[3],
+                       const char* sid, float tol);
+
+// SEH-guarded (TEST): an ITEM template every client resolves identically (same game
+// data): the one whose stringID equals `prefer`, or whose name contains it, when
+// given; else the common template addTestItemsToContainer seeds. Writes sid + type.
+bool commonItemTemplate(GameWorld* gw, char* outSid, unsigned int outLen, unsigned int* outType,
+                        const char* prefer = 0);
+
+// SEH-guarded (join): spawn a LOCAL proxy ground item from the template (sid, typeCat) at
+// world position (x,y,z), so the join renders a host-dropped item where the host sees it.
+// Returns the spawned object (cull/update it later) or 0. The join owns this proxy; it is
+// keyed to the host's netId by the caller (Replicator).
+// outHand (optional, 5 ints) receives the proxy's engine hand, which is how the
+// caller re-validates the pointer later: the engine destroys ground items when
+// their zone unloads, so a stored pointer goes dangling the moment a player
+// travels out of the block. The hand is only written if it ROUND-TRIPS back to
+// this exact object; otherwise it is zeroed, and the caller must fall back to
+// trusting the pointer (a hand that never resolves would read as "already
+// destroyed" and leak the proxy as a permanent duplicate item).
+RootObject* spawnWorldItemProxy(GameWorld* gw, const char* sid, unsigned int typeCat,
+                                int qty, float x, float y, float z,
+                                unsigned int* outHand = 0);
+
+// SEH-guarded (join): move an existing proxy to (x,y,z) (a settled world item rarely
+// moves, but a re-drop/nudge must track). No-op on fault.
+void updateWorldItemProxy(RootObject* proxy, float x, float y, float z);
+
+// SEH-guarded (join): destroy a proxy ground item (engine removal). After this the
+// pointer is DEAD; the caller must drop its netId->proxy entry. Returns true if destroyed.
+bool removeWorldItemProxy(GameWorld* gw, RootObject* proxy);
+
+// SEH-guarded (host, TEST hook): destroy every free ground item within `radius` of the
+// leader (deduped). Used by the world_item_sync scenario to despawn a dropped item so the
+// host's tracker culls it and the join removes its proxy (the cull half of the oracle).
+// Returns the number destroyed.
+int destroyWorldItemsNear(GameWorld* gw, float radius);
+
+// SEH-guarded DIAGNOSTIC: dump every nearby item (ITEM/WEAPON/ARMOUR) with type/isInInventory/
+// distance, to learn why a dropped weapon isn't being correlated to a free ground copy.
+void diagGroundScan(GameWorld* gw, const unsigned int cHand[5], const char* sid, float radius);
+
+// SEH-guarded: count FREE ground items (not the char's own worn/held copies) of (sid,type)
+// within radius of cHand. Lets the relocation spike isolate the item lying on the ground.
+int countFreeGroundItemsNear(GameWorld* gw, const unsigned int cHand[5],
+                             const char* sid, unsigned int typeCat, float radius);
+
+// SEH-guarded SPIKE: pick up a free ground item of (sid,type) near cHand by RELOCATING the
+// real object into the character's inventory (no createItem) - the conservation primitive
+// proving weapons can move bag<->ground without fabrication. Returns 1 on success.
+int pickupWorldItemIntoInventory(GameWorld* gw, const unsigned int cHand[5],
+                                 const char* sid, unsigned int typeCat, float radius);
+
+// SEH-guarded: world position of the first free ground item of (sid,type) near cHand. Fills
+// out[3], returns 1 if found. Used by the W2 drop detector to mirror the drop position.
+int firstFreeGroundItemPos(GameWorld* gw, const unsigned int cHand[5],
+                           const char* sid, unsigned int typeCat, float radius, float out[3]);
+
+// SEH-guarded: world position of the object at hand. Fills out[3], returns 1 on success.
+// Fallback drop position when the spatial item query can't find the dropped weapon.
+int objectWorldPos(const unsigned int hand[5], float out[3]);
+
+// SEH-guarded: world position of a tracked Item* (as void*). The drop detector reads the
+// REAL dropped object's position to author the exact cursor-drop location. Returns 1 on ok.
+int itemWorldPos(void* item, float out[3]);
+
+// SEH-guarded CONSERVATION primitive (Phase W2): relocate the owner's OWN copy of a weapon
+// from its bag to the ground at (x,y,z) - the peer-side mirror of a drop. Unequips a worn
+// copy to loose first if needed. Never fabricates. Returns the number relocated.
+// outDropped (optional): receives the now-grounded Item* so it can be tracked for pickup.
+int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
+                           const char* sid, unsigned int typeCat,
+                           float x, float y, float z, void** outDropped = 0);
+
+// SEH-guarded CONSERVATION BACKSTOP (Phase W2): relocateWeaponToGround found no local copy
+// to move, so rebuild the item from the drop intent's own provenance (quality/manufacturer/
+// material all ride WorldDropPacket) into the owner's bag and drop THAT. Heals the case
+// where the peer's copy was already destroyed - e.g. a bag snapshot that overtook the
+// intent. The caller must first confirm the owner hand resolves locally; weapon
+// fabrication still honours KENSHICOOP_WEAPON_FAB. Returns the number relocated.
+int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
+                            const char* sid, unsigned int typeCat, int qualityBucket,
+                            const char* manufacturer, const char* material,
+                            float x, float y, float z, void** outDropped = 0);
+
+// SEH-guarded (Phase W3): capture the WEAPON items the object at cHand holds, with their real
+// Item* handles, so the drop detector can track the exact dropped object for a later pickup.
+// Fills sids[i] (<48 chars) + items[i] (Item* as void*); returns the count.
+unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
+                               char (*sids)[48], void** items, unsigned int maxOut);
+
+// SEH-guarded (Phase W3): re-home a tracked ground Item* into the inventory at targetHand
+// (Inventory::tryAddItem of the existing object - no fabrication). The pickup mirror of
+// relocateWeaponToGround. Returns 1 on success. `item` must be a still-live tracked object.
+int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item);
+
+// ---- Equipped-gear (armour/weapon slot) test hooks (inv_equip scenario) ----
+// SEH-guarded: report the first EQUIPPED item worn by the object at cHand (its
+// template stringID + itemType) and the total count of worn items. Returns 1 if any
+// worn item exists. Lets the scenario drive equip/unequip on a KNOWN, race-compatible
+// template (gear the character already wears) without hunting for one.
+int findEquippedItemKey(GameWorld* gw, const unsigned int cHand[5],
+                        char* outSid, unsigned int outLen, unsigned int* outType,
+                        int* outEquippedCount);
+
+// SEH-guarded: remove `qty` of the EQUIPPED (sid, type) worn by the object at cHand
+// (the "drop/unequip armour" action). Returns the number removed.
+int removeEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                       const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded: create and EQUIP `qty` of (sid, type) onto the object at cHand (the
+// "equip armour" action). Returns the number equipped.
+int addEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                    const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded DIAGNOSTIC: log the full inventory (loose _allItems + every section with
+// its slot/equip flags + items) of the object at cHand, so we can see where a worn
+// weapon actually lives relative to the equip-section walk the snapshot uses.
+void dumpInventory(GameWorld* gw, const unsigned int cHand[5]);
+
+// SEH-guarded: UNEQUIP `qty` of the worn (sid,type) at cHand to LOOSE inventory WITHOUT
+// destroying it (move slot -> loose, preserving the item for a later re-equip). Returns
+// how many moved. The faithful "drag worn item into the bag" action for inv_reequip.
+int unequipItemToLoose(GameWorld* gw, const unsigned int cHand[5],
+                       const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded: EQUIP `qty` of the LOOSE (sid,type) the object at cHand already holds
+// (move loose -> slot). Equips a REAL item so it persists (fabricated equips are
+// discarded, d25). Returns how many equipped. Drives the UP path for inv_reequip.
+int reequipLooseItem(GameWorld* gw, const unsigned int cHand[5],
+                     const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded: find a template the character at cHand can WEAR and equip it (so the
+// scenario has a known worn item to cycle even when squad members start naked). Writes
+// the winning stringID + itemType. Returns 1 on success, 0 if nothing could be worn.
+int seedEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                     char* outSid, unsigned int outLen, unsigned int* outType);
+
+// Moved to EngineProbe.h (Phase 5a domain split): the spike-451 weapon-mint
+// fabrication probes (diagWeaponCreate, installCreateItemTraceHook,
+// probeReplayWeaponMint, probeFabricateWeaponLoose, commonNovelWeaponSid) and the
+// spike-402 native-snapshot round-trip (probeNativeSnapshot). The probe scenarios
+// (ScenarioSupport.h) include EngineProbe.h; the adapter (EngineInternal.h)
+// re-includes it. The spike-401 research block below STAYS here because three of
+// its entry points are protocol-38 SYNC calls (interleaved sync+probe).
+
+// ---- Protocol 38: research / tech-tree sync (+ spike 401 store probes) -------
+// Spike 401 (research tech-tree store): the unlock store is
+// PlayerInterface::technology - a `Research*` with NO KenshiLib header (forward
+// declaration only), the documented "progress store unmapped" gap. The probe
+// maps it dynamically from plugin context:
+//   phase 0  - locate + baseline: log the pointer, hex-dump the first 0x100
+//              bytes, classify every qword slot in the first 0x400 that points
+//              at a readable GameData record (type + sid), and remember an
+//              0x800-byte snapshot.
+//   phase 1+ - re-snapshot and log every changed dword vs the previous snapshot
+//              ("[r401] diff ..." with a float view). Run between operate()
+//              bursts and across a tech completion: the moving dwords are the
+//              progress scalar, the mutating region is the completed-set
+//              container.
+// Returns 1 ok / 0 store unresolved / -1 fault.
+int probeResearchStore(GameWorld* gw, int phase);
+// ManagementScreen::currentResearch - the tech UI's selected research GameData.
+// Writes its sid ('' when none/unresolvable); returns 1 when a sid was written.
+int probeCurrentResearchSid(char* outSid, unsigned int outLen);
+// Query the live Research store for one RESEARCH GameData by sid, through the
+// engine's own predicates (recovered 1.0.65 RVAs: isKnown 0x82f300, canResearch
+// 0x832fa0 - the exact calls the research UI's click handler makes). Returns
+// 1 ok / 0 unresolvable (no store, sid unknown) / -1 fault. SYNC (protocol 38).
+int researchQueryBySid(GameWorld* gw, const char* sid, int* outKnown,
+                       int* outCan);
+// The engine's own selection lever: Research::startResearch(GameData*)
+// (recovered RVA 0x834550) - what a research-UI click commits after its
+// canResearch/isKnown gauntlet. The CALLER checks those first (this replays
+// the click, not the gauntlet). Returns 1 called / 0 unresolvable / -1 fault.
+// SYNC (protocol 38): the join applies a host-authoritative research start.
+int researchStartBySid(GameWorld* gw, const char* sid);
+// Deterministic subject pick: the FIRST RESEARCH record that is not known and
+// canResearch (gamedata enumeration order is shared, so every client picks the
+// same sid). Returns 1 picked / 0 none / -1 fault.
+int researchPickSubject(GameWorld* gw, char* outSid, unsigned int outLen);
+// research_cost scenario subject: the FIRST RESEARCH record that is not known,
+// canResearch, and has a "cost" reference list (enumeration order is shared, so
+// both clients pick the same). Writes its sid and the first cost item's sid +
+// count. Research::startResearch does NOT pay this cost (#84 spike, rb_spike3) -
+// the research UI's click handler takes it out of the bench first.
+// Returns 1 picked / 0 none / -1 fault.
+int researchPickCostSubject(GameWorld* gw, char* rsid, unsigned int rcap, char* costSid,
+                            unsigned int cap, int* costQty);
+// Enumerate every RESEARCH GameData: log the first maxLog rows (sid, name,
+// known, can) plus a total/known summary. Returns the total record count.
+unsigned int probeResearchEnum(GameWorld* gw, unsigned int maxLog);
+// Collect the sids of every KNOWN research (Research::isKnown over the shared
+// RESEARCH enumeration) into outSids (each entry sidCap bytes, NUL-terminated).
+// The protocol-38 publish sampler. Returns the number written (<= maxN);
+// 0 also covers store-unresolved/fault. SYNC (protocol 38).
+unsigned int researchEnumKnown(GameWorld* gw, char* outSids,
+                               unsigned int sidCap, unsigned int maxN);
+// Research-bench read beyond ProdRead: techLevel (getTechLevel), the
+// UseableStuff progress-bar float (0x3A4 - candidate bench-local progress
+// scalar) and the power bit. Returns 1 ok / 0 not a research bench (incl. any
+// non-BUILDING hand, e.g. a character's inventory key) / -1 fault.
+int probeResearchBenchRead(const unsigned int mHand[5], int* outTech,
+                           float* outProg, int* outPower);
+
+// ---- Honest pose oracle (downstream of the actual body, not the task flag) --
+// SEH-guarded: read pose signals that reflect the RENDERED body, so a pose check
+// cannot self-confirm off the task field we may have written:
+//   *pelvis  = pelvis (Bip01) height above the body's ground position, in metres
+//              (seated ~0.4-0.6, standing ~0.9-1.1; <0 = unavailable)
+//   *idle    = CharBody::isIdle()    (1/0/-1 unknown)
+//   *crouched= CharBody::isCrouched()(1/0/-1 unknown)
+//   *task    = current TaskType (TASK_NONE if none)
+// Returns true if at least the pelvis height was read.
+bool readPoseState(Character* c, float* pelvis, int* idle, int* crouched, int* task);
+
+// SEH-guarded: read the body-state bit-flags (BODY_* in Wire.h) off a rendered
+// Character - down/KO, ragdoll, dead, crawl. 0 = upright/normal (also on fault).
+// Also carries the protocol-53 PRONE FIELD (bits 9-11): the body's exact
+// ProneState, so capture and the local-vs-streamed compare share one read.
+unsigned short readBodyState(Character* c);
+
+// ---- Protocol 53: prone posture -------------------------------------------
+// Character::_currentProneState (0xE0) is a plain member, read directly like
+// stealthMode (0xD4). -1 = unreadable/null; otherwise a kenshi ProneState value
+// (PS_NORMAL..PS_KO, mirrored by PRONE_* in Wire.h).
+int readProneState(Character* c);
+// Pose the LOCAL body via Character::setProneState. That entry point is VIRTUAL
+// (vtable offset 0x370) unlike the non-virtual setStealthMode beside it, so it is
+// dispatched directly through the header rather than resolved via GetRealAddress -
+// nothing to add to the capability table. Caller compares against readProneState
+// first (this does not check); SEH-guarded. p = a kenshi ProneState value.
+bool applyProneState(Character* c, int p);
+
+// ---- Crawl-drive transform probe (protocol 53, diagnostic) ------------------
+// A crawler driven with applyRaw tracks its owner in Character::getPosition -
+// measured to ~0.2 u, and the nametag moves with it - while the MODEL stays where
+// the body collapsed. No engine-reported field explains that: the copy reads
+// conscious, un-ragdolled, correctly posed and correctly positioned. So read the
+// candidate transforms a body actually has and let a run say which one the mesh
+// follows, instead of guessing at internals. All plain members (CharMovement at
+// 0xC4/0x320/0x37C/0x380, HavokCharacter::position at 0x20) - no entry point to
+// resolve. Read-only; safe to log at scenario cadence.
+struct DriveProbe {
+    float mvX, mvY, mvZ;    // CharMovement::pos - what applyRaw writes
+    float hkX, hkY, hkZ;    // HavokCharacter::position - navmesh/collision body
+    bool  haveHk;           // false when the character has no havok character
+    int   movementMode;     // MovementMode: 0 NORMAL, 1 COMBAT, 2 DIRECTION
+    bool  animOverride;     // CharMovement::animationOverride
+    float tavX, tavY, tavZ; // trackingAnimRelocationVector - anim-owned motion
+    float motX, motY, motZ; // CharMovement::currentMotion
+    // The body's MOTION as the engine itself sees it, which is a different
+    // question from where the body IS. A teleported body arrives without ever
+    // having moved: the physics character's velocity and directionMoved stay
+    // zero, and a clip that advances with real movement has nothing to advance
+    // on - the body slides along the ground in a frozen pose. Read them beside
+    // the mirror we write (curMoving/curSpeed) to tell "the engine moved it"
+    // from "we placed it there".
+    float hkVelX, hkVelY, hkVelZ;
+    float hkMovedX, hkMovedY, hkMovedZ;
+    bool  curMoving;        // CharMovement::currentlyMoving as it stands now
+    float curSpeed;         // CharMovement::currentSpeed as it stands now
+};
+bool readDriveProbe(Character* c, DriveProbe* out);
+
+// True when the body still has its movement controller's physics character
+// (CharMovement::havokCharacter). The engine tears that down while a body is
+// collapsed and re-creates it on recovery, so a body that is up-and-about
+// WITHOUT one is being rendered from a stale transform.
+bool hasPhysicsBody(Character* c);
+// Re-create it (CharMovement::restore). The recovery a driven copy never runs
+// for itself, because it is AI-suspended. No-op (false) if the entry point is
+// unresolved (CAP_MOVE_RESTORE off) or the body already has one - restore()
+// is the counterpart to destroy(), not something to call on a healthy body.
+bool restoreMovement(Character* c);
+
+// Mirror a body's MOTION onto its physics character, which is where the crawl
+// clip reads it from. applyMotion writes the same truth onto CharMovement
+// (currentlyMoving/currentSpeed/currentMotion) and that is enough for an upright
+// copy's walk/run selection, but it does NOT advance a crawler's clip: measured
+// (run 20260805_164254) with the copy's mirror correct at mot=3.83 cur=1:5.21
+// while its physics velocity sat at zero and the body slid along the ground in a
+// frozen pose. The owner's, crawling, read hkvel=0.35,0.04,0.35 over
+// hkmoved=0.705,0.075,0.705 - a unit direction with velocity = direction x
+// speed. So present the same pair: a body whose translation is host-authoritative
+// should report the motion that translation represents.
+// 'dir' need not be normalised (it is normalised here); 'speed' is in world
+// units/sec and is converted to physics units. Zero speed writes a clean stop.
+bool applyPhysMotion(Character* c, float dirX, float dirY, float dirZ, float speed);
+
+// ---- Stage 5 rest-pose reproduction ----------------------------------------
+
+// SEH-guarded: force 'c' into the task carried by 'e' (e.task) targeting the
+// fixture named by e's subject hand, so the body adopts the SAME pose at the SAME
+// object as the host (e.g. SIT_AROUND on a specific stool). Resolves the subject
+// hand to a local RootObject; only commits if that fixture exists here.
+// Deliberately never issues a task with a NULL target (the engine would auto-pick
+// a nearby object and WALK the body to it). Returns:
+//   2 = applied (fixture resolved at the host transform, pose committed)
+//   3 = fixture resolved but it is the WRONG (far) one - a cross-client identity
+//       mismatch; NOT committed (issuing it would walk the body to the far seat).
+//       Caller should treat like a bad fixture and idle-park in place.
+//   1 = subject not loaded here (caller should fall back to a held idle-park)
+//   0 = no task in e / required fns unresolved
+//  -1 = fault
+int applyTask(Character* c, const EntityState& e);
+
+// I9: reproduce a rest pose via the PLAYER-ORDER path (addOrder/addJob with an
+// explicit location) instead of the autonomous SIT_AROUND goal. Pins the body to
+// THIS fixture at THIS spot (no local seat re-search). Same return codes as
+// applyTask (2 applied / 3 wrong-far fixture / 1 not loaded / 0 none / -1 fault).
+int applyTaskOrder(Character* c, const EntityState& e);
+
+// I9: detach an NPC from its town/faction (separateIntoMyOwnSquad) so the town-AI
+// stops auto-assigning it tasks - an inert, squad-like puppet driven only by the
+// host order. Call once per driven NPC. Returns true if the detach was issued.
+bool detachFromTownAI(Character* c);
+
+// I10: end the body's current action (CharBody::endAction) so a suspended
+// node-stander stops executing its residual walk-to-node and drops to idle
+// instead of marching in place. Returns true if the call was made.
+bool endAction(Character* c);
+
+// Read a body's RAW top-level Tasker::key (engine TaskType) - the same value the
+// host streams as EntityState::rawTask. TASK_NONE if the body has no current
+// task; -1 on fault / unresolved fn. Used by the AI-gating divergence check.
+int readTaskKey(Character* c);
+
+// True if 'taskKey' is a NODE-anchored rest pose (STAND_AT_NODE /
+// STAND_AT_SHOPKEEPER_NODE). These sit/idle the body at an AI node whose subject
+// is NOT a resolvable RootObject (applyTask cannot reproduce it), so the only way
+// to reproduce the pose on the join is to let the body's OWN local AI execute the
+// node behavior - i.e. do NOT suspend its AI and do NOT park it at rest.
+bool isNodeAnchoredPose(int taskKey);
+
+// True if 'taskKey' is a CONSTRUCTION-SITE task (BUILD / JOB_BUILDER): the body
+// stands at a building site playing the construction animation. Unlike every other
+// reproducible pose, the subject is created at RUNTIME, so its hand differs per
+// client and the sync layer must translate it through the protocol-27 build key
+// maps before ordering the pose on the peer.
+bool isBuildSiteTask(int taskKey);
+
+// True if 'taskKey' is a machine work task (OPERATE_MACHINERY /
+// OPERATE_AUTOMATIC_MACHINERY): the body works a mine, refiner or bench whose
+// output the host simulates, so a copy that stopped working stops production.
+bool isMachineWorkTask(int taskKey);
+
+// True for MOVE_ON_FREE_WILL - the body's own AI walk (patrol, return to post).
+// A peer-driven squad copy never chooses one itself once its AI is suspended, so
+// one still running is left over from before it was recruited.
+bool isFreeWillMoveTask(int taskKey);
+
+// AI-gating probe lever: recruit a world NPC into the local player's squad (the
+// "inhabit" path) so it stops self-assigning town tasks and obeys our drive.
+// Join-side only. Returns the engine's recruit() result (false if unresolved).
+bool recruitNpc(GameWorld* gw, Character* c);
+
+// Phase 1b (cross-game recruit membership): make 'c' a real member of THIS
+// client's player squad, assigned to the tab named by newHand's container (the
+// recruiter-reported target). The PEER calls this on a recruit/move edge so a
+// recruited unit appears in the squad panel in BOTH games. Uses
+// Character::setFaction into the resolved platoon (the header-documented
+// re-platoon path) - NOT recruitNpc, whose PlayerInterface::recruit detour would
+// echo a spurious recruit edge back. Control stays with the OWNER: the caller
+// keeps the hand pinned peer-owned, so this side never streams/controls it and
+// the host's kinematic drive wins. Idempotent; SEH-guarded. Returns true if the
+// body is a player-squad member afterwards.
+bool joinPlayerSquadAt(GameWorld* gw, Character* c, const unsigned int newHand[5]);
+
+// AI decision-layer suspension (the faction-safe alternative to recruit): detour
+// Character::periodicUpdate so that, for NPCs in the suspended set, the AI "think"
+// tick is skipped (no autonomous re-tasking) while the body keeps animating and
+// executing its current/injected action. installAiSuspendHook() wires the detour
+// once; the set is rebuilt each tick via clearAiSuspend()/addAiSuspend().
+bool         installAiSuspendHook();
+void         clearAiSuspend();
+void         addAiSuspend(Character* c);
+unsigned int aiSuspendCount();
+// Is 'c' in this tick's suspended set? Pointer compare only (never dereferenced).
+bool         isAiSuspended(Character* c);
+
+// Task-selection observation spike (KENSHICOOP_TASK_SPIKE, OFF by default):
+// passively detours CharBody::setCurrentAction - the single seam every task
+// SELECTION result (AI scorer or player order) flows through before the body
+// executes it, separate from the periodicUpdate brain tick. Proves the seam is
+// hookable in isolation and logs the chosen (task, subject, location) tuple per
+// body (`[spike] SELECT` lines). Changes no behavior - the precondition probe
+// for streaming selection instead of suppressing the whole AI.
+bool         installTaskSelectSpikeHook();
+void         setTaskSelectSpike(bool on);
+
+// Join-side damage suppression (the "cosmetic fights are actually cosmetic"
+// guard): detour Character::hitByMeleeAttack so that, for bodies in the guarded
+// set, a locally-simulated melee hit applies NO damage (returns HIT_MISSED
+// without running the engine's hit path). Kenshi's medical model is entirely
+// LOCAL (blood/limbs/bleed never cross the wire), so without this the join's
+// cosmetic copy of a host-authoritative fight accumulates real local damage that
+// nothing reconciles - a body could bleed toward a death the host never had.
+// Same pattern as the AI-suspend detour: pointer-compared set, rebuilt each tick
+// on the main thread, hook installed once.
+bool         installDamageGuardHook();
+void         clearDamageGuard();
+void         addDamageGuard(Character* c);
+unsigned int damageGuardCount();
+// Cumulative intercepted / passed-through melee hits since load (the damage_guard
+// oracle's engagement signal: guarded>0 proves local swings really targeted driven
+// bodies AND the hook stopped them).
+void         damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed);
+
+// Machine work detours: <Building>::operate for the production (mines, refiners,
+// generators) and crafting overrides - the per-frame work call a body's
+// OPERATE_MACHINERY action makes on the machine it is posed at. Only the classes
+// a two-client run proved double-produced are gated: farm, research and furnace
+// work keep the per-client v0.57.5 behaviour (docs/REPLICATION_PITFALLS.md #19).
+// Logs who worked which machine (`[prod] operate ...`, ~5 s aggregate per
+// worker/machine pair), every whole-unit output crossing (`[prod] operate CROSS
+// ...`) and, in mirror mode, the skipped work (`[prod] operate MIRROR ...`,
+// throttled). Returns the number of overrides hooked (2 when all resolved).
+int          installMachineOperateHooks();
+// Mirror mode (the JOIN while protocol 33 runs): machine output is simulated
+// once, on the host. Local work is skipped for a worker this client DRIVES (its
+// owner's sim works it) and on any machine the host is mirroring (marked by
+// markMachineMirrored from each applied/converged protocol-33 row the host can
+// actually produce on - a PRODUCTION_IMPOSSIBLE row, e.g. a crafting bench whose
+// host copy has no job queued, does not mark; the mark lapses ttlMs later, after
+// which local work resumes for an unmirrored machine).
+void         setMachineWorkMirror(bool on);
+void         markMachineMirrored(const unsigned int hand[5], unsigned long ttlMs);
+
+// ---- Join-dealt authoritative damage report (protocol 45) -------------------
+// The damage guard suppresses the join PC's melee on driven NPC copies (cosmetic
+// medical model), but those hits must still WOUND the real NPC on the host. When
+// combat reporting is ON (join only), the guard ACCUMULATES the damage a REPORT
+// ATTACKER (an owned player-squad body) would have dealt to each guarded copy,
+// keyed by the copy's Character*. The replicator drains it per driven copy and
+// sends a CombatHitPacket; the host applies it. setCombatReport(false) clears the
+// accumulator. The attacker set is rebuilt each tick (like the guard set).
+void         setCombatReport(bool on);
+void         clearReportAttackers();
+void         addReportAttacker(Character* c);
+// Drain the accumulated join-dealt damage for one victim copy (returns false if
+// nothing pending). flesh/blood are the summed deltas since the last drain.
+bool         takeReportedDamage(Character* c, float* outFlesh, float* outBlood);
+
+// Read a character's current blood level by hand (medical.blood). The vitals
+// ground-truth read for the damage_guard conformance oracle: the HOST's victim
+// must lose blood in a real fight while the JOIN's driven copy must not.
+bool readBloodByHand(const unsigned int hand[5], float* outBlood);
+
+// ---- Player-combat / medical validation primitives (spike 21 field map) ----
+
+// One anatomy part's damage model (protocol 16). Keyed by the part's index in
+// MedicalSystem::anatomy - deterministic across clients loading the same save.
+struct MedPartRead {
+    bool  used;      // this slot carries a live part
+    unsigned char partType; // HealthPartStatus::PartType
+    unsigned char side;     // LeftRight
+    float flesh;     // cut HP (-1 = unreadable)
+    float fleshStun; // stun HP (-1 = unreadable)
+    float bandaging; // bandage level (-1 = unreadable)
+    float juryRig;   // robotics jury-rig level (-1 = unreadable)
+    float maxHealth; // _maxHealth (local clamp; NOT sent on the wire)
+};
+
+// Full vitals snapshot of a rendered body's LOCAL medical model (the state that
+// never crosses the wire by itself - spikes 21-23). Protocol 16: carries the
+// FULL anatomy (parts[], anatomy order) plus limb-loss state; the legacy 4-limb
+// arrays remain for the scenario scaffolds/oracles (order matches
+// RobotLimbs::Limb: [0]=LEFT_ARM [1]=RIGHT_ARM [2]=LEFT_LEG [3]=RIGHT_LEG).
+struct MedicalRead {
+    bool  valid;
+    float blood;
+    float bleedRate;    // medical.currentBleedRate
+    float limbFlesh[4]; // HealthPartStatus::flesh (current HP; -1 = part missing)
+    float limbBand[4];  // HealthPartStatus::bandaging (-1 = part missing)
+    float limbMax[4];   // HealthPartStatus::_maxHealth (-1 = part missing)
+    bool  unconscious;  // medical.unconcious
+    bool  dead;         // medical.dead
+    bool  crippled;     // medical.crippled (protocol 53): the CAUSE behind an
+                        // injured crawl. Unlike unconscious/dead this one IS
+                        // written on a driven copy - no event channel owns the
+                        // crippled transition, and the engine's crawl
+                        // locomotion/animation paths key on this bool.
+    // ---- protocol 16: full anatomy ----
+    unsigned int nParts;      // filled parts[] slots (MedicalSystem::anatomy order)
+    MedPartRead  parts[12];   // coop::MED_PARTS_MAX slots
+    // ---- protocol 16: limb loss (RobotLimbs::Limb order) ----
+    unsigned char limbState[4]; // LimbState (0xFF = unknown/no robotLimbs)
+    char limbSid[4][48];        // robotic replacement template stringID ("" unless REPLACED)
+    // ---- protocol 29: hunger ----
+    float hunger; // MedicalSystem::hunger (-1 = unread/not carried)
+    float fed;    // MedicalSystem::fed (-1 = unread/not carried)
+    float dazed;  // MedicalSystem::dazedOrAlert (DIAGNOSTICS ONLY - never
+                  // written; drunk/drug-evidence field for the deferred half)
+};
+// SEH-guarded read of c's medical model into *out. Returns out->valid.
+bool readMedical(Character* c, MedicalRead* out);
+// Same, resolving the body from a readObjectHand-layout hand first.
+bool readMedicalByHand(const unsigned int hand[5], MedicalRead* out);
+// SEH-guarded direct hunger/fed write (protocol 29 probe sentinel lever and
+// the driven-copy apply primitive). Values < 0 leave the field untouched.
+bool writeHungerByHand(const unsigned int hand[5], float hunger, float fed);
+
+// Phase-2 vitals sync: SEH-guarded WRITE of a received owner-authoritative
+// medical snapshot onto a DRIVEN copy (blood, bleedRate; full per-part
+// flesh/fleshStun/bandaging/juryRig when in.nParts > 0, else the legacy 4-limb
+// arrays; -1 fields skipped; a part is only written when the local anatomy slot
+// agrees on partType+side). unconscious/dead are NOT written - the reliable
+// event channel owns those transitions. crippled IS written (protocol 53): it has
+// no event channel, and it is what the engine's crawl gait keys on. Returns false
+// on fault/null.
+bool writeMedical(Character* c, const MedicalRead& in);
+
+// Phase-2 treatment forwarding, owner side: raise-only per-limb bandaging apply
+// (bandaging = max(local, band[i]), clamped to _maxHealth; -1 = skip). Raise-only
+// makes a re-delivered delta idempotent. Returns the number of limbs raised.
+int applyBandageLevels(Character* c, const float band[4]);
+
+// ---- Protocol 17: character stats sync ----------------------------------
+// Snapshot of a body's LOCAL CharStats model: raw stat/skill levels indexed by
+// kenshi's StatsEnumerated (slot 0 = STAT_NONE, unused; -1 = unreadable), plus
+// xp and freeAttributePoints. Like the medical model these never cross the
+// wire by themselves - and unlike medical, the PEER's engine resolves real
+// fights with its local copy of these numbers.
+struct StatsRead {
+    bool  valid;
+    unsigned int nStats;    // filled slots (STAT_STRENGTH=1 .. STAT_END-1)
+    float stats[40];        // coop::STATS_SLOT_MAX; by StatsEnumerated index
+    float xp;               // CharStats::xp (-1 = unreadable)
+    float freeAttribPts;    // CharStats::freeAttributePoints (-1 = unreadable)
+};
+// SEH-guarded read of c's CharStats into *out (via CharStats::getStatRef so no
+// per-field offsets). Returns out->valid.
+bool readStats(Character* c, StatsRead* out);
+// Same, resolving the body from a readObjectHand-layout hand first.
+bool readStatsByHand(const unsigned int hand[5], StatsRead* out);
+// SEH-guarded WRITE of a received owner-authoritative stats snapshot onto a
+// DRIVEN copy (-1 fields skipped), then CharStats::_recalculateStats() so
+// derived values (attack/block speed, run speed, encumbrance) refresh
+// immediately. Returns false on fault/null.
+bool writeStats(Character* c, const StatsRead& in);
+
+// Deterministic STAT-RAISE scaffold (stats_sync scenario): set one stat (by
+// StatsEnumerated index) on the body at subjHand to 'value' (raise-only) and
+// recalculate. Runs on the body's OWNER; the peer asserts the crossing.
+bool raiseSubjectStat(GameWorld* gw, const unsigned int subjHand[5],
+                      int statId, float value);
+// Raise EVERY stat (STAT_STRENGTH..STAT_END-1) on the body at subjHand to at least
+// 'value' (raise-only) and recalc once. Returns the count raised. Runs on the
+// body's OWNER (combat_win buffs each side's own PC squad to a winning stat line).
+unsigned int raiseAllStats(GameWorld* gw, const unsigned int subjHand[5], float value);
+// Raise EVERY player-squad member (all tabs) to 'value' in every stat; returns the
+// count of members buffed. The "buffpc" setup scene uses it to bake a maxed save.
+unsigned int buffAllPlayerStats(GameWorld* gw, float value);
+// SEH-guarded: is any player-squad member (all tabs) an instance of the GameData
+// template `sid`? The template stringID comes from the game start and a rename
+// cannot change it, so it identifies WHICH start this world came from. Used to
+// recognise the "Multiplayer+ (Wanderer x2)" start (see WPX2_MARKER_SID in Plugin.cpp).
+bool playerSquadHasTemplate(GameWorld* gw, const char* sid);
+
+// ---- Upstream #74: join-authored state the host-authored save must carry ----
+// A player squad (tab) is keyed by its members' handle CONTAINER pair - the same
+// key the squad-tab ownership uses; save tabs carry identical keys on every client.
+struct SquadNameRow { unsigned int cont[2]; char name[64]; };
+// SEH-guarded: one row per distinct player squad (Platoon::getName). Returns rows.
+unsigned int readPlayerSquadNames(GameWorld* gw, SquadNameRow* out, unsigned int max);
+// Platoon::setName on the player squad keyed `cont`: 1 set / 2 already equal /
+// 0 no such player squad / -1 fault or unbound.
+int setPlayerSquadName(GameWorld* gw, const unsigned int cont[2], const char* name);
+// The player faction (PlayerInterface::participant) name. false if unavailable.
+bool readPlayerFactionName(GameWorld* gw, char* out, unsigned int len);
+// Faction::setName on the player faction: 1 set / 2 already equal / 0 none / -1 fault.
+int setPlayerFactionName(GameWorld* gw, const char* name);
+// One permanent job: TaskType, target hand (null for location-only jobs), location.
+struct PermajobRow { int task; ObjectHand subj; float loc[3]; };
+// Character::getPermajobCount/getPermajobData for character `ch`: rows stored (<= max),
+// -1 unresolved/fault.
+int readPermajobs(const ObjectHand& ch, PermajobRow* out, int max);
+// Character::addJob(task, target, shift=true, addDontClear=true, loc): append one
+// PERMANENT job (shift=false is a one-off order). Returns the permajob count after,
+// -2 target not loaded here, -1 fault.
+int addPermajob(const ObjectHand& ch, int task, const ObjectHand& subj, const float loc[3]);
+// Character::clearPermajobs: 1 ok / -1 unresolved or fault.
+int clearPermajobs(const ObjectHand& ch);
+// TaskType OPERATE_MACHINERY (the job a worker assigned to a machine/bench runs).
+int taskOperateMachinery();
+
+// ---- Protocol 18: carried-body sync --------------------------------------
+// Snapshot of a body's LOCAL carry relationship: is it carrying someone
+// (Character::isCarryingSomething + the carryingObject hand), and is it
+// itself on someone's shoulder (Character::isBeingCarried)?
+struct CarryRead {
+    bool valid;
+    bool carrying;           // this body carries something
+    bool beingCarried;       // this body is on someone's shoulder
+    unsigned int carried[5]; // carryingObject hand (readObjectHand layout;
+                             // zeroed unless carrying)
+};
+bool readCarry(Character* c, CarryRead* out);
+// Order the local CARRIER to pick up the local body at carriedHand via the
+// engine's own pickupObject (full chain: carry-mode ragdoll, shoulder bone
+// attach, carry animation, transform-follow). Idempotent: already carrying
+// that body = success; carrying a different body = refused. SEH-guarded.
+bool applyPickup(GameWorld* gw, Character* carrier, const unsigned int carriedHand[5]);
+// Release the carrier's carried body (dropCarriedObject; ragdoll = limp
+// ground drop). Idempotent: not carrying = success no-op. SEH-guarded.
+bool applyDrop(Character* carrier, bool ragdoll);
+// Scenario scaffolds (carry_order): resolve the carrier by hand, then
+// applyPickup / applyDrop. Run on the CARRIER's owner; the peer asserts the
+// crossing.
+bool carrySubject(GameWorld* gw, const unsigned int carrierHand[5],
+                  const unsigned int carriedHand[5]);
+bool dropSubject(GameWorld* gw, const unsigned int carrierHand[5], bool ragdoll);
+
+// ---- Protocol 19: furniture occupancy (beds + prison cages) ---------------
+// Snapshot of a body's LOCAL furniture relationship: Character::inSomething
+// (IN_NOTHING/IN_BED/IN_PRISON) + the furniture's save-stable hand (inWhat).
+// Protocol 41 adds kind 3 (chained/pole): Character::isChained; for it the
+// `furn` hand carries the OWNER (Character::slaveOwner), not a building.
+struct FurnitureRead {
+    bool valid;
+    int  kind;             // 0 = none, 1 = bed, 2 = prison cage, 3 = chained/pole
+    unsigned int furn[5];  // kind 1/2: inWhat hand; kind 3: slaveOwner hand
+};
+bool readFurniture(Character* c, FurnitureRead* out);
+// ---- Phase 6: shackle (locked equipped item) read lever --------------------
+// Read-only snapshot of a character's shackle/lock state for the 6a evidence
+// spike. `chained` is Character::isChained (0x320); `hasShackleItem` is
+// getChainedModeShackles() != null (an equipped LockedArmour); `lockPresent`
+// is that LockedArmour's `lock` (0x2F0) != null (a live lock object). A
+// desync fingerprint is when the owner reports chained/locked but the peer's
+// driven copy reports it cleared. SEH-guarded; degrades to `chained` only if
+// getChainedModeShackles is unresolved.
+struct ShackleRead {
+    bool valid;
+    bool chained;          // Character::isChained (0x320)
+    bool hasShackleItem;   // getChainedModeShackles() != null
+    bool lockPresent;      // LockedArmour::lock (0x2F0) != null
+    unsigned int owner[5]; // Character::slaveOwner (0x328) hand, all-zero if none
+    // The engine's own per-attempt odds of this character picking that lock,
+    // or < 0 for "not measured" (no lock, or the fn did not resolve). NEGATIVE
+    // AND ZERO MEAN DIFFERENT THINGS and the escape scenario depends on the
+    // difference: 0 says the engine will never let this attempt succeed, so
+    // waiting longer is pointless, while < 0 says we never got to ask.
+    float lockpickChance;
+};
+bool readShackle(Character* c, ShackleRead* out);
+// Jail-probe read lever (KENSHICOOP_JAIL_PROBE): Character::isSlave() as int
+// (0 NOT_SLAVE / 1 IS_SLAVE / 2 ESCAPING_SLAVE / 3 EX_SLAVE), -1 if unresolved
+// or faulted. Read-only; answers whether the join marks its own PC a prisoner.
+int readSlaveState(Character* c);
+// Phase 6 (6a spike): env-gated ([shackledbg], KENSHICOOP_DEBUG_SHACKLE)
+// per-character shackle/lock trace, throttled ~1 Hz. Enumerates nearby world
+// NPCs (prisoners are not in the player squad) and logs every body that is
+// chained or carries a shackle item, on BOTH clients, so a manual session
+// captures the tick a peer's driven copy diverges from the owner. No-op when
+// the env var is unset; SEH-guarded per body. `isHost` only tags the line.
+void shackleDbgTick(GameWorld* gw, bool isHost);
+bool shackleDbgOn();
+// Place the local occupant into / remove it from the furniture at furnHand via
+// the engine's own setBedMode/setPrisonMode (kind: 1 bed, 2 cage) - pose,
+// attach and transform are engine-native. Idempotent: already in the desired
+// state = success no-op. On exit (on=false) an unresolvable furnHand falls
+// back to the occupant's own inWhat. SEH-guarded.
+bool applyFurniture(GameWorld* gw, Character* occupant,
+                    const unsigned int furnHand[5], int kind, bool on);
+// Scenario scaffolds (bed_put / cage_put): resolve the occupant by hand, then
+// applyFurniture against the baked fixture found via findFurnitureNear. Run on
+// the OCCUPANT's owner; the peer asserts the crossing.
+bool putSubjectInFurniture(GameWorld* gw, const unsigned int subjHand[5], int kind, bool on);
+// True when the streamed task is a CONSCIOUS bed-use pose (USE_BED /
+// USE_BED_ORDER / SLEEP_ON_FLOOR): those ride the validated L3 fixture-pose
+// path (bed_pose), so the occupancy machinery must not fight it - the
+// replicator scopes its edges/carve-out/self-heal away from them.
+bool taskIsBedPose(int t);
+// Seat / station poses a bar NPC holds (OPERATE_MACHINERY - Kenshi's stool -,
+// PRETEND_TO_OPERATE_MACHINERY, SIT_AROUND, SIT_ON_THRONE): a driven squad copy
+// still in one while its owner walks with no task is holding a stale pose.
+bool taskIsSeatPose(int t);
+// Self-heal helper (lost/late ENTER edge): find the nearest matching fixture
+// (kind: 1 bed, 2 cage) within 'radius' of the streamed position and place
+// the occupant in it (the continuous bodyState bit carries no furniture hand).
+// Not used for kind 3 (chained/pole): a chain has no searchable building and
+// needs the OWNER hand, so its self-heal re-applies via a remembered owner.
+bool enterFurnitureNearPos(GameWorld* gw, Character* occupant, int kind,
+                           float x, float y, float z, float radius);
+
+// ---- Protocol 20: stealth mode + detection indicators ----------------------
+// One seer entry of a sneaker's detection map: WHICH local character notices
+// the sneaker, and how far along the notice is (Character::WhoSeesMe).
+struct StealthSeer {
+    unsigned int npc[5];   // seer hand (readObjectHand layout)
+    unsigned char see;     // YesNoMaybe: 0 = NO, 1 = YES, 2 = MAYBE
+    float         prog;    // progressOfMaybe (0..1, meaningful for MAYBE)
+};
+// Snapshot of a body's LOCAL stealth state: Character::stealthMode (the mode
+// bool that drives the sneak-walk), stealthUnseen (overall HUD status), and a
+// capped copy of whoSeesMeSneaking - the per-NPC detection map the stealth
+// marker arrows render from.
+struct StealthRead {
+    bool valid;
+    bool sneaking;          // Character::stealthMode (0xD4)
+    unsigned char unseen;   // Character::stealthUnseen (YesNoMaybe key)
+    unsigned int nSeers;    // entries copied into seers[]
+    unsigned int mapSize;   // TOTAL entries in the engine map (may exceed cap)
+    StealthSeer seers[16];
+};
+bool readStealth(Character* c, StealthRead* out);
+// Cheap per-frame mode probe (no map iteration): -1 unreadable, 0 off, 1 on.
+int readStealthMode(Character* c);
+// Toggle the engine's own stealth mode on the LOCAL body (sneak-walk pose,
+// stealthUpdate scanning, skill use - the full chain). Idempotent. SEH-guarded.
+bool applyStealth(Character* c, bool on);
+// Replay one detection entry between the LOCAL pair: resolve the seer by hand
+// and run Character::notifyICanSeeYouSneaking on the local sneaker - exactly
+// what the seer's own vision check would have done, so the marker arrows and
+// unseen status render natively. SEH-guarded.
+bool applyStealthSeer(GameWorld* gw, Character* sneaker,
+                      const unsigned int npcHand[5], unsigned char see, float prog);
+// Drop every entry from the LOCAL body's whoSeesMeSneaking map. The engine only
+// ages those entries while its stealth update is running, so once the sneak ends
+// the last replayed snapshot would linger for the rest of the session (measured:
+// frozen, never decaying). SEH-guarded.
+bool clearStealthSeers(Character* c);
+// Scenario scaffold (sneak_pose / sneak_probe): resolve the subject by hand,
+// applyStealth. Run on the machine that owns the action being tested.
+bool sneakSubject(GameWorld* gw, const unsigned int subjHand[5], bool on);
+
+// Protocol-16 treatment forwarding: raise-only bandaging apply keyed by ANATOMY
+// index (all parts, not just limbs). band[i] = level for anatomy part i, -1 =
+// skip. Returns the number of parts raised.
+int applyBandageParts(Character* c, const float band[12]);
+
+// Limb-loss replication (Phase C/D): reconcile a driven copy's LimbStates with
+// the owner's. states[] is LimbState per RobotLimbs::Limb (0xFF = skip); sid[]
+// the robotic replacement template stringIDs ("" = none). ORIGINAL->STUMP/
+// REPLACED applies MedicalSystem::amputate(limb, createSeveredItem, zero
+// force); ORIGINAL->CRUSHED applies crushLimb. STUMP->REPLACED fabricates the
+// prosthetic from sid (LIMB_REPLACEMENT template) and fits it via
+// MedicalSystem::setRobotLimbItem. createSeveredItem: the HOST passes true
+// (world authority - its real severed item then streams to everyone via the
+// world-item channel); the JOIN passes false (the streamed copy is canonical).
+// Returns a bitmask of limbs changed (bit i = limb i), 0 if nothing to do,
+// -1 on fault.
+int applyLimbStates(GameWorld* gw, Character* c, const unsigned char states[4],
+                    const char sid[4][48], bool createSeveredItem);
+
+// Join-side severed-item dedupe (Phase C): the join's own damage sim creates a
+// REAL severed-limb ground item when an owned member loses a limb, but the
+// HOST's copy (spawned by its event-apply) is the canonical one - it streams
+// back as a world-item proxy. Destroy the local free severed-limb item(s)
+// (Item::itemFunction == ITEM_SEVERED_LIMB) within 'radius' of the body at
+// cHand. Returns the number destroyed.
+int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius);
+
+// limb_loss oracle read: count FREE severed-limb ground items (itemFunction ==
+// ITEM_SEVERED_LIMB, not in any inventory) within 'radius' of the body at cHand.
+int countSeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius);
+
+// Deterministic LIMB-LOSS scaffold (limb_loss scenario): run the engine's own
+// amputate on the body at subjHand (its OWNER calls this - authoritative damage,
+// exactly what a real severing hit does, severed item included). limb =
+// RobotLimbs::Limb (0..3). Returns true if the amputation ran.
+bool amputateSubjectLimb(GameWorld* gw, const unsigned int subjHand[5], int limb);
+
+// Deterministic LIMB wound scaffold (medic_order / player_ko): lower every limb's
+// flesh to 'flesh' (only lower, never heal) and the blood to 'blood' on the body
+// at subjHand. Produces a clean, oracle-visible medical delta on the body's OWNER
+// without waiting for random combat limb rolls. Returns true if applied.
+bool woundSubjectLimbs(GameWorld* gw, const unsigned int subjHand[5],
+                       float flesh, float blood);
+
+// Protocol 45 (host applies join-dealt damage): unlike woundSubjectLimbs (which
+// sets ABSOLUTE floor levels for the medic scaffold), this SUBTRACTS cumulative
+// deltas - the join reports the damage EACH suppressed swing would have dealt, and
+// the host wounds the authoritative NPC by that increment. flesh is subtracted
+// from the currently-weakest limb (concentrates a wound, so repeated hits chew one
+// part down - a clean monotone flesh series); blood is subtracted from the blood
+// pool. Both clamp at 0 (never heal). Returns true if applied.
+bool applyReportedDamage(GameWorld* gw, const unsigned int subjHand[5],
+                         float flesh, float blood);
+
+// Deterministic TREATMENT scaffold (medic_order): bandage every damaged limb on
+// the body at subjHand (HealthPartStatus::bandaging -> _maxHealth, raise only) -
+// the same medical fields a real first-aid pass raises incrementally
+// (MedicalSystem::applyFirstAid, spike 23). Returns the number of limbs bandaged.
+int healSubjectBandage(GameWorld* gw, const unsigned int subjHand[5]);
+
+// player_ko revive scaffold: wake the body at subjHand (clear the forced KO +
+// ragdoll, clear medical.unconcious, restore blood to a healthy floor) so its
+// owner publishes the upright edge -> reliable EVT_REVIVE. Returns true on ok.
+bool reviveSubject(GameWorld* gw, const unsigned int subjHand[5]);
+
+// Owner-authoritative death veto (2026-07-15). A DRIVEN copy whose owner still
+// reports it ALIVE must never latch DEAD from the local (cosmetic) fight - the
+// melee damage guard blocks new wounds, but a lethal frame in an unguarded
+// window or a non-melee source can still flip medical.dead, and Kenshi's
+// medical model is local-only so nothing reconciles it back (the corpse stays
+// dead here while the owner's copy lives). This clears a spuriously-set
+// medical.dead + unconcious, releases the ragdoll, and floors blood so the
+// body cannot immediately re-die. Death only takes hold on the peer via the
+// owner's reliable EVT_DEATH. Returns true if it actually vetoed a local death.
+bool vetoLocalDeath(Character* c);
+
+// player_combat victim pick: the UPRIGHT non-squad world NPC nearest the body at
+// refHand (excluding, optionally, up to two prior hands - pass 0 for none; the
+// second exclude lets a window drop a DUD striker that never engages without
+// re-picking it, run 033318). Fills outHand (readObjectHand layout). Returns
+// true if one was found.
+bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
+                      const unsigned int excludeHand[5], unsigned int outHand[5],
+                      const unsigned int excludeHand2[5] = 0);
+
+// Order the body at atkHand to focus-melee the body at vicHand (UNPROVOKED, same
+// goal path as startDuel). Both hands readObjectHand layout. Returns true if the
+// order was issued. Guarded: no-op (true) when the attacker is already in combat,
+// so a throttled re-issue doesn't thrash the AI (the combat_order lesson).
+bool orderAttackByHand(GameWorld* gw, const unsigned int atkHand[5],
+                       const unsigned int vicHand[5]);
+
+// ---- Money + vendor trading (protocol 52 pool / shop_probe) -----------------
+// Kenshi keeps ONE player wallet per save: the save's player-state record holds
+// a single `player money` value, and the live field hangs off the player FACTION
+// (Faction::factionOwnerships), not off any squad. The PER-PLATOON
+// Ownerships::money reached by readWalletByHand belongs to NPC/town squads (the
+// cats you loot off a bandit platoon) and reads 0 for the player's own tabs -
+// which is why the old per-tab money channel synced a field the player economy
+// ignores (wallet_probe). Player cats are therefore a SHARED POOL, replicated by
+// protocol 52 over readPlayerWallet/writePlayerWallet.
+//
+// Vendors are ShopTrader RootObjects with save-stable hands; a purchase is
+// Inventory::buyItem mutating vendor stock + the pool LOCALLY on one client only
+// - the divergence the probe measures.
+
+// One nearby vendor (ShopTrader) summary for the shop_probe evidence log.
+struct VendorRead {
+    unsigned int hand[5]; // readObjectHand layout [type,container,containerSerial,index,serial]
+    int          money;   // vendor cash register (RootObject::getMoney; -1 unreadable)
+    int          stock;   // item ENTRIES in its inventory (-1 unreadable)
+    int          qty;     // summed item quantity (stack-shrink shows here; -1 unreadable)
+    int          src;     // which inventory answered: 0 none, 1 ShopTrader's own
+                          // (the aggregated trade-UI view; LAZY - null until the
+                          // shop opens), 2 the trader CHARACTER's inventory
+    unsigned int traderHand[5]; // the trader Character's SAVE-STABLE hand (zeros
+                          // if unread) - the cross-client vendor identity (the
+                          // ShopTrader wrapper's own hand serial is runtime)
+    char         sid[48]; // the wrapper's GameData stringID ("" if unread) -
+                          // identifies WHAT these SHOP_TRADER_CLASS objects are
+    float        x, y, z; // vendor world position
+};
+
+// SEH-guarded: enumerate SHOP_TRADER_CLASS objects within `radius` of the local
+// leader into out[] (up to maxOut). Returns the number written.
+unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut,
+                             float radius);
+
+// SEH-guarded: read the PLAYER's wallet - the single pool the HUD shows and
+// every purchase/sale/loot/bounty moves (player faction -> factionOwnerships ->
+// Ownerships::getMoney, engine accessors, never raw offsets). This is the
+// protocol-52 sample point. *outMoney = -1 on failure. Returns true on ok.
+bool readPlayerWallet(GameWorld* gw, int* outMoney);
+
+// SEH-guarded: write the player's wallet via Ownerships::setMoney (the
+// protocol-52 apply primitive). Rejects negative amounts - the pool is clamped
+// at 0 by the host, never driven below it. Returns true on ok.
+bool writePlayerWallet(GameWorld* gw, int money);
+
+// SEH-guarded: read the wallet of the platoon containing the body at mHand
+// (Character -> ActivePlatoon -> Platoon -> Ownerships::getMoney - engine
+// accessors, never raw offsets). This is an NPC/town-SQUAD wallet: it reads 0
+// for the player's own tabs, so it is diagnostic only (wallet_probe) and is NOT
+// the player's cats - use readPlayerWallet for those. *outMoney = -1 on
+// failure. Returns true on ok.
+bool readWalletByHand(const unsigned int mHand[5], int* outMoney);
+
+// SEH-guarded: write the wallet of the platoon containing the body at mHand via
+// Ownerships::setMoney (diagnostic counterpart of readWalletByHand; see the
+// note there about which wallet this is). Returns true on ok.
+bool writeWalletByHand(const unsigned int mHand[5], int money);
+
+// Purchase observability detour (protocol 22, 1c groundwork): hook Inventory::
+// buyItem so every REAL trade-UI purchase logs a "[shop] BUY-LOCAL" line
+// (seller identity + money, item sid, buyer). Automation cannot reach a real
+// purchase in the test save (lazy vendor inventories, no bound trader), so
+// manual field sessions carry the evidence for the vendor-stock mirror design.
+bool installShopHook();
+
+// ---- Protocol 23: recruitment sync ------------------------------------------
+// Hook PlayerInterface::recruit so every SUCCESSFUL local recruit (dialog or
+// programmatic) records its before/after hand pair. The Replicator drains the
+// queue once per tick into EVT_RECRUIT (subject = old hand, actor = new hand);
+// the peer re-keys its local copy of the old hand to the new stream key.
+// 'who' is the recruited body itself (pointer identity survives the
+// re-container; read only through SEH-guarded calls) so the drain can find
+// the key the PEER streams it under and release this side's drive of it.
+struct RecruitEdge { unsigned int before[5]; unsigned int after[5]; Character* who; };
+bool installRecruitHook();
+unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut);
+
+// ---- Protocol 24: faction-relation sync -------------------------------------
+// One relation row between the PLAYER faction and a world faction, both
+// directions (the probe must show which side guard aggro consults). sid is the
+// faction's GameData stringID - the save-stable cross-client identity protocol
+// 21 already round-trips for proxy spawns. enemy/ally are the derived flags
+// the AI consults (-1 = accessor unresolved).
+struct FactionRead {
+    char  sid[48];
+    char  name[48];
+    float usToThem;   // player faction's relation table toward them
+    float themToUs;   // their relation table toward the player (reciprocal row)
+    int   enemy;      // player's table: isEnemy(them)
+    int   enemyRecip; // their table: isEnemy(player)
+    int   ally;       // player's table: isAlly(them)
+};
+// SEH-guarded enumeration of every REAL world faction with a readable sid.
+unsigned int listPlayerRelations(GameWorld* gw, FactionRead* out, unsigned int maxOut);
+// SEH-guarded single-row read: both table directions for one faction sid.
+bool readRelationBySid(GameWorld* gw, const char* sid, float* outUs, float* outThem);
+// SEH-guarded raw relation write (FactionRelations::setRelation) on the player
+// faction's row toward sid; reciprocal also writes their row toward the player.
+// outBefore/outAfter capture the player-side row around the write.
+bool writeRelationBySid(GameWorld* gw, const char* sid, float value, bool reciprocal,
+                        float* outBefore, float* outAfter);
+// Detour BOTH FactionRelations::affectRelations overloads (the engine's own
+// mutation path: EVENT = cause enum, AMT = raw amount). Every real mutation
+// logs a "[fac] AFFECT-EV/AMT" line and records a delta the Replicator drains
+// (the join forwards its local mutations to the host - the treatments pattern).
+struct FactionDelta {
+    char  meSid[48];
+    char  whomSid[48];
+    int   isEvent;
+    int   ev;
+    float amount;
+    float mult;
+    float after;
+};
+bool installFactionHooks();
+unsigned int drainFactionDeltas(FactionDelta* out, unsigned int maxOut);
+
+// ---- Protocol 26: door/gate state sync ---------------------------------------
+// One row per BAKED door/gate near the interest centers. The wire identity is
+// the door Building's save-stable hand - the exact key the furniture/bed sync
+// already round-trips cross-client. `open` collapses the animated DoorState
+// (OPEN/OPENING = 1, CLOSED/CLOSING = 0) so a door in motion publishes its
+// DESTINATION, not the transient.
+struct DoorRead {
+    unsigned int hand[5]; // [type, container, containerSerial, index, serial]
+    float x, y, z;        // world position (census diagnostics only)
+    int   open;           // 1 = open/opening
+    int   locked;         // DoorLock engaged (0 when no lock)
+    int   hasLock;        // door carries a DoorLock at all
+    int   state;          // raw DoorState (probe diagnostics)
+    int   gate;           // isGate() != 0 (town gates ride the same channel)
+    char  name[40];       // GameData name (diagnostics)
+    // Protocol 28: the door-to-building link. A door on a PLACED building has
+    // a runtime hand, so its wire identity is (parent building hand, index in
+    // the parent's ordered `doors` list) translated through the build maps.
+    unsigned int parentHand[5]; // owning Building's hand (all-zero = no parent)
+    int   doorIndex;            // position in parent->doors (-1 = no parent)
+};
+// SEH-guarded enumeration of doors among BUILDING objects within radius of the
+// interest centers (dual-interest, deduped). Returns the count written.
+unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned int maxOut);
+// SEH-guarded single-door read by hand. Returns false when the hand does not
+// resolve locally or is not a door.
+bool readDoorByHand(const unsigned int dHand[5], DoorRead* out);
+// SEH-guarded door write through the engine's own action entries:
+// openDoor/closeDoor (the polite path - animation, navmesh, sound), falling
+// back to _forceDoorOpenUT/_forceDoorClosedUT when the polite call refuses;
+// lockDoor/unlockDoor for the lock bit (skipped when the door has no lock).
+// wantLocked < 0 leaves the lock untouched. Returns false on resolve failure
+// or fault; *outAfter reports the post-write DoorRead when non-null.
+bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
+                     DoorRead* outAfter);
+
+// ---- Protocol 54: property-deed (building ownership) sync --------------------
+// Buying a house/shop is a state change on a BAKED building: the engine moves
+// the building's owner faction (RootObjectBase::setFaction) and adds its hand to
+// the PLAYER FACTION's owned-object set (Faction::factionOwnerships, the same
+// Ownerships block that holds the protocol-52 wallet). Both clients loaded the
+// same save, so the building's hand is the cross-client identity - the door
+// precedent, not the protocol-27 runtime-mint one.
+struct DeedRead {
+    unsigned int hand[5]; // [type, container, containerSerial, index, serial]
+    int   owned;          // 1 = owner faction IS the player faction
+    int   forSale;        // Building::isForSale() (-1 = object not resolvable here)
+    int   shop;           // Building::isAShop() (-1 = not resolvable)
+    int   resolved;       // 1 = the hand resolves to a live local Building
+    char  ownerSid[48];   // owning faction's GameData stringID ('' = none/unknown)
+    char  name[40];       // GameData name (diagnostics)
+    float x, y, z;        // world position (diagnostics)
+};
+// SEH-guarded enumeration of the player faction's OWNED BUILDINGS - the deed
+// publisher's sample. Read off the owned-object set rather than a spatial query
+// ON PURPOSE: ownership is a latched fact that must keep publishing after the
+// buyer walks away, and the set is memory-resident whether or not the building's
+// zone is loaded. Rows whose hand does not resolve locally are still returned
+// (resolved=0, sentinel detail fields). Returns the count written.
+unsigned int enumOwnedBuildings(GameWorld* gw, DeedRead* out, unsigned int maxOut);
+// SEH-guarded enumeration of BUILDINGS near the interest centers (dual-interest,
+// deduped) with their ownership/for-sale state. Diagnostics only (the deed
+// probe's census + sentinel picker); the channel never samples this.
+unsigned int enumBuildingsNear(GameWorld* gw, float radius, DeedRead* out,
+                               unsigned int maxOut);
+// SEH-guarded single-building read by hand. Returns false when the hand does not
+// resolve locally or is not a building.
+bool readDeedByHand(GameWorld* gw, const unsigned int bHand[5], DeedRead* out);
+// SEH-guarded ownership write - the deed apply lever. wantOwned=1 moves the
+// building to the PLAYER faction and adds it to the player's owned set;
+// wantOwned=0 moves it to the faction named by ownerSid (left untouched when
+// that sid does not resolve) and drops it from the owned set. This is a pure
+// STATE write: it never runs Building::buyMeCallback, which would charge the
+// cats a second time (the payer's spend already rides protocol 52). Returns
+// false on resolve failure or fault; *outAfter reports the post-write DeedRead.
+bool writeDeedByHand(GameWorld* gw, const unsigned int bHand[5], int wantOwned,
+                     const char* ownerSid, DeedRead* outAfter);
+
+// The WIDE ownership state of one building, for diffing a REAL purchase against
+// an applied deed row. Moving the owner faction is only the part of buying a
+// house that the market sees; the field report is that the peer's copy leaves
+// the market but does not come online as a base (no datapanel, no access, no
+// research level), so this dumps every state a purchase could plausibly also
+// touch. Each side logs it for the same hand and the DIFF names what the apply
+// still has to write. -1 = not readable here (unresolved hand / missing lever).
+struct DeedAudit {
+    unsigned int hand[5];
+    int resolved;
+    int isPlayer;      // Building::isThePlayer (the engine's own predicate)
+    int ownedSet;      // Ownerships::isOwned (the set half)
+    int forSale, shop, isPublic, designation;
+    int residentHand;  // 1 = residentSquad hand is set (the evicted-family half)
+    int residentLeader;// 1 = that squad still has a live leader here
+    int townHand;      // 1 = Building::_town is set
+    int townMgr;       // 1 = buildingsManager is bound
+    int interior;      // 1 = myInterior is bound
+    int internals;     // Building::getNumInternalBuildings
+    int doors, doorsPlayer, doorsSet;   // door group: total / player-owned / in set
+    int furn, furnPlayer, furnSet;      // interior+furniture group, same three
+    int canUse;        // Ownerships::canIUseThisBuilding(b, player leader)
+    int homeIsThis;    // 1 = Ownerships::_homeBuilding IS this building
+    int homeSet;       // 1 = _homeBuilding is set to something
+    int homeTown;      // 1 = _homeTown is bound
+    int stuffSize;     // Ownerships::stuff entry count
+    int wallet;        // the shared purse (the double-charge witness)
+    // The per-SQUAD ownership blocks. Ownerships exists twice over: once on the
+    // player FACTION (where the shared purse lives, and the only one the deed
+    // write touches) and once per PLATOON. If buying also registers the house on
+    // the buying SQUAD, the peer would read owned at faction level - which it
+    // does - while every squad-scoped question still answers no.
+    int squads;        // distinct player platoons seen
+    int squadsOwn;     // ...that report isOwned(this building)
+    int squadsHome;    // ...whose _homeBuilding IS this building
+    int curOwn;        // the CURRENT platoon's isOwned (-1 = unreadable)
+    int curHome;       // the CURRENT platoon's _homeBuilding is this (-1 = same)
+    int townPlayer;    // Town::isPlayerBuildingsInThisTown (the base switch)
+    int townLevel;     // Town::playerTownLevel (what the base panel prints)
+    char ownerSid[48];
+    char name[40];
+};
+// SEH-guarded wide audit of one building by hand. Returns false when the hand
+// does not resolve locally (out is still zero-filled with resolved=0).
+bool auditDeed(GameWorld* gw, const unsigned int bHand[5], DeedAudit* out);
+
+// ---- Protocol 27: placed-building sync ---------------------------------------
+// One placed-building/construction-site row. The template GameData stringID is
+// the cross-client identity (protocol 21's sid precedent); the local hand is
+// RUNTIME-minted for placements (the probe's central finding), so it is only a
+// local key - the wire keys mints by the PLACER's hand.
+struct BuildRead {
+    unsigned int hand[5]; // local hand [type, container, containerSerial, index, serial]
+    float x, y, z;        // world position
+    float progress;       // ConstructionState::constructionProgress (0..1)
+    int   complete;       // ConstructionState::isComplete
+    char  sid[48];        // template GameData stringID (wire identity)
+    char  name[40];       // template name (diagnostics)
+};
+// One REAL local placement edge (UI commit detour or programmatic placement).
+struct BuildEdge {
+    unsigned int hand[5]; // the placed building's local hand (the wire key)
+    float x, y, z;        // placement transform (what the peer mints at)
+    float yaw;
+    int   floorNum;
+    int   fromUi;         // 1 = captured at the factory, 0 = programmatic probe
+    char  sid[48];        // template sid
+};
+// Detour RootObjectFactory::createBuilding - the choke point EVERY building
+// creation passes through, including a player's build-mode commit. Each new
+// construction site queues a BuildEdge the Replicator drains. Capturing here
+// rather than off PreviewBuilding::justBeenBuilt is deliberate: that field read
+// 0 for placements that visibly succeeded, so no player build ever streamed.
+bool installBuildHook();
+// Gate capture to live gameplay. Pass the same worldLive that gates
+// replication; while false, capture ignores creations, which is what keeps
+// world load and world swaps (the whole save's buildings) off the wire.
+void setBuildCaptureArmed(bool armed);
+// SEH-guarded terrain height under an x/z. Returns false if the engine's
+// terrain query is unresolved. Callers that want a building to sit ON the
+// ground pass this as the absolute Y to placeBuildingAt.
+bool terrainHeightAt(float x, float z, float* outY);
+unsigned int drainBuildEdges(BuildEdge* out, unsigned int maxOut);
+// SEH-guarded enumeration of INCOMPLETE construction sites among BUILDING
+// objects within radius of the interest centers (complete/baked buildings are
+// legion and never stream - only sites under construction are interesting).
+unsigned int enumSitesNear(GameWorld* gw, float radius, BuildRead* out, unsigned int maxOut);
+// SEH-guarded single-building read by local hand (works for complete ones too).
+bool readBuildingByHand(const unsigned int bHand[5], BuildRead* out);
+// SEH-guarded construction-progress write through the engine's own virtuals
+// (setConstructionProgress; notifyConstructionComplete fires once at >= 1.0 so
+// the site "finishes" natively - scaffold off, materials restored, navmesh).
+// Returns false on resolve failure or fault; *outAfter when non-null.
+// markComplete is the AUTHORITY's own isComplete, never a threshold inferred
+// from progress: constructionProgress is an absolute amount against the
+// building's total, so a site legitimately passes 1.0 while still going up.
+bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
+                              bool markComplete, BuildRead* outAfter);
+// SEH-guarded programmatic placement by template sid at explicit coordinates
+// (the peer-side MINT primitive; completed=false mints a construction site).
+// Returns 1 placed, 0 template-miss/factory-refused, -1 fault. outHand gets
+// the minted building's local hand.
+// `y` is the ABSOLUTE world Y to land at. createBuilding treats the Y it is
+// given as an offset ABOVE the terrain, so this subtracts the terrain height to
+// convert; `dy` on the mint line reports how far off the landing was, and
+// `ground` reports the terrain height used. Passing an absolute straight through
+// put peer mints ~terrain-height into the sky; grounding at x/z instead dropped
+// them below any placer who built on a slope or a foundation. Callers wanting a
+// building ON the ground pass terrainHeightAt() as `y`.
+int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
+                    float heading, bool completed, unsigned int outHand[5]);
+// Probe convenience: pick a deterministic small BUILDING template, place it
+// leader-relative (fwd/side) with completed=false, and report everything the
+// probe logs. Returns 1 placed, 0 refused, -1 fault. wantDoor selects a
+// template WITH a door (shack class) instead of the doorless fixture class
+// (protocol 28: placed-door sync needs a door to toggle).
+int probePlaceBuilding(GameWorld* gw, float fwd, float side, bool wantDoor,
+                       unsigned int outHand[5], char* outSid, unsigned int sidLen,
+                       float* outX, float* outY, float* outZ, float* outYaw);
+
+// ---- Protocol 28: placed-building doors + dismantle ---------------------------
+// SEH-guarded read of door #doorIndex of the building bHand resolves to
+// (index into Building::doors, the engine's own ordered child list). Returns
+// false when the building does not resolve, has no door list, or the index
+// is out of range.
+bool readDoorOfBuilding(const unsigned int bHand[5], unsigned int doorIndex,
+                        DoorRead* out);
+// SEH-guarded building removal through GameWorld::destroy (the world-item
+// cull lever) - the peer-side apply for PKT_BUILD_REMOVE and the probe's
+// local destroy lever. Returns false on resolve failure or fault.
+bool destroyBuildingByHand(GameWorld* gw, const unsigned int bHand[5]);
+// Detour Building::notifyConstructionDismantling - the engine's dismantle-
+// complete notification - queueing the building's hand as a removal edge the
+// Replicator drains into PKT_BUILD_REMOVE.
+bool installDismantleHook();
+unsigned int drainRemoveEdges(unsigned int (*out)[5], unsigned int maxOut);
+// Queue a removal edge manually (the probe's programmatic destroy path uses
+// this: GameWorld::destroy does not pass through the dismantle notification).
+void queueRemoveEdge(const unsigned int bHand[5]);
+
+// ---- Protocol 33: production machine sync ------------------------------------
+// One production machine / power fixture / farm / research bench row. Identity
+// is the Building's hand: save-stable for BAKED machines (the door/furniture
+// precedent), runtime for session-placed ones (translated through the
+// protocol-27 build maps on the wire). The continuous state is a handful of
+// floats: the output buffer (StorageBuilding::productionItem), up to 2 input
+// buffers (ProductionBuilding::consumptionItems), the power bit, and the farm
+// growth floats. -1 sentinels mean "field not carried / not this class".
+struct ProdRead {
+    unsigned int hand[5]; // local hand [type, container, containerSerial, index, serial]
+    float x, y, z;        // world position (census diagnostics)
+    int   classType;      // BuildingClassType (BCTYPE_PRODUCTION/CRAFTING/FARM/...)
+    int   complete;       // ConstructionState::isComplete (incomplete rides protocol 27)
+    int   powerOn;        // isPowerOn() (0/1; -1 unreadable)
+    float powerOutput;    // getPowerOutput() (generators; 0 for consumers)
+    int   productionState;// ProductionBuilding::ProductionState (-1 = not production-class)
+    float miningLevel;    // _resourceMiningLevel (ore drills / mines)
+    // output buffer (StorageBuilding::productionItem; sid "" / -1 = no buffer)
+    char  outSid[48];     // output item template GameData stringID
+    float outAmount;      // productionItem->amount (stack + progress toward next)
+    int   outCap;         // productionItem->maxCapacity
+    // input buffers (ProductionBuilding::consumptionItems, first 2; -1 = absent)
+    int   nInputs;
+    float inAmount[2];
+    char  inSid[2][48];
+    // research bench evidence (BCTYPE_RESEARCH only; -1 otherwise)
+    int   techLevel;      // ResearchBuilding::getTechLevel()
+    // farm growth floats (BCTYPE_FARM only; -1 otherwise)
+    float grown;          // FarmBuilding::grown
+    float died;           // FarmBuilding::died
+    float growStart;      // FarmBuilding::growStart
+    int   harvested;      // FarmBuilding::harvested
+    char  name[40];       // template name (diagnostics)
+    char  sid[48];        // template GameData stringID
+};
+// SEH-guarded enumeration of COMPLETE machine-class buildings (production /
+// crafting / furnace / farm / research) within radius of the interest centers
+// (dual-interest, deduped). Returns the count written.
+unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
+                              unsigned int maxOut);
+// SEH-guarded single-machine read by local hand. Returns false when the hand
+// does not resolve locally or is not a machine-class building.
+bool readMachineByHand(const unsigned int mHand[5], ProdRead* out);
+// SEH-guarded machine write through the engine's own levers. All fields are
+// optional (sentinel = leave untouched):
+//   wantPower  - -1 leave, 0/1 switchPowerOn (vtable, the engine's own toggle)
+//   outAmount  - >= 0: set the output buffer. useSetItem=true routes through
+//                the native virtual setProductionItem(item, stack, progress01)
+//                (stack = floor, progress = frac); false writes
+//                productionItem->amount directly (the clamp/fight probe leg).
+//                The output ITEM template is the machine's current one (outSid
+//                of the last read); no template swap in v1.
+//   inAmount   - per-input direct ConsumptionItem::amount writes (< 0 = skip)
+//   farm       - [grown, died, growStart, harvested] direct writes (< 0 = skip;
+//                only applied on BCTYPE_FARM)
+// Returns false on resolve failure or fault; *outAfter reports the post-write
+// ProdRead when non-null.
+bool writeMachineByHand(const unsigned int mHand[5], int wantPower,
+                        float outAmount, bool useSetItem,
+                        const float inAmount[2], const float farm[4],
+                        ProdRead* outAfter);
+// SEH-guarded: drive the machine's own operate(worker, amount) with the local
+// leader as the worker - the engine's worker-production path, used by the
+// probe as a deterministic "a worker is producing here" scaffold (a real
+// ordered worker's output rides the same call). Returns false on resolve
+// failure / fault.
+bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amount);
+// Probe convenience (prod_probe / store_probe): place a COMPLETABLE building
+// template leader-relative (fwd/side) as a construction site + queue the
+// protocol-27 build edge (so the peer mints a proxy when buildSync is on); the
+// caller ramps it complete via writeBuildProgressByHand. kind: 0 = power
+// generator, 1 = crafting bench, 2 = storage container (BCTYPE_STORAGE -
+// protocol 34's chest subject), 3 = research bench (BCTYPE_RESEARCH - spike
+// 401's subject), 4 = blueprint-free crafting bench (BCTYPE_CRAFTING - the
+// first-aid desk bench_yield_join queues a job on). Returns 1 placed,
+// 0 template-miss/refused, -1 fault.
+int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
+                      unsigned int outHand[5], char* outSid, unsigned int sidLen);
+
+// ---- Protocol 34: storage/machine container sync -----------------------------
+// One container-bearing building row for the census: a storage chest
+// (BCTYPE_STORAGE) or a machine (the protocol-33 classes - their crafted whole
+// ITEMS land in the same Building inventory). Identity is the Building's hand,
+// exactly the ProdRead story: save-stable for BAKED buildings, runtime for
+// session-placed ones (translated through the protocol-27 build maps on the
+// wire). Contents are summarized as the captureContainerContents fingerprint:
+// distinct (sid,type) entry count + total quantity + order-independent hash.
+struct ContRead {
+    unsigned int hand[5]; // local hand [type, container, containerSerial, index, serial]
+    float x, y, z;        // world position (census diagnostics)
+    int   classType;      // BuildingClassType (BCTYPE_STORAGE or a machine class)
+    int   complete;       // ConstructionState::isComplete (incomplete rides protocol 27)
+    int   hasInv;         // getInventory() != null (lazy-inventory evidence)
+    int   nEntries;       // distinct (sid,type,equipped) entries captured
+    int   qtyTotal;       // sum of entry quantities (whole items in the container)
+    unsigned int hash;    // order-independent content fingerprint (0 = empty)
+    char  firstSid[48];   // first captured entry's template sid (diagnostics)
+    int   firstQty;       // first captured entry's quantity
+    char  name[40];       // template name (diagnostics)
+    char  sid[48];        // template GameData stringID
+    int   shop;           // protocol 60: a SHOP COUNTER (BF_SHOP / shopOwner set)
+    unsigned int shopOwner[5]; // its UseableStuff::shopOwner (trader PLATOON hand)
+};
+// SEH-guarded enumeration of COMPLETE container-bearing buildings (STORAGE +
+// the machine classes) within radius of the interest centers (dual-interest,
+// deduped). Per row the contents are captured (up to 64 entries) into the
+// count/qty/hash summary - the capacity question's measuring stick. Returns
+// the count written. includeShops (protocol 60) also takes the SHOP COUNTERS,
+// whatever their class - the host's vendor-stock census.
+unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
+                                unsigned int maxOut, bool includeShops = false);
+// SEH-guarded: the shopOwner (trader PLATOON hand) of the shop counter at
+// cHand. False when it does not resolve or is not a shop counter.
+bool readShopCounterOwner(const unsigned int cHand[5], unsigned int owner[5]);
+// SEH-guarded single-container read by local hand. Returns false when the hand
+// does not resolve locally or is not a container-bearing building class.
+bool readContainerByHand(const unsigned int cHand[5], ContRead* out);
+// Protocol 62 (corpse census, upstream #40): one non-squad character (NPC or
+// animal) near an interest center. hand is the container layout
+// [type, container, containerSerial, index, serial] - a character's own hand
+// IS its inventory container hand. body lets the caller map a bound proxy to
+// the stream key it is driven under.
+struct CorpseRead {
+    unsigned int hand[5];
+    Character*   body;
+    float        x, y, z;
+};
+// SEH-guarded enumeration of non-squad characters that have an inventory within
+// radius of the interest centers (player squads excluded - their owners author
+// them), deduped across overlapping spheres. deadOnly keeps Character::isDead
+// bodies only - the host's corpse census. A peer's copy of a body the host
+// killed is only held DOWN (the death latch), never engine-dead, so a lookup on
+// that side passes false. Returns the count written.
+unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
+                               unsigned int maxOut, bool deadOnly);
+
+// Nearest BCTYPE_PRODUCTION building (a resource mine) to the leader, or null.
+// Class-matched rather than name-matched, and searched wide, because a mine's
+// origin can sit tens of metres from where its miner stands. Drives the
+// mine_pose scenario's fixture pick.
+RootObject* findMineNear(GameWorld* gw);
+
+// ---- Protocol 55: runtime-fixture identity -----------------------------------
+// Resolve a peer's fixture row (world position + template sid + building class)
+// to the LOCAL hand of the same physical object, for fixtures whose hand is
+// client-local rather than save-stable - an ore/stone mine is instantiated per
+// client for a terrain node, so the same mine carries a different index AND
+// serial on each side while sitting at the identical position. Position is the
+// match key; sid and classType are guards. Writes the local hand and returns
+// true on a match, false when nothing here qualifies (zone not loaded yet - the
+// caller keeps using the raw hand, which is correct for save-baked machines).
+bool findFixtureByPosSid(GameWorld* gw, float x, float y, float z,
+                         const char* sid, int classType, unsigned int out[5]);
+
+// ---- Protocol 35: squad management sync --------------------------------------
+// A squad-tab MOVE re-containers the body exactly like a recruit (the hand's
+// container fields change), but no single engine function owns the UI path -
+// so instead of a detour, poll the roster: the Character* body pointer
+// SURVIVES re-containering (the protocol-23 re-key evidence), so a per-poll
+// pointer -> hand map diff catches EVERY move flavor (UI drag, createSquad,
+// separate-into-own-squad) with one mechanism. A pointer that LEFT the roster
+// reports a zeroed after-hand (dismissal/death - the stored hand is reported
+// without dereferencing the possibly-freed pointer). Brand-NEW pointers are
+// NOT edges here: recruit ENTRY is the protocol-23 detour's story.
+struct SquadMoveEdge { unsigned int before[5]; unsigned int after[5]; };
+// Poll the live roster against the pointer map, queueing edges (cap 64).
+// Call ~1 Hz from the main thread. An EMPTY roster skips the exit sweep (a
+// world swap mid-load must not report the whole squad as dismissed); the
+// session-reset path clears the map via clearSquadRoster instead.
+void pollSquadRoster(GameWorld* gw);
+// Drop every pointer baseline (world swap: all Character* dangle).
+void clearSquadRoster();
+unsigned int drainSquadMoveEdges(SquadMoveEdge* out, unsigned int maxOut);
+
+// SEH-guarded probe lever (squad_probe): programmatically MOVE the member at
+// mHand between squad tabs, so the scenario can exercise the re-container
+// path the UI drag takes. lever selects the candidate:
+//   0 = Character::separateIntoMyOwnSquad(true)  - eject into a NEW tab
+//       (tHand ignored; the proven detachFromTownAI lever on a squad body);
+//   1 = Character::setFaction(playerFaction, targetPlatoon) - move into the
+//       tab of the member at tHand (the header-documented re-platoon path);
+//   2 = ActivePlatoon::addCharacterAt(target, member, index) - the container
+//       insert taken directly (fallback if lever 1 does not re-container).
+// outBefore/outAfter capture the member's hand around the call (wire layout).
+// Returns 1 = hand CHANGED (the move landed), 0 = lever ran but the hand is
+// unchanged (refused/no-op - a FINDING, not a fault), -1 = fault/unresolved.
+int probeMoveSquadMember(GameWorld* gw, const unsigned int mHand[5],
+                         const unsigned int tHand[5], int lever,
+                         unsigned int outBefore[5], unsigned int outAfter[5]);
+
+// ---- Protocol 23 phase 0: recruitment probe (recruit_probe) -----------------
+// SEH-guarded: perform ONE programmatic recruitment via the engine's own
+// PlayerInterface::recruit and report the identity evidence. runtimeSubject
+// selects the leg: true = recruit a freshly runtime-spawned NPC (host-only
+// hand - the spawn-sync regime), false = recruit the nearest BAKED world NPC
+// (save-stable hand - the bar-recruit regime). outHandBefore/After capture the
+// subject's hand around the call: recruit re-containers the body into a player
+// platoon, so the CONTAINER fields change - whether index/serial survive is
+// the finding that gates the protocol-23 design.
+// Returns 1 recruited, 0 refused / no subject, -1 fault.
+int probeRecruit(GameWorld* gw, bool runtimeSubject,
+                 unsigned int outHandBefore[5], unsigned int outHandAfter[5],
+                 float radius = 60.0f);
+
+// SEH-guarded: force the vendor at vHand to BUILD its stock. A ShopTrader's
+// Inventory is created lazily (null until the trade UI first opens - shop_probe
+// run 101952: every vendor read stock=-1), so a programmatic purchase must first
+// run the engine's own stock builder: the trader's ActivePlatoon::
+// refreshInventory(firstTime=true), the same path the shop-open flow schedules.
+// Returns 1 = inventory present (already or after refresh), 0 = still null,
+// -1 = fault/unresolved.
+int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]);
+
+// SEH-guarded PROBE (shop_probe): drive ONE programmatic purchase - the first
+// loose item of the vendor at vHand, bought by the character at buyerHand via
+// the engine's own Inventory::buyItem (called on the VENDOR inventory,
+// sendingTo = the buyer). Emits "[shop]" log lines with vendor money/stock and
+// buyer wallet BEFORE/AFTER so the oracle can measure exactly what one local
+// purchase mutates. Writes the bought template stringID to outSid.
+// Returns 1 bought (buyItem returned an item), 0 nothing-to-buy/refused,
+// -1 fault or unresolved prerequisites.
+int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
+                   const unsigned int buyerHand[5],
+                   char* outSid, unsigned int sidLen);
+
+// ---- Protocol 60: vendor stock ----------------------------------------------
+// Kenshi's shop stock lives in the shop's COUNTERS - storage furniture whose
+// UseableStuff::shopOwner names the trader character - and the trade UI's
+// ShopTrader wrapper only aggregates their sections. These readers expose the
+// counters and their owning trader so the vendor_stock scenario can compare
+// both clients' stock per trader.
+struct ShopCounterRead {
+    unsigned int hand[5];  // counter hand (readObjectHand layout)
+    unsigned int owner[5]; // UseableStuff::shopOwner: the trader's PLATOON hand
+                           // (type PLATOON; only container/containerSerial set)
+    int   classType;       // BuildingClassType
+    int   fn;              // Building::getSpecialFunction() (BF_SHOP = shop counter)
+    int   hasInv;          // getInventory() != null
+    int   nEntries;        // captured entries
+    int   qtyTotal;        // summed quantity
+    float x, y, z;
+    char  name[40];        // template name (diagnostics)
+};
+// SEH-guarded: every building within radius of the local leader that is a
+// shop counter (shopOwner set, or special function BF_SHOP). Returns count.
+unsigned int enumShopCountersNear(GameWorld* gw, float radius,
+                                  ShopCounterRead* out, unsigned int maxOut);
+// Trader character readout (identity + the engine's own trader predicates).
+struct TraderRead {
+    unsigned int hand[5];
+    int   isTrader;        // Character::isATrader (-1 unresolved)
+    int   platTrader;      // ActivePlatoon::getIsTrader (-1 unresolved)
+    int   hasVendorList;   // ActivePlatoon::getHasVendorList (-1 unresolved)
+    int   hasInv, nEntries, qtyTotal; // the character's own inventory
+    float x, y, z;
+    char  name[40];
+};
+// SEH-guarded read of the character at tHand. False when it does not resolve.
+bool readTraderByHand(const unsigned int tHand[5], TraderRead* out);
+// SEH-guarded: every character within radius of the local leader that the
+// engine calls a trader (Character::isATrader or its platoon's getIsTrader).
+unsigned int listTradersNear(GameWorld* gw, float radius, TraderRead* out,
+                             unsigned int maxOut);
+// SEH-guarded: open the engine's trade window between the buyer and the
+// trader exactly as the dialogue "Trade" option does (ForgottenGUI::
+// showTradeWindow, money trading). Returns 1 requested, 0 unresolved, -1 fault.
+int openTradeWindow(const unsigned int buyerHand[5], const unsigned int traderHand[5]);
+// SEH-guarded: close any open trade window.
+void closeTradeWindow();
+// SEH-guarded probe (manual T1): every open inventory window - its key hand,
+// the hand of the Inventory's owner and its item count - plus the GUI's current
+// trade target (inventoryWindowTrader). Returns the window count written.
+struct InvWindowRead {
+    unsigned int key[5];    // inventoryWindowsOpen key
+    unsigned int owner[5];  // getInventory()->owner hand (0s if none)
+    int          items;     // getInventory()->_allItems.size(), -1 if no inventory
+};
+unsigned int readInventoryWindows(InvWindowRead* out, unsigned int maxOut,
+                                  unsigned int traderOut[5]);
+// ---- Trader lock + shop hand-over (protocol 65) ----------------------------
+// The trade window shows a ShopTrader's own aggregated Inventory (created lazily
+// when the window opens) and money - not the shop counters.
+// SEH-guarded: true while a trade window with a ShopTrader is open locally;
+// traderHand = that ShopTrader's trader CHARACTER (raw, save-stable hand).
+bool localTradeTarget(unsigned int traderHand[5]);
+// SEH-guarded: the shop of the trader character at traderHand - its stock
+// (top-level entries) and money. Found through the OPEN trade window (a
+// ShopTrader is non-physical; world queries miss it). Returns the entry count,
+// or -1 when that shop is not open / does not exist here.
+int captureTraderStock(GameWorld* gw, const unsigned int traderHand[5], InvItemEntry* out,
+                       unsigned int maxOut, int* outMoney, bool* outTruncated);
+// SEH-guarded: set the trader platoon's money, and make the shop hold exactly
+// `items` (additive-only when truncated). 1 applied, 0 money set but the shop
+// stock is not reachable (window closed) - apply again at the next open, -1 fault.
+int applyTraderStock(GameWorld* gw, const unsigned int traderHand[5], const InvItemEntry* items,
+                     unsigned int count, bool truncated, int money);
+// SEH-guarded (tests): buy the first loose ONE-UNIT stack of the trader's SHOP stock
+// (the trade window's own inventory) into buyerHand. 1 bought, 0 nothing to buy,
+// -1 no shop stock here (the window was never opened) / fault.
+int traderBuyOne(GameWorld* gw, const unsigned int traderHand[5],
+                 const unsigned int buyerHand[5], char* outSid, unsigned int sidLen,
+                 int* outQty);
+// SEH-guarded: ONE purchase exactly as the trade window performs it - the
+// engine's Inventory::buyItem on the stock container at srcHand (debits the
+// player pool, credits the shop, takes the stack out of stock), then the
+// returned stack is put into the buyer's inventory EXACTLY once: buyItem
+// sometimes places it into the buyer itself, otherwise this is the drop half of
+// the UI drag. pickLast selects the last loose stack instead of the first.
+// Writes the bought sid + units and logs "[vendor] TRADE-PLACE" (how the stack
+// went in, how often the receiver holds it).
+// Returns 1 bought, 0 nothing to buy / refused, -1 fault or unresolved.
+int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
+                  const unsigned int buyerHand[5], bool pickLast,
+                  char* outSid, unsigned int sidLen, int* outQty);
+// A SALE is the same call with the roles swapped (srcHand = the seller's
+// character, buyerHand = the shop counter): the engine debits the counter's
+// cash, credits the player pool, and the stack lands on the counter.
+// SEH-guarded (protocol 60): the shop's cash as the counter reports it
+// (RootObject::getMoney - the money a trade at this counter moves).
+bool readShopCash(const unsigned int cHand[5], int* outCash);
+// SEH-guarded: move the counter's cash to `target` through the engine's own
+// takeMoney (a negative amount pays in). *outAfter = the re-read value.
+bool setShopCash(const unsigned int cHand[5], int target, int* outAfter);
+// Protocol 60, the join's half of host-owned stock: a trader's own stock
+// refresh (ActivePlatoon::refreshInventory) must not restock a shop whose
+// counters the host mirrors, or the join would show - and report back as
+// trades - goods the host never made. The gate is asked with the platoon's
+// hand container fields (what shopOwner names); true skips the refresh
+// ("[vendor] REFRESH-SKIP"). A null gate (host, sync off) never skips.
+typedef bool (*VendorRefreshGateFn)(unsigned int platContainer, unsigned int platSerial);
+void setVendorRefreshGate(VendorRefreshGateFn fn);
+// Detour ActivePlatoon::refreshInventory: every trader refresh logs
+// "[vendor] REFRESH" and consults the gate above.
+bool installVendorHooks();
+
+// ---- Consensus game-speed sync ----------------------------------------------
+
+// SEH-guarded read of the world's speed state: *mult = frameSpeedMult,
+// *paused = the user-pause flag. Returns false on fault/null.
+bool readGameSpeed(GameWorld* gw, float* mult, bool* paused);
+
+// ---- Protocol 25: game-clock sync --------------------------------------------
+// SEH-guarded read of the world's game clock: *outHours = the engine's
+// in-game-hours TimeOfDay (GameWorld::getTimeStamp_inGameHours - whether it is
+// absolute campaign time or hours-since-load is a time_probe question),
+// *outHourLenSec = real seconds per game hour. -1 sentinels on failure.
+// There is NO clock writer: a timeStamper-base step was prototyped and
+// rejected (the calendar does not derive from that timer - Engine.cpp note);
+// the Replicator corrects offsets by slewing the sim speed instead.
+bool readGameClock(GameWorld* gw, double* outHours, float* outHourLenSec);
+
+// SEH-guarded write through the engine's OWN setters (GameWorld::userPause +
+// GameWorld::setGameSpeed) so the UI speed buttons track the applied state
+// exactly like a real click. mult <= 0 means paused (the wire convention);
+// the pre-pause multiplier is left alone so unpausing restores it. Returns
+// false on fault/null/unresolved setters. This IS the loud "user clicked"
+// path: the speed-intent hooks see it, so scenarios use it as a simulated
+// click and the replicator must NEVER use it for the arbitrated apply.
+bool writeGameSpeed(GameWorld* gw, float mult, bool paused);
+
+// The QUIET write (vote/effective decoupling): drive the actual sim speed via
+// GameWorld::setFrameSpeedMultiplier + userPause WITHOUT updating the UI speed
+// buttons and WITHOUT registering as user intent (reentrancy-guarded against
+// the intent hooks). The buttons keep showing the player's last click (their
+// VOTE); the replicator enforces the arbitrated min(host, join) underneath.
+bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused);
+
+// Speed-intent capture (the vote source). Two complementary detectors,
+// because the MainBar click handler writes the speed INLINE (2026-07-08
+// manual-session finding: real UI clicks never reach a setGameSpeed detour):
+//   * hooks on setGameSpeed/userPause/togglePause catch every call that DOES
+//     route through the public setters (scenario writeGameSpeed clicks);
+//   * a per-tick poll catches the rest: engine state deviating from our last
+//     QUIET write = a real click / keyboard pause / RE_Kenshi; the button
+//     highlight deviating from the vote snapshot = a click on the speed
+//     EQUAL to the current effective (the stuck-vote case - engine state
+//     doesn't move, but the UI highlight does).
+// consumeSpeedIntent returns true once per new intent and fills the
+// requested state (intent pause preserves the requested multiplier,
+// mirroring the engine's model).
+bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused);
+
+// SEH-guarded: is a dialogue open on this client's GUI (ForgottenGUI::
+// inDialogue)? A dialogue auto-pauses the engine, and that pause is the
+// engine's, not the player's vote. False when the GUI is not up.
+bool inDialogue();
+
+// Install the three intent detours (setGameSpeed / userPause / togglePause)
+// and seed the intent state from the live engine so the first vote reflects
+// the save's starting speed. Call once, from the main thread, after gameplay
+// is live. Returns false when any target fails to resolve or hook.
+bool installSpeedIntentHooks(GameWorld* gw);
+
+// Spike probe (KENSHICOOP_SPEED_PROBE=1): read the MainBar speed-button
+// selected states into out (one char per button, '0'/'1', NUL-terminated;
+// cap n-1 buttons). Returns the button count read, -1 when the GUI isn't up.
+int readSpeedButtons(char* out, int n);
+
+// Phase 5: publish the combat-cap-active state (from syncSpeed) so the
+// speed-path diagnostics can attribute an engine-forced cap vs a user click.
+void setSpeedCombatHint(bool inCombat);
+
+// Phase 5: force the MyGUI speed buttons back onto the captured vote when the
+// live highlight has drifted (engine dialog auto-pause / combat cap / a
+// click=false dehighlight). No-op when already matching. Gate the call on "no
+// user acted this tick" so a genuine same-frame click is not fought.
+void reconcileVoteButtons();
+
+// ---- CharCreate: join character creation (EngineCharGen.cpp, protocol 57) ----
+// All SEH-guarded. The marker is idata "kenshicoop chargen" in the appearance
+// GameData (persists through the save via AppearanceBase::serialise).
+bool chargenHasMarker(Character* c);
+bool chargenSetMarker(Character* c);
+// True when the body comes from a KenshiCoop co-op game start (its GameData
+// template is "<n>-KenshiCoop-MultiplayerStart.mod") - a fresh co-op character.
+bool chargenIsCoopStartChar(Character* c);
+// True when the RACE GameData 'sid' exists in this game's loaded data.
+bool chargenRaceKnown(GameWorld* gw, const char* sid);
+// Race GameData stringID of the body ('' when unknown).
+void chargenRaceSid(Character* c, char* out, unsigned int cap);
+// Open the native editor (EDIT_NEWGAME, all playable races) on chars[0..n).
+// False when an editor is already open or on fault.
+bool chargenOpenEditor(Character** chars, unsigned int n);
+// True while ForgottenGUI::characterEditor is non-null.
+bool chargenEditorOpen();
+// Test hook: randomise + next race + name every edited body, then confirm.
+bool chargenAutoConfirm(const char* name);
+// Test hook: confirm the open editor as it is (e.g. the host's own New Game
+// squad), every character counted as reviewed.
+bool chargenConfirmEditor();
+// Export the body's appearance as .bod2 bytes (the editor's exporter path).
+bool chargenExport(Character* c, std::vector<unsigned char>& out);
+// Load .bod2 bytes back and hand them to setAppearanceData; then setName.
+bool chargenApply(Character* c, const std::vector<unsigned char>& bod2, const char* name);
+// ---- end CharCreate ----
+
+} // namespace engine
+} // namespace coop
+
+#endif // KENSHICOOP_ENGINE_H

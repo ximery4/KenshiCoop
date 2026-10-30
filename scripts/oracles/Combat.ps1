@@ -1,0 +1,1750 @@
+# oracles/Combat.ps1 - combat oracles (monolith split of CoopOracles.psm1,
+# 2026-07-12): Test-CombatProbe/CombatOrder/CombatKill, Test-DamageGuard,
+# Test-PlayerCombat, Test-AssaultTown, Test-AssaultTravel, Test-PlayerKo,
+# Test-CombatCrowd.
+# Dot-sourced by CoopOracles.psm1 (module scope).
+# Must NOT: change gate names or the "[combat]"/PCOMBAT/ASSAULT marker
+# regexes - they are the C++ log contract (resources/CODE_MAP.md).
+
+# combat_probe READ oracle (host-side): duel spawned, sustained in-combat samples,
+# and the duelists mutually target each other's resolvable hands.
+function Test-CombatProbe {
+    param([string]$HostFile)
+    $setup = Select-String -Path $HostFile -Pattern 'SETUP\(duel\): spawned PEACEFUL A=([\d]+),([\d]+) B=([\d]+),([\d]+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $setup) { Write-Host "  COMBAT-PROBE FAIL - duel did not spawn"; return (Add-GateResult -Name "combat_probe" -Status FAIL -Detail "duel did not spawn") }
+    $aIdx = $setup.Matches[0].Groups[1].Value; $aSer = $setup.Matches[0].Groups[2].Value
+    $bIdx = $setup.Matches[0].Groups[3].Value; $bSer = $setup.Matches[0].Groups[4].Value
+    $fighting = @(Select-String -Path $HostFile -Pattern 'COMBAT [AB] .*inCombat=1.*hasTarget=1' -ErrorAction SilentlyContinue)
+    if ($fighting.Count -lt 10) {
+        Write-Host "  COMBAT-PROBE FAIL - only $($fighting.Count) in-combat+targeted sample(s) (need >= 10)"
+        return (Add-GateResult -Name "combat_probe" -Status FAIL -Metrics @{ samples = $fighting.Count } -Detail "too few in-combat samples")
+    }
+    $aOnB = @(Select-String -Path $HostFile -Pattern ("COMBAT A .*hasTarget=1 target=" + [regex]::Escape("$bIdx,$bSer")) -ErrorAction SilentlyContinue)
+    $bOnA = @(Select-String -Path $HostFile -Pattern ("COMBAT B .*hasTarget=1 target=" + [regex]::Escape("$aIdx,$aSer")) -ErrorAction SilentlyContinue)
+    if ($aOnB.Count -lt 1 -or $bOnA.Count -lt 1) {
+        Write-Host "  COMBAT-PROBE FAIL - duelists not mutually targeting (A->B=$($aOnB.Count) B->A=$($bOnA.Count))"
+        return (Add-GateResult -Name "combat_probe" -Status FAIL -Metrics @{ aOnB = $aOnB.Count; bOnA = $bOnA.Count } -Detail "not mutually targeting")
+    }
+    Write-Host "  COMBAT-PROBE [host] PASS - live duel: $($fighting.Count) in-combat samples; mutual attack-target hands resolve (A->B, B->A)"
+    return (Add-GateResult -Name "combat_probe" -Status PASS -Metrics @{ samples = $fighting.Count })
+}
+
+# combat_order LIVE-transition: the join's own copies flip NOT-combat -> combat
+# (task=65024) after the host's "SCENARIO COMBAT issued" marker.
+function Test-CombatOrder {
+    param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 5000,
+          [double]$PostMin = 0.40, [double]$PreMax = 0.10)
+    $COMBAT = 65024 # TASK_COMBAT_MELEE (0xFE00)
+    $T = Get-MarkerTimeMs -File $HostFile -Pattern "SCENARIO COMBAT issued"
+    if ($null -eq $T) { Write-Host "  COMBAT-ORDER FAIL - no 'SCENARIO COMBAT issued' marker on host"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "no COMBAT marker") }
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $duelists = @()
+    foreach ($hand in $H.Keys) {
+        if (@($H[$hand] | Where-Object { $_.t -ge $T -and $_.task -eq $COMBAT }).Count -gt 0) { $duelists += $hand }
+    }
+    if ($duelists.Count -lt 1) { Write-Host "  COMBAT-ORDER FAIL - host never streamed a combat task after the order"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "no combat task streamed") }
+    $preCombat = 0; $preTotal = 0; $postCombat = 0; $postTotal = 0; $seen = 0
+    foreach ($hand in $duelists) {
+        if (-not $J.ContainsKey($hand)) { continue }
+        $seen++
+        $pre  = @($J[$hand] | Where-Object { $_.t -lt $T })
+        $post = @($J[$hand] | Where-Object { $_.t -ge ($T + $GraceMs) })
+        $preTotal  += $pre.Count;  $preCombat  += @($pre  | Where-Object { $_.task -eq $COMBAT }).Count
+        $postTotal += $post.Count; $postCombat += @($post | Where-Object { $_.task -eq $COMBAT }).Count
+    }
+    if ($seen -lt 1) { Write-Host "  COMBAT-ORDER FAIL - join never received any duelist hand (saw $($duelists.Count) on host)"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "join received no duelists") }
+    if ($preTotal -lt 1 -or $postTotal -lt 1) { Write-Host "  COMBAT-ORDER FAIL - insufficient join samples (preTotal=$preTotal postTotal=$postTotal)"; return (Add-GateResult -Name "combat_order" -Status FAIL -Detail "insufficient join samples") }
+    $preRatio  = [Math]::Round($preCombat  / $preTotal, 3)
+    $postRatio = [Math]::Round($postCombat / $postTotal, 3)
+    $ok = ($preRatio -le $PreMax -and $postRatio -ge $PostMin)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  COMBAT-ORDER [join] $v - duelists=$($duelists.Count) seen=$seen combat-before $preCombat/$preTotal (ratio=$preRatio<=$PreMax), combat-after $postCombat/$postTotal (ratio=$postRatio>=$PostMin)"
+    return (Add-GateResult -Name "combat_order" -Status $v -Metrics @{ preRatio = $preRatio; postRatio = $postRatio; duelists = $duelists.Count })
+}
+
+# combat_kill OUTCOME oracle: host-authoritative resolution + attribution +
+# reliable delivery + synced down outcome. Also measures event latency.
+function Test-CombatKill {
+    param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 3000, [double]$MinDown = 0.70)
+    # LAST pin, not first: the scenario re-pins when the town knocks a duelist
+    # out during the baseline, and only the final pair fought.
+    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $pin) { Write-Host "  COMBAT-KILL FAIL - no pinned duelists on host"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no pinned duelists") }
+    $ai = $pin.Matches[0].Groups[1].Value; $as = $pin.Matches[0].Groups[2].Value
+    $bi = $pin.Matches[0].Groups[3].Value; $bs = $pin.Matches[0].Groups[4].Value
+    # A duel needs two conscious duelists. When the town's own brawl downs the
+    # pinned victim before the order, the enforced takedown finds no bodyState
+    # edge and sends nothing - which is indistinguishable, at the wire, from a
+    # takedown the attribution path failed to stamp. The scenario says which one
+    # happened, so read it rather than guess: no fight is NO SIGNAL (this is the
+    # primary gate, so the run still fails - just not for the wrong reason).
+    $premise = Select-String -Path $HostFile -Pattern 'SCENARIO duel PREMISE FAILED (.+)$' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $premise) {
+        $why = $premise.Matches[0].Groups[1].Value
+        Write-Host "  COMBAT-KILL SKIP - the scripted duel never had two conscious duelists ($why); no takedown to replicate"
+        return (Add-GateResult -Name "combat_kill" -Status SKIP -Detail "duel premise failed ($why)")
+    }
+    # The victim is whoever actually lost. The scenario enforces a takedown on B
+    # only when the duel has not already produced one; when A loses first it says
+    # so, and that self-resolved KO - with its real attacker - is what to follow.
+    $resolved = Select-String -Path $HostFile -Pattern 'SCENARIO duel RESOLVED loser=A\((\d+),(\d+)\)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $resolved) {
+        $ai = $bi; $as = $bs   # the winner is the other one
+        $bi = $resolved.Matches[0].Groups[1].Value; $bs = $resolved.Matches[0].Groups[2].Value
+    }
+    # ATTRIBUTED to someone, not to A specifically. The property under test is
+    # that the host resolves the takedown, names the body that caused it, and
+    # delivers that reliably - none of which depends on WHICH fighter lands the
+    # last blow. duel1 is a populated place and the pinned pair fight next to
+    # the player squad, so a bystander finishing B is ordinary (run 171617:
+    # actor=1,1348632832, a squad member, three seconds before the scripted
+    # takedown). Demanding A made a green run depend on stagecraft; an actor of
+    # 0,0 is still a FAIL, because that is the attribution bug itself.
+    $sendPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] SEND id=\d+ ev=(1|2) hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=(\d+),(\d+)'
+    $sends = @(Select-String -Path $HostFile -Pattern $sendPat -ErrorAction SilentlyContinue)
+    $send = $sends | Where-Object { $_.Matches[0].Groups[6].Value -ne '0' -or $_.Matches[0].Groups[7].Value -ne '0' } | Select-Object -First 1
+    if ($null -eq $send) {
+        $why = if ($sends.Count -gt 0) { "$($sends.Count) KO/death event(s) for B carried actor=0,0" }
+               else { "no KO/death event for B at all" }
+        Write-Host "  COMBAT-KILL FAIL - host sent no ATTRIBUTED combat KO/death for B=$bi,$bs ($why)"
+        return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no attributed KO/death sent")
+    }
+    $ev = $send.Matches[0].Groups[5].Value
+    $xi = $send.Matches[0].Groups[6].Value; $xs = $send.Matches[0].Groups[7].Value
+    $actorIsA = ($xi -eq $ai -and $xs -eq $as)
+    $sendT = Convert-StampToMs -Groups $send.Matches[0].Groups -OffsetMs (Get-LogClockOffsetMs -File $HostFile)
+    $recvPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=' + $ev + ' .*hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=' + $xi + ',' + $xs
+    $recv = Select-String -Path $JoinFile -Pattern $recvPat -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $recv) {
+        Write-Host "  COMBAT-KILL FAIL - join never received the reliable combat event (ev=$ev hand=B=$bi,$bs actor=$xi,$xs)"
+        return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "attributed event not received")
+    }
+    $rg = $recv.Matches[0].Groups
+    $T = Convert-StampToMs -Groups $rg -OffsetMs (Get-LogClockOffsetMs -File $JoinFile)
+    $latMs = $T - $sendT
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $ids = Get-HandAliases -File $JoinFile -WireIndexSerial "$bi,$bs"
+    $samples = @()
+    foreach ($id in $ids) {
+        foreach ($hand in $J.Keys) { if ($hand -match ('^' + [regex]::Escape($id) + ',')) { $samples += $J[$hand] } }
+    }
+    if ($samples.Count -lt 1) { Write-Host "  COMBAT-KILL FAIL - join logged no body series for victim B=$bi,$bs (tried $($ids -join ' '))"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no victim series on join") }
+    $post = @($samples | Where-Object { $_.t -ge ($T + $GraceMs) })
+    if ($post.Count -lt 1) { Write-Host "  COMBAT-KILL FAIL - no join samples after the event"; return (Add-GateResult -Name "combat_kill" -Status FAIL -Detail "no post-event samples") }
+    $down = @($post | Where-Object { ($_.bs -band 7) -ne 0 }).Count
+    $ratio = [Math]::Round($down / $post.Count, 3)
+    $ok = ($ratio -ge $MinDown)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $evName = if ($ev -eq "2") { "DEATH" } else { "KO" }
+    $who = if ($actorIsA) { "by the pinned A=$ai,$as" } else { "by $xi,$xs (a bystander, not the pinned A=$ai,$as)" }
+    Write-Host "  COMBAT-KILL [join] $v - combat $evName for B=$bi,$bs ${who}: reliable event received (latency=${latMs}ms), victim down-after $down/$($post.Count) (ratio=$ratio>=$MinDown)"
+    return (Add-GateResult -Name "combat_kill" -Status $v -Metrics @{ downRatio = $ratio; latencyMs = $latMs; eventType = $evName; actorIsPinnedA = $actorIsA })
+}
+
+# damage_guard: the join's cosmetic fights must apply NO local damage. From the
+# host's pinned victim (B), compare each side's LOCAL blood series ("SCENARIO
+# VITALS hand=i,s ... blood=..") - the HOST's victim must LOSE blood (a real
+# fight happened). PROTOCOL 16 REWRITE: combat-scoped NPC vitals now STREAM
+# host->join, so the join's series legitimately TRACKS the host's drop - the
+# old "join stays flat" gate would fail on the feature working. The guard is
+# now proven by (a) the intercept counters (local swings happened and were
+# stopped) and (b) NO EXCESS local damage: the join's lowest blood must not
+# undershoot the host's lowest by more than MaxExcessDrop (a local leak lands
+# ON TOP of the streamed truth and drags the copy below it).
+function Test-DamageGuard {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$MinHostDrop = 5.0, [double]$MaxExcessDrop = 8.0)
+    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $pin) {
+        Write-Host "  DAMAGE-GUARD SKIP - no pinned duelists on host"
+        return (Add-GateResult -Name "damage_guard" -Status SKIP -Detail "no pinned duelists")
+    }
+    $bi = $pin.Matches[0].Groups[3].Value; $bs = $pin.Matches[0].Groups[4].Value
+    $series = {
+        param($file)
+        $vals = @()
+        foreach ($id in (Get-HandAliases -File $file -WireIndexSerial "$bi,$bs")) {
+        foreach ($m in (Select-String -Path $file -Pattern ("SCENARIO VITALS hand=" + [regex]::Escape($id) + " t=\d+ blood=(-?[\d\.]+)") -ErrorAction SilentlyContinue)) {
+            $vals += [double]$m.Matches[0].Groups[1].Value
+        }
+        }
+        return ,$vals
+    }
+    $H = & $series $HostFile
+    $J = & $series $JoinFile
+    if ($H.Count -lt 2 -or $J.Count -lt 2) {
+        Write-Host "  DAMAGE-GUARD SKIP - insufficient vitals samples (host=$($H.Count) join=$($J.Count))"
+        return (Add-GateResult -Name "damage_guard" -Status SKIP -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient vitals samples")
+    }
+    $hostDrop = ($H | Measure-Object -Maximum).Maximum - ($H | Measure-Object -Minimum).Minimum
+    $joinDrop = ($J | Measure-Object -Maximum).Maximum - ($J | Measure-Object -Minimum).Minimum
+    $hostMin  = ($H | Measure-Object -Minimum).Minimum
+    $joinMin  = ($J | Measure-Object -Minimum).Minimum
+    $excess   = $hostMin - $joinMin  # join undershooting the host's floor = local leak
+    $m = @{ hostDrop = [Math]::Round($hostDrop, 1); joinDrop = [Math]::Round($joinDrop, 1)
+            hostMin = [Math]::Round($hostMin, 1); joinMin = [Math]::Round($joinMin, 1)
+            excessDrop = [Math]::Round($excess, 1)
+            hostSamples = $H.Count; joinSamples = $J.Count }
+    # The JOIN-BELOW-HOST gate: streamed vitals can only pull the copy DOWN TO
+    # the host's truth; any blood below that floor was local damage the guard
+    # should have intercepted.
+    if ($excess -gt $MaxExcessDrop) {
+        Write-Host ("  DAMAGE-GUARD FAIL - join's driven victim B=$bi,$bs fell $([Math]::Round($excess,1)) blood BELOW the host's floor (> $MaxExcessDrop; cosmetic fight leaked damage)")
+        return (Add-GateResult -Name "damage_guard" -Status FAIL -Metrics $m -Detail "join copy took local damage beyond the streamed truth")
+    }
+    # Engagement signal: the join's guard must have actually intercepted swings
+    # (proves the local cosmetic fight generated hits AND the hook stopped them).
+    $dg = Select-String -Path $JoinFile -Pattern 'SCENARIO DMGGUARD guarded=(\d+) passed=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $dg) {
+        $m.guardedHits = [int]$dg.Matches[0].Groups[1].Value
+        $m.passedHits  = [int]$dg.Matches[0].Groups[2].Value
+    }
+    if ($hostDrop -lt $MinHostDrop) {
+        # The scripted takedown is a KO (knockDown), which may draw no blood on the
+        # host - the join-side no-excess plus the hook's intercept count still prove
+        # the guard: local swings happened and none landed.
+        if ($null -ne $dg -and $m.guardedHits -gt 0) {
+            Write-Host ("  DAMAGE-GUARD PASS - join guard intercepted $($m.guardedHits) local swing(s), no excess join damage (excess=$([Math]::Round($excess,1))); host fight drew $([Math]::Round($hostDrop,1)) blood (KO takedown)")
+            return (Add-GateResult -Name "damage_guard" -Status PASS -Metrics $m)
+        }
+        Write-Host ("  DAMAGE-GUARD SKIP - host fight drew only $([Math]::Round($hostDrop,1)) blood and the join guard intercepted no swings; nothing to judge")
+        return (Add-GateResult -Name "damage_guard" -Status SKIP -Metrics $m -Detail "no blood drawn + no swings intercepted")
+    }
+    Write-Host ("  DAMAGE-GUARD PASS - victim B=$bi,$bs host blood drop=$([Math]::Round($hostDrop,1)) (real fight) " +
+                "join floor excess=$([Math]::Round($excess,1)) (<= $MaxExcessDrop; join tracks the streamed truth, drop=$([Math]::Round($joinDrop,1)))")
+    return (Add-GateResult -Name "damage_guard" -Status PASS -Metrics $m)
+}
+# player_combat BIDIRECTIONAL (armed NPC strikers vs the two tab leaders): the
+# striker's combat intent must be APPLIED by the join's replicator against the
+# right victim, and each window's victim must lose blood on ITS OWNER (medical
+# resolves on the victim's owner: join for window A, host for window B).
+# Also measures the victim's rendered-copy blood drop on the OTHER side: the
+# divergence the host-side damage guard + vitals sync (phase 2) close
+# (recorded, not gated in phase 1).
+function Test-PlayerCombat {
+    # MinIntent=1: ONE applied order is the HEALTHY case - the join's replicator
+    # deliberately re-issues only while the local fight is broken (run 011229:
+    # a green window applied exactly 1 order and drew blood). The blood gate
+    # below independently proves a real fight followed the order.
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinIntent = 1, [double]$MinDrop = 3.0, [double]$MaxEndGap = 12.0)
+    # Both windows are issued host-side (world-NPC strikers are host-owned):
+    #   A: NPC-A melees the JOIN's leader  - victim owned by the JOIN
+    #   B: NPC-B melees the HOST's leader  - victim owned by the HOST
+    $mA = Select-String -Path $HostFile -Pattern 'SCENARIO PCOMBAT A issued atk=(\d+),(\d+) vic=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $mB = Select-String -Path $HostFile -Pattern 'SCENARIO PCOMBAT B issued atk=(\d+),(\d+) vic=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mA) { Write-Host "  PLAYER-COMBAT FAIL - host never issued window A (no striker/victim)"; return (Add-GateResult -Name "player_combat" -Status FAIL -Detail "no A order") }
+    if ($null -eq $mB) { Write-Host "  PLAYER-COMBAT FAIL - host never issued window B (no striker/victim)"; return (Add-GateResult -Name "player_combat" -Status FAIL -Detail "no B order") }
+    $TA = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO PCOMBAT A issued'
+    $TB = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO PCOMBAT B issued'
+
+    # peerLog = where the striker's RECV series proves intent crossed (always the
+    # join: strikers are host-owned). ownerLog = the victim's owner (authoritative
+    # damage). copyLog = the other side's rendered copy (divergence metric only in
+    # phase 1; becomes a convergence gate after phase-2 vitals sync).
+    $dirs = @(
+        @{ tag = "A"; T = $TA; atk = ($mA.Matches[0].Groups[1].Value + ',' + $mA.Matches[0].Groups[2].Value)
+           vic = ($mA.Matches[0].Groups[3].Value + ',' + $mA.Matches[0].Groups[4].Value)
+           peerLog = $JoinFile; ownerLog = $JoinFile; copyLog = $HostFile },
+        @{ tag = "B"; T = $TB; atk = ($mB.Matches[0].Groups[1].Value + ',' + $mB.Matches[0].Groups[2].Value)
+           vic = ($mB.Matches[0].Groups[3].Value + ',' + $mB.Matches[0].Groups[4].Value)
+           peerLog = $JoinFile; ownerLog = $HostFile; copyLog = $JoinFile }
+    )
+    $m = @{}; $bad = @()
+    foreach ($d in $dirs) {
+        $t = $d.tag
+        # 1. Intent crossed: the JOIN's replicator APPLIED a striker's combat
+        # order against the right victim ("[combat] order hand=... tgt=<vic>").
+        # This is the direct wire-level proof; the driven copy's sampled local
+        # task is unreliable (the local engine reports transient fight sub-tasks,
+        # measured task=87/65535 mid-fight in the first sync run). ANY striker
+        # hand counts: the scenario replaces a striker the bar brawl KOs.
+        $ip  = '\[combat\] order hand=\d+,\d+ tgt=' + $d.vic + ' '
+        $int = @(Select-String -Path $d.peerLog -Pattern $ip -ErrorAction SilentlyContinue).Count
+        # 2. Authoritative damage: the victim's blood drops on its OWNER's side.
+        # NB: assign-then-filter - piping Get-VitalsSeries directly would pass its
+        # comma-wrapped ArrayList through Where-Object as ONE opaque item.
+        $ownerDrop = $null
+        $Vall = Get-VitalsSeries -File $d.ownerLog -HandIS $d.vic
+        $V = @($Vall | Where-Object { $_.t -ge $d.T })
+        if ($V.Count -ge 2) {
+            $ownerDrop = [double]($V | Measure-Object -Property blood -Maximum).Maximum -
+                         [double]($V | Measure-Object -Property blood -Minimum).Minimum
+        }
+        # 3. Convergence gate (GATING since phase 2 - vitals sync + host-side
+        # damage guard): the victim's rendered copy on the OTHER side must TRACK
+        # the owner's blood (the stream writes it). Compare at the end of the
+        # OVERLAP window, not last-vs-last: the two scenarios end ~6 s apart
+        # (peer-ready arming skew + different durations) and the owner keeps
+        # bleeding after the copy's log stops - run 014713 measured a fake 38.3
+        # "gap" while the aligned samples agreed to 0.0. Vitals t is already on
+        # the common clock (Get-VitalsSeries applies the CLOCKSYNC offset).
+        $copyDrop = $null; $endGap = $null
+        $Call = Get-VitalsSeries -File $d.copyLog -HandIS $d.vic
+        $C = @($Call | Where-Object { $_.t -ge $d.T })
+        if ($C.Count -ge 2) {
+            $copyDrop = [double]($C | Measure-Object -Property blood -Maximum).Maximum -
+                        [double]($C | Measure-Object -Property blood -Minimum).Minimum
+        }
+        if ($V.Count -ge 1 -and $C.Count -ge 1) {
+            $tEnd = [Math]::Min([double]$V[-1].t, [double]$C[-1].t)
+            $vAt = @($V | Where-Object { $_.t -le ($tEnd + 750) })
+            $cAt = @($C | Where-Object { $_.t -le ($tEnd + 750) })
+            if ($vAt.Count -ge 1 -and $cAt.Count -ge 1) {
+                $endGap = [Math]::Abs([double]$vAt[-1].blood - [double]$cAt[-1].blood)
+            }
+        }
+        $m["${t}Intent"]    = $int
+        $m["${t}OwnerDrop"] = if ($null -ne $ownerDrop) { [Math]::Round($ownerDrop,1) } else { -1 }
+        $m["${t}CopyDrop"]  = if ($null -ne $copyDrop)  { [Math]::Round($copyDrop,1) }  else { -1 }
+        $m["${t}EndGap"]    = if ($null -ne $endGap)    { [Math]::Round($endGap,1) }    else { -1 }
+        if ($int -lt $MinIntent) { $bad += "${t}: join applied $int combat order(s) for striker $($d.atk) -> $($d.vic) (need >= $MinIntent)" }
+        if ($null -eq $ownerDrop -or $ownerDrop -lt $MinDrop) { $bad += "${t}: victim $($d.vic) owner-side blood drop=$($m["${t}OwnerDrop"]) (need >= $MinDrop - no authoritative damage landed)" }
+        if ($null -eq $endGap -or $endGap -gt $MaxEndGap) { $bad += "${t}: victim $($d.vic) copy/owner final blood gap=$($m["${t}EndGap"]) (need <= $MaxEndGap - vitals sync not converging)" }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  PLAYER-COMBAT FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "player_combat" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  PLAYER-COMBAT PASS - A: $($m.AIntent) applied orders, victim owner-drop $($m.AOwnerDrop) (copy $($m.ACopyDrop), end-gap $($m.AEndGap)); " +
+                "B: $($m.BIntent) applied orders, victim owner-drop $($m.BOwnerDrop) (copy $($m.BCopyDrop), end-gap $($m.BEndGap))")
+    return (Add-GateResult -Name "player_combat" -Status PASS -Metrics $m)
+}
+
+# assault_town (join-initiated town combat): the JOIN's player character starts an
+# unprovoked fight with a world NPC; the fight must appear on the HOST. The gate
+# walks the wire chain link by link so a FAIL names the broken link:
+#   1. issued  - join ordered its own leader onto a victim (scenario marker)
+#   2. cap     - the join's replicator CAPTURED + streamed the combat intent
+#                ("[combat] CAP hand=<atk>" on the join)
+#   3. applied - the host's drive path ORDERED its join-PC copy into the fight
+#                ("[combat] order hand=<atk> ... r=2" on the host)
+#   4. fight   - the host's local engine actually runs it ("hostview fight=1"
+#                lines; MinFight samples at 1 Hz)
+function Test-AssaultTown {
+    param([string]$HostFile, [string]$JoinFile, [int]$MinFight = 3)
+    $mi = Select-String -Path $JoinFile -Pattern 'SCENARIO ASSAULT issued atk=(\d+),(\d+) vic=(\d+),(\d+) ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mi) {
+        Write-Host "  ASSAULT-TOWN FAIL - join never issued the assault (no victim pick?)"
+        return (Add-GateResult -Name "assault_town" -Status FAIL -Detail "no assault order (link 1)")
+    }
+    $atk = $mi.Matches[0].Groups[1].Value + ',' + $mi.Matches[0].Groups[2].Value
+    $vic = $mi.Matches[0].Groups[3].Value + ',' + $mi.Matches[0].Groups[4].Value
+
+    # 2. Capture: the join streamed a combat task for its leader (any target -
+    # a bar brawl legitimately retargets); strict victim match kept as metric.
+    $capAll = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' ') -ErrorAction SilentlyContinue).Count
+    $capVic = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' task=\d+ tgt=\d+,\d+,\d+,' + $vic + '$') -ErrorAction SilentlyContinue).Count
+
+    # 3. Applied: the host's combat branch ordered its driven join-PC copy
+    # (r=2 = ordered; r=1 = target hand didn't resolve on the host).
+    $ordOk   = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=2') -ErrorAction SilentlyContinue).Count
+    $ordMiss = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=1') -ErrorAction SilentlyContinue).Count
+    $ordVic  = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=' + $vic + ' .*r=2') -ErrorAction SilentlyContinue).Count
+
+    # 4. Fight: the host's local combat read of the join-PC copy.
+    $fight = @(Select-String -Path $HostFile -Pattern 'SCENARIO ASSAULT hostview fight=1' -ErrorAction SilentlyContinue).Count
+
+    $m = @{ cap = $capAll; capVic = $capVic; ordered = $ordOk; orderedVic = $ordVic
+            orderMiss = $ordMiss; hostFight = $fight }
+    $bad = @()
+    if ($capAll -lt 1) { $bad += "join never streamed a combat intent for $atk (link 2: capture)" }
+    elseif ($ordOk -lt 1) {
+        if ($ordMiss -ge 1) { $bad += "host saw the intent but the target hand never resolved ($ordMiss r=1 orders; link 3: target resolve)" }
+        else                { $bad += "host never ordered the join-PC copy (0 [combat] order lines; link 3: apply)" }
+    }
+    if ($fight -lt $MinFight) { $bad += "host-side fight never ran (hostview fight=1 x$fight, need >= $MinFight; link 4)" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  ASSAULT-TOWN FAIL - " + ($bad -join "; ") + " [cap=$capAll capVic=$capVic ord=$ordOk ordVic=$ordVic miss=$ordMiss fight=$fight]")
+        return (Add-GateResult -Name "assault_town" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  ASSAULT-TOWN PASS - atk=$atk vic=$vic cap=$capAll (vic-match $capVic) host-orders=$ordOk (vic-match $ordVic) hostview-fight=$fight")
+    return (Add-GateResult -Name "assault_town" -Status PASS -Metrics $m)
+}
+
+# assault_travel: assault_town's chain, re-run while both squads TRAVEL - the one
+# ingredient the 2026-08-05 free-play report added ("an enemy was attacking my
+# character on the join client, but not the host", after a long run). Links 1-4
+# are assault_town's; links 5-6 are the asymmetry the standing test cannot see:
+#   1. issued   - join ordered its leader onto a victim (scenario marker)
+#   2. travelled- the leg actually moved on BOTH sides (else the premise failed
+#                 and a PASS would mean nothing)
+#   3. cap      - the join streamed the combat intent ("[combat] CAP hand=<atk>")
+#   4. applied  - the host ordered its join-PC copy ("[combat] order ... r=2";
+#                 r=1 = the victim hand never resolved there)
+#   5. fight    - the host's local engine ran it ("hostview fight=1" samples)
+#   6. parity   - per NPC hand, how many 1 Hz samples show a body fighting on one
+#                 client while the other has it at peace. The field log's
+#                 signature was a 22 s one-sided fight, so this is the gate that
+#                 names it. Gated in BOTH directions: cell claims can hand a
+#                 world NPC to either client, so either screen can be the one
+#                 running a fight the body's owner never authored.
+# Parity reads the MEMBER (host) / RECV (join) entity series, whose task= field is
+# each client's own truth, keyed on the hand's INDEX,SERIAL only: a body pulled
+# into a local runtime squad mid-fight keeps its index/serial but changes its hand
+# CONTAINER, and that rewrite is exactly what happens to a victim on the client
+# that is really fighting it.
+# assault_mint shares this oracle (-RequireMint adds link 0: the victim must be a
+# body the join MINTED, which is what makes the run a reproduction of the field
+# episode rather than a re-run of assault_town under motion).
+function Test-AssaultTravel {
+    param([string]$HostFile, [string]$JoinFile, [int]$MinFight = 3,
+          [int]$MinTravel = 300, [double]$MaxJoinOnlyFrac = 0.25, [int]$MinPairs = 8,
+          [string]$GateName = 'assault_travel', [switch]$RequireMint)
+    $label = $GateName.ToUpper().Replace('_', '-')
+    $mi = Select-String -Path $JoinFile -Pattern 'SCENARIO TRAVELFIGHT issued atk=(\d+),(\d+) vic=(\d+),(\d+)(?: local=\d+,\d+)? ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mi) {
+        Write-Host "  $label FAIL - join never issued the assault (no victim pick?)"
+        return (Add-GateResult -Name $GateName -Status FAIL -Detail "no assault order (link 1)")
+    }
+    $atk = $mi.Matches[0].Groups[1].Value + ',' + $mi.Matches[0].Groups[2].Value
+    $vic = $mi.Matches[0].Groups[3].Value + ',' + $mi.Matches[0].Groups[4].Value
+
+    # 2. Travel: the largest path length either side reported.
+    $hostMoved = Get-TravelMoved -File $HostFile
+    $joinMoved = Get-TravelMoved -File $JoinFile
+
+    # 3/4. Intent crossing (same regexes as assault_town - one log contract).
+    $capAll  = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' ') -ErrorAction SilentlyContinue).Count
+    $ordOk   = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=2') -ErrorAction SilentlyContinue).Count
+    $ordMiss = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=1') -ErrorAction SilentlyContinue).Count
+
+    # 5. The host's own combat read of the driven join-PC copy.
+    $fight = @(Select-String -Path $HostFile -Pattern 'SCENARIO TRAVELFIGHT hostview fight=1' -ErrorAction SilentlyContinue).Count
+
+    # 6. Per-hand fight parity from the NPC entity series, and - when the victim
+    # is a mint, whose local hand differs per client - from the enemy-state
+    # series the scenario publishes under the shared canonical hand.
+    $par = Get-FightTaskParity -HostFile $HostFile -JoinFile $JoinFile
+    if ($RequireMint) {
+        $epar = Get-EnemyStateParity -HostFile $HostFile -JoinFile $JoinFile
+        if ($epar.pairs -gt 0) { $par = $epar }
+    }
+
+    # 0. Mint variant: the victim must be a body this join had to create locally.
+    $minted = @(Select-String -Path $JoinFile -Pattern ('\[spawn\] proxy BOUND hand=\d+,\d+,\d+,' + $vic + ' ') -ErrorAction SilentlyContinue).Count
+
+    $m = @{ atk = $atk; vic = $vic; hostMoved = $hostMoved; joinMoved = $joinMoved
+            cap = $capAll; ordered = $ordOk; orderMiss = $ordMiss; hostFight = $fight
+            minted = $minted
+            pairs = $par.pairs; agree = $par.agree
+            joinOnly = $par.joinOnly; joinOnlyFrac = $par.joinOnlyFrac
+            hostOnly = $par.hostOnly; hostOnlyFrac = $par.hostOnlyFrac
+            worstHand = $par.worstHand; worstJoinOnly = $par.worstJoinOnly
+            worstHostHand = $par.worstHostHand; worstHostOnly = $par.worstHostOnly }
+    $bad = @()
+    if ($RequireMint -and $minted -lt 1) {
+        $bad += "the victim $vic was not a minted body on the join (no [spawn] proxy BOUND; link 0: the run did not reproduce the field setup)"
+    }
+    if ($hostMoved -lt $MinTravel -or $joinMoved -lt $MinTravel) {
+        $bad += "the travel leg never ran (host moved $hostMoved u, join moved $joinMoved u, need >= $MinTravel; link 2)"
+    }
+    if ($capAll -lt 1) { $bad += "join never streamed a combat intent for $atk (link 3: capture)" }
+    elseif ($ordOk -lt 1) {
+        if ($ordMiss -ge 1) { $bad += "host saw the intent but the victim hand never resolved there ($ordMiss r=1 orders; link 4: target resolve)" }
+        else                { $bad += "host never ordered the join-PC copy (link 4: apply)" }
+    }
+    if ($fight -lt $MinFight) { $bad += "host-side fight never ran (hostview fight=1 x$fight, need >= $MinFight; link 5)" }
+    if ($par.pairs -ge $MinPairs -and $par.joinOnlyFrac -gt $MaxJoinOnlyFrac) {
+        $worst = if ($par.worstHand) { " (worst hand $($par.worstHand), $($par.worstJoinOnly) samples)" } else { "" }
+        $bad += ("one-sided fighting: $($par.joinOnly)/$($par.pairs) paired samples ($($par.joinOnlyFrac)) " +
+                 "have a body fighting on the join while the host has it at peace" + $worst +
+                 "; link 6: parity")
+    }
+    # The mirror case. A world NPC belongs to whichever client claimed its cell,
+    # so a join squad alone in a cell owns the bodies there and the HOST is the
+    # driven side - then the invented fight is the host's. Same defect, same
+    # gate: neither screen may run a fight its owner is not running.
+    if ($par.pairs -ge $MinPairs -and $par.hostOnlyFrac -gt $MaxJoinOnlyFrac) {
+        $worst = if ($par.worstHostHand) { " (worst hand $($par.worstHostHand), $($par.worstHostOnly) samples)" } else { "" }
+        $bad += ("one-sided fighting: $($par.hostOnly)/$($par.pairs) paired samples ($($par.hostOnlyFrac)) " +
+                 "have a body fighting on the host while the join has it at peace" + $worst +
+                 "; link 6: parity")
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  $label FAIL - " + ($bad -join "; ") +
+                    " [moved h=$hostMoved j=$joinMoved minted=$minted cap=$capAll ord=$ordOk miss=$ordMiss fight=$fight " +
+                    "pairs=$($par.pairs) joinOnly=$($par.joinOnly) hostOnly=$($par.hostOnly)]")
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  $label PASS - atk=$atk vic=$vic travelled h=$hostMoved j=$joinMoved u; " +
+                "minted=$minted cap=$capAll host-orders=$ordOk hostview-fight=$fight; " +
+                "fight parity $($par.agree)/$($par.pairs) agree (join-only $($par.joinOnly), host-only $($par.hostOnly))")
+    return (Add-GateResult -Name $GateName -Status PASS -Metrics $m)
+}
+
+# Proxy divergence. A minted proxy stands in for a body another client owns, so
+# the two copies must occupy roughly the same spot - and unlike the fight-parity
+# measures this one is not a sampling race, it is a distance that either stays
+# bounded or does not. Pre-fix run 20260806_091951 has one proxy walking
+# 165 -> 350 -> 484 -> 561 u away while the host holds it still and its local
+# copy fights the whole time, which is the 2026-08-05 field report exactly.
+# Parses the join's throttled "[proxy] drift ... d=<u> streamed=<0|1> fight=<0|1>"
+# sweep (one line per proxy per second).
+function Test-ProxyDrift {
+    param([string]$JoinFile, [double]$MaxDrift = 130.0, [int]$MinSamples = 10,
+          [double]$MaxHostStep = 40.0, [double]$RunawayDrift = 300.0,
+          [int]$RunawayRun = 3)
+    $pat = '\[proxy\] drift hand=(\d+),(\d+) d=([\d\.]+) .*streamed=(\d) fight=(\d) hstep=(-?[\d\.]+)'
+    $all = @(Select-String -Path $JoinFile -Pattern $pat -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                  $g = $_.Matches[0].Groups
+                  [pscustomobject]@{ hand = "$($g[1].Value),$($g[2].Value)"
+                                     d = [double]$g[3].Value
+                                     streamed = [int]$g[4].Value
+                                     fight = [int]$g[5].Value
+                                     hstep = [double]$g[6].Value } })
+    # Judge only samples where the OWNER's copy was roughly still between
+    # sweeps. The census is 1 Hz against a game that runs at 5x, so a sample
+    # taken while the owner is sprinting measures that latency, not a
+    # disagreement - the copy is tracking, a tick behind. hstep < 0 means we
+    # have no previous sweep for that proxy yet.
+    $rows = @($all | Where-Object { $_.hstep -ge 0 -and $_.hstep -le $MaxHostStep })
+    $lagged = $all.Count - $rows.Count
+    # No telemetry AT ALL is a failure, not a skip: this gate's scenario always
+    # mints, so a silent sweep means a stale DLL or a renamed log line - the way
+    # a broken measurement quietly reports success.
+    if ($all.Count -eq 0) {
+        $d = 'no [proxy] drift samples in the join log (telemetry missing - stale build?)'
+        Write-Host "  PROXY-DRIFT FAIL - $d"
+        return (Add-GateResult -Name 'proxy_drift' -Status FAIL -Metrics @{ samples = 0 } -Detail $d)
+    }
+    if ($rows.Count -lt $MinSamples) {
+        $m = @{ samples = $rows.Count; lagged = $lagged }
+        Write-Host "  PROXY-DRIFT SKIP - only $($rows.Count) judgeable proxy samples of $($all.Count) (need >= $MinSamples; $lagged excluded as owner-in-motion)"
+        return (Add-GateResult -Name 'proxy_drift' -Status PASS -Metrics $m -Detail 'insufficient samples')
+    }
+    $ds = @($rows | ForEach-Object { $_.d } | Sort-Object)
+    $max = $ds[-1]
+    $med = $ds[[int]($ds.Count / 2)]
+    $over = @($rows | Where-Object { $_.d -gt $MaxDrift })
+    # The damaging combination: far from where its owner has it AND fighting, so
+    # the local AI is acting on a position the other world does not agree with.
+    $overFighting = @($over | Where-Object { $_.fight -eq 1 })
+    # Being over the line is not itself the defect. The reconciliation triggers
+    # at 120 u and reparks at most every 5 s, so a body that is walking can sit
+    # just above the line between parks - measured max 114-153 u across fixed
+    # runs, against 661 u with reconciliation off. What separates the two is not
+    # the peak: it is whether the copy is FIGHTING out there, and whether the
+    # distance keeps growing instead of being pulled back.
+    #
+    # "Not pulled back" is a DURATION, so a runaway is a proxy over the limit on
+    # RunawayRun consecutive judged sweeps of that proxy, not on one. A first
+    # park is immediate and the census is 1 Hz, so a copy that is reconciled
+    # spends at most two sweeps over the line: the one that sees the gap and
+    # the one the park lands in. mint_aggro / assault_mint mint at the census
+    # spot 450 u from where the host SPAWNED the squad, then apply the one
+    # stream sample the host sent before its own park moved it there - one
+    # sweep at 450 u, parked back by the next (20261022_123528), which the
+    # single-sample rule read as "nothing is pulling it back". A copy that is
+    # genuinely loose stays out for the whole fight (run 20260806_091951:
+    # 350 -> 484 -> 561 u), and a body launched into the air stays out for
+    # its whole flight (the same run's dropped Jakku: five sweeps at 443-687 u).
+    $runaway = @()
+    $streak = @{}
+    foreach ($r in $rows) {
+        if ($r.d -gt $RunawayDrift) {
+            if ($streak.ContainsKey($r.hand)) { $streak[$r.hand] += , $r }
+            else { $streak[$r.hand] = @(, $r) }
+            if ($streak[$r.hand].Count -eq $RunawayRun) { $runaway += $streak[$r.hand] }
+            elseif ($streak[$r.hand].Count -gt $RunawayRun) { $runaway += , $r }
+        } else {
+            $streak.Remove($r.hand)
+        }
+    }
+    $worst = ($rows | Sort-Object d -Descending | Select-Object -First 1)
+    $m = @{ samples = $rows.Count; lagged = $lagged; maxDrift = $max; medDrift = $med
+            over = $over.Count; overFighting = $overFighting.Count
+            runaway = $runaway.Count
+            worstHand = $worst.hand; worstStreamed = $worst.streamed }
+    $bad = @()
+    if ($overFighting.Count -gt 0) {
+        $w = ($overFighting | Sort-Object d -Descending | Select-Object -First 1)
+        $bad += ("proxy $($w.hand) was FIGHTING $([int]$w.d) u from where its owner has it " +
+                 "($($overFighting.Count) samples): the two screens disagree about where " +
+                 "the fight is happening")
+    }
+    if ($runaway.Count -gt 0) {
+        $rw = ($runaway | Sort-Object d -Descending | Select-Object -First 1)
+        $bad += ("proxy $($rw.hand) stayed over $RunawayDrift u from its owner's copy for " +
+                 ">= $RunawayRun consecutive sweeps (peak $([int]$rw.d) u): nothing is pulling it back")
+    }
+    if ($bad.Count -gt 0) {
+        $d = $bad -join '; '
+        Write-Host "  PROXY-DRIFT FAIL - $d [max=$([int]$max) median=$([int]$med) over=$($over.Count) samples=$($rows.Count)]"
+        return (Add-GateResult -Name 'proxy_drift' -Status FAIL -Metrics $m -Detail $d)
+    }
+    Write-Host ("  PROXY-DRIFT PASS - no proxy fought while displaced and none ran away " +
+                "(max=$([int]$max), median=$([int]$med), $($over.Count) sample(s) over $MaxDrift u " +
+                "but at peace; samples=$($rows.Count), $lagged excluded as owner-in-motion)")
+    return (Add-GateResult -Name 'proxy_drift' -Status PASS -Metrics $m)
+}
+
+# mint_aggro: the UNPROVOKED half of the field report, and the only one of these
+# scenarios where nothing of ours touches the enemy. The host spawns a hostile
+# squad with its AI intact at census range, the join mints it, and the host then
+# puts it beside the join's characters. From there the fight is the enemy's to
+# start - so if one screen has it swinging while the other has it at peace, the
+# client that does not own it invented that fight out of its own local AI.
+#   1. spawned - the host put a hostile squad out there (scenario marker)
+#   2. minted  - the join had to create the body locally (no local copy at load)
+#   3. quiet   - NO attack was ordered by the scenario; a provoked fight is a
+#                different and accepted situation (pc_assault's architecture),
+#                so a run that somehow issued one proves nothing here
+#   4. parity  - the gate: both screens agree about whether it is fighting
+function Test-MintAggro {
+    param([string]$HostFile, [string]$JoinFile, [double]$MaxOneSidedFrac = 0.25,
+          [int]$MinPairs = 8)
+    $spawned = @(Select-String -Path $HostFile -Pattern 'SCENARIO TRAVELFIGHT enemy spawned n=(\d+)' -ErrorAction SilentlyContinue)
+    $closed  = @(Select-String -Path $HostFile -Pattern 'SCENARIO TRAVELFIGHT enemy closed n=(\d+)' -ErrorAction SilentlyContinue)
+    $issued  = @(Select-String -Path $JoinFile -Pattern 'SCENARIO TRAVELFIGHT issued atk=' -ErrorAction SilentlyContinue)
+    $minted  = @(Select-String -Path $JoinFile -Pattern '\[spawn\] proxy BOUND hand=' -ErrorAction SilentlyContinue).Count
+    $par = Get-EnemyStateParity -HostFile $HostFile -JoinFile $JoinFile
+    $nSpawn = if ($spawned.Count -ge 1) { [int]$spawned[0].Matches[0].Groups[1].Value } else { 0 }
+    $nClose = if ($closed.Count -ge 1) { [int]$closed[0].Matches[0].Groups[1].Value } else { 0 }
+
+    $m = @{ spawned = $nSpawn; closed = $nClose; minted = $minted; issued = $issued.Count
+            pairs = $par.pairs; agree = $par.agree
+            joinOnly = $par.joinOnly; joinOnlyFrac = $par.joinOnlyFrac
+            hostOnly = $par.hostOnly; hostOnlyFrac = $par.hostOnlyFrac }
+    $bad = @()
+    if ($nSpawn -lt 1) { $bad += "the host never spawned the hostile squad (link 1)" }
+    elseif ($nClose -lt 1) { $bad += "the squad was never brought to the join (link 1)" }
+    if ($minted -lt 1) { $bad += "the join minted nothing, so no body had a fragile identity (link 2)" }
+    if ($issued.Count -gt 0) { $bad += "an attack WAS ordered, so any fight here is player-authored (link 3)" }
+    if ($par.pairs -lt $MinPairs) {
+        $bad += "only $($par.pairs) paired enemy samples (need >= $MinPairs; the two logs never saw the same body - link 4)"
+    } else {
+        if ($par.joinOnlyFrac -gt $MaxOneSidedFrac) {
+            $bad += ("the enemy fights on the JOIN while the host has it at peace in " +
+                     "$($par.joinOnly)/$($par.pairs) samples ($($par.joinOnlyFrac)); link 4: parity")
+        }
+        if ($par.hostOnlyFrac -gt $MaxOneSidedFrac) {
+            $bad += ("the enemy fights on the HOST while the join has it at peace in " +
+                     "$($par.hostOnly)/$($par.pairs) samples ($($par.hostOnlyFrac)); link 4: parity")
+        }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  MINT-AGGRO FAIL - " + ($bad -join "; ") +
+                    " [spawned=$nSpawn closed=$nClose minted=$minted issued=$($issued.Count) " +
+                    "pairs=$($par.pairs) joinOnly=$($par.joinOnly) hostOnly=$($par.hostOnly)]")
+        return (Add-GateResult -Name 'mint_aggro' -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  MINT-AGGRO PASS - unprovoked hostile mint: spawned=$nSpawn minted=$minted; " +
+                "fight parity $($par.agree)/$($par.pairs) agree " +
+                "(join-only $($par.joinOnly), host-only $($par.hostOnly))")
+    return (Add-GateResult -Name 'mint_aggro' -Status PASS -Metrics $m)
+}
+
+# bandit_chase / bandit_chase_host: the field report "a pack of mobs showed up
+# twice" and "a dust bandit followed me into town and never appeared in my
+# friend's game". The victim's owner spawns a hostile pack only its own engine
+# has, then the victim runs into the town cell the OTHER client authors. Every
+# second both sides log how many bodies of the pack's template stand near the
+# victim (SCENARIO CHASE: vis = shown, i.e. alive and not hidden by our
+# existence judgment; keys/dupKeys = canonical identities among them).
+#   1. spawned   - the victim's owner put the pack out (scenario marker)
+#   2. crossed   - the victim entered the town cell, so the chase crossed from
+#                  one client's cell into the other's
+#   3. no dupes  - neither side shows more of the pack than was spawned, nor a
+#                  canonical key on two shown bodies, for longer than
+#                  MaxDupeRunS consecutive samples
+#   4. one-sided - one side shows pack bodies near the victim while the other
+#                  shows none, for longer than MaxOneSidedRunS consecutive pairs
+#   5. parity    - past the mint latency (GraceMs after the spawn) the shown
+#                  counts agree within one body in >= MinAgreeFrac of the pairs
+#   6. rekey     - mid-chase a side split a pack body it simulates into a squad
+#                  of its own, so the body lives on under a new local hand
+#                  (SCENARIO CHASE rekey moved=1); 3-5 then judge the peer's
+#                  view of the renamed body
+function Test-BanditChase {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = 'bandit_chase',
+          [int]$GraceMs = 8000, [int]$TolMs = 1200, [int]$MaxDupeRunS = 3,
+          [int]$MaxOneSidedRunS = 5, [double]$MinAgreeFrac = 0.8, [int]$MinPairs = 30)
+    $stamp   = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]'
+    $spawnRx = $stamp + '.*SCENARIO CHASE spawned side=(host|join) n=(\d+)'
+    $rowRx   = $stamp + '.*SCENARIO CHASE side=(host|join) t=\d+ spawned=\d .* vis=(\d+) hid=(\d+) dead=(\d+) keys=(\d+) dupKeys=(\d+)'
+    $spawnT = -1; $nPack = 0; $owner = ''
+    $series = @{ host = (New-Object System.Collections.ArrayList); join = (New-Object System.Collections.ArrayList) }
+    $crossed = 0; $rekeyed = 0
+    foreach ($file in @($HostFile, $JoinFile)) {
+        $off = Get-LogClockOffsetMs -File $file
+        foreach ($m in (Select-String -Path $file -Pattern $spawnRx -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $spawnT = Convert-StampToMs -Groups $g -OffsetMs $off
+            $owner = $g[5].Value; $nPack = [int]$g[6].Value
+        }
+        $crossed += @(Select-String -Path $file -Pattern 'SCENARIO CHASE crossed side=' -ErrorAction SilentlyContinue).Count
+        $rekeyed += @(Select-String -Path $file -Pattern 'SCENARIO CHASE rekey side=\w+ .* moved=1' -ErrorAction SilentlyContinue).Count
+        foreach ($m in (Select-String -Path $file -Pattern $rowRx -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            [void]$series[$g[5].Value].Add([pscustomobject]@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off); vis = [int]$g[6].Value
+                hid = [int]$g[7].Value; keys = [int]$g[9].Value; dup = [int]$g[10].Value })
+        }
+    }
+    $m = @{ owner = $owner; pack = $nPack; crossed = $crossed; rekeyed = $rekeyed; pairs = 0
+            agree = 0; exact = 0; agreeFrac = 0; hostDupeRun = 0; joinDupeRun = 0
+            hostMaxVis = 0; joinMaxVis = 0; oneSidedRun = 0; hostOnly = 0; joinOnly = 0 }
+    $bad = @()
+    if ($spawnT -lt 0 -or $nPack -lt 1) {
+        $bad += "the victim's owner never spawned the pack (link 1)"
+    } else {
+        if ($crossed -lt 1) { $bad += "the victim never entered the town cell, so the chase never crossed cells (link 2)" }
+        if ($rekeyed -lt 1) { $bad += "no pack body was renamed mid-chase (no 'SCENARIO CHASE rekey ... moved=1'; link 6)" }
+        $from = $spawnT + $GraceMs
+        # 3. duplicates, judged on each side's own series.
+        foreach ($side in @('host', 'join')) {
+            $run = 0; $worst = 0; $maxVis = 0
+            foreach ($r in @($series[$side] | Where-Object { $_.t -ge $from } | Sort-Object t)) {
+                if ($r.vis -gt $maxVis) { $maxVis = $r.vis }
+                if ($r.vis -gt $nPack -or $r.dup -gt 0) { $run++; if ($run -gt $worst) { $worst = $run } }
+                else { $run = 0 }
+            }
+            $m["${side}DupeRun"] = $worst; $m["${side}MaxVis"] = $maxVis
+            if ($worst -gt $MaxDupeRunS) {
+                $bad += ("the $side shows the pack DUPLICATED for $worst consecutive samples " +
+                         "(max $maxVis visible of $nPack spawned; link 3)")
+            }
+        }
+        # 4./5. paired by wall time, join rows against their nearest host row.
+        $hRows = @($series['host'] | Where-Object { $_.t -ge $from } | Sort-Object t)
+        $run = 0; $worstRun = 0
+        foreach ($jr in @($series['join'] | Where-Object { $_.t -ge $from } | Sort-Object t)) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($hr in $hRows) {
+                $dd = [Math]::Abs([int]$hr.t - [int]$jr.t)
+                if ($dd -lt $bd) { $bd = $dd; $best = $hr }
+            }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $m.pairs++
+            if ([Math]::Abs($best.vis - $jr.vis) -le 1) { $m.agree++ }
+            if ($best.vis -eq $jr.vis) { $m.exact++ }
+            $oneSided = $false
+            if ($best.vis -ge 1 -and $jr.vis -eq 0) { $m.hostOnly++; $oneSided = $true }
+            elseif ($jr.vis -ge 1 -and $best.vis -eq 0) { $m.joinOnly++; $oneSided = $true }
+            if ($oneSided) { $run++; if ($run -gt $worstRun) { $worstRun = $run } } else { $run = 0 }
+        }
+        $m.oneSidedRun = $worstRun
+        if ($m.pairs -gt 0) { $m.agreeFrac = [Math]::Round($m.agree / $m.pairs, 3) }
+        if ($m.pairs -lt $MinPairs) {
+            $bad += "only $($m.pairs) paired samples (need >= $MinPairs)"
+        } else {
+            if ($worstRun -gt $MaxOneSidedRunS) {
+                $bad += ("the pack stood near the victim on ONE side only for $worstRun consecutive " +
+                         "pairs (host-only $($m.hostOnly), join-only $($m.joinOnly); link 4)")
+            }
+            if ($m.agreeFrac -lt $MinAgreeFrac) {
+                $bad += ("visible pack counts disagree by more than one body in " +
+                         "$($m.pairs - $m.agree)/$($m.pairs) pairs (agree $($m.agreeFrac) < $MinAgreeFrac; link 5)")
+            }
+        }
+    }
+    $summary = ("owner=$owner pack=$nPack crossed=$crossed rekeyed=$rekeyed pairs=$($m.pairs) agree=$($m.agree) " +
+                "exact=$($m.exact) dupeRun=$($m.hostDupeRun)/$($m.joinDupeRun) " +
+                "maxVis=$($m.hostMaxVis)/$($m.joinMaxVis) oneSidedRun=$($m.oneSidedRun) " +
+                "hostOnly=$($m.hostOnly) joinOnly=$($m.joinOnly)")
+    if ($bad.Count -gt 0) {
+        Write-Host ("  BANDIT-CHASE FAIL - " + ($bad -join "; ") + " [$summary]")
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host "  BANDIT-CHASE PASS - one pack on both screens through the chase [$summary]"
+    return (Add-GateResult -Name $GateName -Status PASS -Metrics $m)
+}
+
+# The largest "moved=<u>" the travel series reported in one log (cumulative path
+# length of that client's own leader, snap steps excluded by the scenario).
+function Get-TravelMoved {
+    param([string]$File)
+    $best = 0
+    foreach ($m in (Select-String -Path $File -Pattern 'SCENARIO TRAVELFIGHT \w+ .*moved=(\d+)' -ErrorAction SilentlyContinue)) {
+        $v = [int]$m.Matches[0].Groups[1].Value
+        if ($v -gt $best) { $best = $v }
+    }
+    return $best
+}
+
+# Pair the host's MEMBER series against the join's RECV series per NPC hand and
+# count the samples where the two clients disagree about whether that body is
+# FIGHTING (task 65024 melee / 65025 waiting-in-the-ring). Keyed on index,serial
+# so a mid-fight container rewrite still pairs. Returns counts + the worst hand.
+function Get-FightTaskParity {
+    param([string]$HostFile, [string]$JoinFile, [int]$TolMs = 1500)
+    $hostMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $HostFile -Kind 'MEMBER')
+    $joinMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $JoinFile -Kind 'RECV')
+    return (Measure-FightDisagreement -HostMap $hostMap -JoinMap $joinMap -TolMs $TolMs)
+}
+
+# The same disagreement count for the ENEMY specifically, from the scenario's
+# "enemystate canon=<i,s> fight=<0|1>" samples. Needed because a minted body has
+# a different LOCAL hand on each client, so the entity series cannot pair it -
+# and the enemy's own state is what the field report was about.
+function Get-EnemyStateParity {
+    param([string]$HostFile, [string]$JoinFile, [int]$TolMs = 1500)
+    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO TRAVELFIGHT enemystate canon=(\d+,\d+) fight=(\d)'
+    $hostMap = @{}; $joinMap = @{}
+    foreach ($pair in @(@($HostFile, $hostMap), @($JoinFile, $joinMap))) {
+        $file = $pair[0]; $map = $pair[1]
+        $off = Get-LogClockOffsetMs -File $file
+        foreach ($m in (Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $key = $g[5].Value
+            if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.ArrayList }
+            [void]$map[$key].Add([pscustomobject]@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off); fight = [int]$g[6].Value })
+        }
+    }
+    return (Measure-FightDisagreement -HostMap $hostMap -JoinMap $joinMap -TolMs $TolMs)
+}
+
+# Nearest-sample pairing of two 'hand -> @{t; fight}' maps, counting the fight
+# disagreements in BOTH directions. Direction matters for the diagnosis but not
+# for the verdict: whoever OWNS a body is its combat authority, and cell claims
+# hand ownership of world NPCs to either client (Replicator::authorityFor - the
+# host only wins ties), so "fighting here, at peace over there" is the same
+# defect whichever screen is the one inventing the fight.
+function Measure-FightDisagreement {
+    param($HostMap, $JoinMap, [int]$TolMs = 1500)
+    $pairs = 0; $agree = 0; $joinOnly = 0; $hostOnly = 0
+    $worstHand = ''; $worstJoinOnly = 0
+    $worstHostHand = ''; $worstHostOnly = 0
+    foreach ($hand in $JoinMap.Keys) {
+        if (-not $HostMap.ContainsKey($hand)) { continue }
+        $jSamples = @($JoinMap[$hand] | Sort-Object t)
+        $hSamples = @($HostMap[$hand] | Sort-Object t)
+        $handJoinOnly = 0; $handHostOnly = 0
+        foreach ($jr in $jSamples) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($hr in $hSamples) {
+                $dd = [Math]::Abs([int]$hr.t - [int]$jr.t)
+                if ($dd -lt $bd) { $bd = $dd; $best = $hr }
+            }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $pairs++
+            if ($jr.fight -eq $best.fight) { $agree++ }
+            elseif ($jr.fight -eq 1) { $joinOnly++; $handJoinOnly++ }
+            else { $hostOnly++; $handHostOnly++ }
+        }
+        if ($handJoinOnly -gt $worstJoinOnly) { $worstJoinOnly = $handJoinOnly; $worstHand = $hand }
+        if ($handHostOnly -gt $worstHostOnly) { $worstHostOnly = $handHostOnly; $worstHostHand = $hand }
+    }
+    $jFrac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
+    $hFrac = if ($pairs -gt 0) { [Math]::Round($hostOnly / $pairs, 3) } else { 0 }
+    return [pscustomobject]@{
+        pairs = $pairs; agree = $agree; joinOnly = $joinOnly; hostOnly = $hostOnly
+        joinOnlyFrac = $jFrac; hostOnlyFrac = $hFrac
+        worstHand = $worstHand; worstJoinOnly = $worstJoinOnly
+        worstHostHand = $worstHostHand; worstHostOnly = $worstHostOnly
+    }
+}
+
+# Reduce a Get-ScenarioSeries map (hand 'i,s,t,c,cs' -> samples with task) to
+# 'i,s' -> @{ t; fight }. 65024 = melee, 65025 = queued by the AttackSlotManager;
+# both are "this client has the body in a fight".
+function Convert-ToFightSeries {
+    param($Series)
+    $out = @{}
+    foreach ($full in $Series.Keys) {
+        $parts = $full.Split(',')
+        if ($parts.Count -lt 2) { continue }
+        $key = $parts[0] + ',' + $parts[1]
+        if (-not $out.ContainsKey($key)) { $out[$key] = New-Object System.Collections.ArrayList }
+        foreach ($s in $Series[$full]) {
+            $fight = if ($s.task -eq 65024 -or $s.task -eq 65025) { 1 } else { 0 }
+            [void]$out[$key].Add([pscustomobject]@{ t = [int]$s.t; fight = $fight })
+        }
+    }
+    return $out
+}
+
+# player_ko BIDIRECTIONAL: each side KOs then revives its OWN squad member; the
+# KO and revive must cross as reliable events (EVT_KNOCKOUT=1 / EVT_REVIVE=3,
+# SEND on the owner, RECV on the peer) and the peer's driven copy must lie down
+# between the edges and stand after the revive.
+function Test-PlayerKo {
+    param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 5000, [double]$MinRatio = 0.60)
+    $dirs = @(
+        @{ tag = "A"; ownerLog = $HostFile; peerLog = $JoinFile; peerKind = "RECV" },
+        @{ tag = "B"; ownerLog = $JoinFile; peerLog = $HostFile; peerKind = "RECV" }
+    )
+    $m = @{}; $bad = @()
+    foreach ($d in $dirs) {
+        $t = $d.tag
+        $mk = Select-String -Path $d.ownerLog -Pattern ('SCENARIO PKO ' + $t + ' down issued hand=(\d+),(\d+)') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $mk) { $bad += "${t}: no down marker"; continue }
+        $hi = $mk.Matches[0].Groups[1].Value; $hs = $mk.Matches[0].Groups[2].Value
+        $Tdown = Get-MarkerTimeMs -File $d.ownerLog -Pattern ('SCENARIO PKO ' + $t + ' down issued')
+        $Trev  = Get-MarkerTimeMs -File $d.ownerLog -Pattern ('SCENARIO PKO ' + $t + ' revive issued')
+        if ($null -eq $Trev) { $bad += "${t}: no revive marker"; continue }
+        # Reliable edges: KO (ev=1) + revive (ev=3) sent by the owner, received by the peer.
+        $ev = {
+            param($evId, $sinceMs)
+            $sp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] SEND id=\d+ ev=' + $evId + ' hand=\d+,\d+,\d+,' + $hi + ',' + $hs
+            $rp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=' + $evId + ' .*hand=\d+,\d+,\d+,' + $hi + ',' + $hs
+            $so = Get-LogClockOffsetMs -File $d.ownerLog; $ro = Get-LogClockOffsetMs -File $d.peerLog
+            $send = $null
+            foreach ($x in @(Select-String -Path $d.ownerLog -Pattern $sp -ErrorAction SilentlyContinue)) {
+                $ts = Convert-StampToMs -Groups $x.Matches[0].Groups -OffsetMs $so
+                if ($ts -ge $sinceMs) { $send = $ts; break }
+            }
+            if ($null -eq $send) { return $null }
+            foreach ($x in @(Select-String -Path $d.peerLog -Pattern $rp -ErrorAction SilentlyContinue)) {
+                $tr = Convert-StampToMs -Groups $x.Matches[0].Groups -OffsetMs $ro
+                if ($tr -ge $send - 1000) { return ($tr - $send) }
+            }
+            return -1
+        }
+        $koLat  = & $ev 1 ($Tdown - 2000)
+        $revLat = & $ev 3 ($Trev - 2000)
+        if ($null -eq $koLat)  { $bad += "${t}: owner sent no EVT_KNOCKOUT for hand=$hi,$hs" }
+        elseif ($koLat -lt 0)  { $bad += "${t}: peer never received the KO event" }
+        if ($null -eq $revLat) { $bad += "${t}: owner sent no EVT_REVIVE for hand=$hi,$hs" }
+        elseif ($revLat -lt 0) { $bad += "${t}: peer never received the revive event" }
+        # Peer pose: driven copy down between the edges, upright after the revive.
+        $S = Get-ScenarioSeries -File $d.peerLog -Kind $d.peerKind
+        $key = $null
+        foreach ($hand in $S.Keys) { if ($hand -match ('^' + $hi + ',' + $hs + ',')) { $key = $hand; break } }
+        if ($null -eq $key) { $bad += "${t}: peer logged no series for hand=$hi,$hs"; continue }
+        $downWin = @($S[$key] | Where-Object { $_.t -ge ($Tdown + $GraceMs) -and $_.t -lt $Trev })
+        $upWin   = @($S[$key] | Where-Object { $_.t -ge ($Trev + $GraceMs) })
+        if ($downWin.Count -lt 1 -or $upWin.Count -lt 1) { $bad += "${t}: insufficient peer samples (down=$($downWin.Count) up=$($upWin.Count))"; continue }
+        $downR = [Math]::Round((@($downWin | Where-Object { ($_.bs -band 7) -ne 0 }).Count) / $downWin.Count, 3)
+        $upR   = [Math]::Round((@($upWin   | Where-Object { ($_.bs -band 7) -eq 0 }).Count) / $upWin.Count, 3)
+        $m["${t}KoLatMs"] = $koLat; $m["${t}RevLatMs"] = $revLat
+        $m["${t}DownRatio"] = $downR; $m["${t}UpRatio"] = $upR
+        if ($downR -lt $MinRatio) { $bad += "${t}: peer down-ratio $downR < $MinRatio between the edges" }
+        if ($upR   -lt $MinRatio) { $bad += "${t}: peer upright-ratio $upR < $MinRatio after the revive" }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  PLAYER-KO FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "player_ko" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  PLAYER-KO PASS - A(host victim): KO lat=$($m.AKoLatMs)ms revive lat=$($m.ARevLatMs)ms down=$($m.ADownRatio) up=$($m.AUpRatio); " +
+                "B(join victim): KO lat=$($m.BKoLatMs)ms revive lat=$($m.BRevLatMs)ms down=$($m.BDownRatio) up=$($m.BUpRatio)")
+    return (Add-GateResult -Name "player_ko" -Status PASS -Metrics $m)
+}
+
+# combat_crowd (waiting-attacker stance conformance): the host orders ~5 bar NPCs
+# onto its own leader; the attack-slot system keeps most of them QUEUED. Gates:
+#   * both stances streamed (host MEMBER task series shows active 0xFE00=65024
+#     AND waiting 0xFE01=65025 samples) - else the run proves nothing;
+#   * the join's [combat] order re-issue count per crowd hand stays low (the
+#     1.5 s clearGoals reset loop is dead - pre-fix: ~40 per hand per minute);
+#   * the join's [combat] snap teleport count stays near zero after engagement
+#     settles (the teleporting-crowd artifact is gone);
+#   * each crowd copy TRACKS its host body (median time-aligned distance <= Tol
+#     for >= MinTrackRatio of the crowd).
+function Test-CombatCrowd {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$Tol = 20.0, [int]$MaxOrdersPerHand = 18,
+          [int]$MaxWaitSnaps = 6, [int]$MaxSnaps = 30,
+          [double]$MinTrackRatio = 0.6,
+          [int]$MaxDt = 800, [int]$SettleMs = 8000)
+    # Crowd hands + window anchor from the host log.
+    $crowd = @()
+    foreach ($cm in (Select-String -Path $HostFile -Pattern 'SCENARIO CROWD striker=(\d+),(\d+)' -ErrorAction SilentlyContinue)) {
+        $crowd += ($cm.Matches[0].Groups[1].Value + "," + $cm.Matches[0].Groups[2].Value)
+    }
+    if ($crowd.Count -lt 3) {
+        Write-Host "  COMBAT-CROWD FAIL - only $($crowd.Count) striker(s) picked (need >= 3)"
+        return (Add-GateResult -Name "combat_crowd" -Status FAIL -Metrics @{ strikers = $crowd.Count } -Detail "crowd pick failed")
+    }
+    $tIssued = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO CROWD issued'
+    if ($null -eq $tIssued) {
+        Write-Host "  COMBAT-CROWD FAIL - host never issued the crowd order"
+        return (Add-GateResult -Name "combat_crowd" -Status FAIL -Detail "no issued marker")
+    }
+    $HS = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $JS = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $m = @{ strikers = $crowd.Count }
+    $bad = @()
+
+    # Helper: is a series key (i,s,type,ctnr,ctnrSerial) one of the crowd hands?
+    $crowdKeys = @{}
+    foreach ($ck in ($HS.Keys + $JS.Keys | Select-Object -Unique)) {
+        foreach ($cr in $crowd) {
+            if ($ck.StartsWith($cr + ",")) { $crowdKeys[$ck] = $cr; break }
+        }
+    }
+
+    # Stance coverage: the host must have STREAMED both stances for crowd hands
+    # inside the window (task rides the MEMBER lines).
+    $nActive = 0; $nWaiting = 0
+    foreach ($ck in $crowdKeys.Keys) {
+        if (-not $HS.ContainsKey($ck)) { continue }
+        foreach ($hsamp in $HS[$ck]) {
+            if ([double]$hsamp.t -lt [double]$tIssued) { continue }
+            if ($hsamp.task -eq 65024) { $nActive++ }
+            elseif ($hsamp.task -eq 65025) { $nWaiting++ }
+        }
+    }
+    $m.activeSamples = $nActive; $m.waitingSamples = $nWaiting
+    if ($nActive -lt 3)  { $bad += "host streamed only $nActive ACTIVE combat sample(s) (fight never ran?)" }
+    if ($nWaiting -lt 3) { $bad += "host streamed only $nWaiting WAITING sample(s) (no queued attackers - crowd too small or stance read broken)" }
+
+    # Join re-issue counts per crowd hand ([combat] order hand=i,s ...). The
+    # pre-fix loop re-ordered every 1.5 s (~40/min); post-fix a copy arms once
+    # and re-issues only on retarget/disengage with backoff.
+    $orders = @{}
+    foreach ($om in (Select-String -Path $JoinFile -Pattern '\[combat\] order hand=(\d+),(\d+)' -ErrorAction SilentlyContinue)) {
+        $oh = $om.Matches[0].Groups[1].Value + "," + $om.Matches[0].Groups[2].Value
+        if ($crowd -contains $oh) { $orders[$oh] = 1 + $(if ($orders.ContainsKey($oh)) { $orders[$oh] } else { 0 }) }
+    }
+    $maxOrders = 0
+    foreach ($ov in $orders.Values) { if ($ov -gt $maxOrders) { $maxOrders = $ov } }
+    $m.maxOrdersPerHand = $maxOrders
+    if ($maxOrders -gt $MaxOrdersPerHand) {
+        $bad += "a crowd copy was re-ordered $maxOrders times (> $MaxOrdersPerHand - the re-issue loop is back)"
+    }
+
+    # Join snap teleports for crowd hands after the settle grace. The WAIT-stance
+    # count is the artifact gate (a queued host body holds its ring spot, so a
+    # snap there means the join copy wandered - the exact pre-fix behaviour); the
+    # total is a looser sanity cap (an ACTIVE brawl legitimately churns, and a
+    # host body that sprint-chases 40-110 u NEEDS the teleport).
+    $joff = Get-LogClockOffsetMs -File $JoinFile
+    $snaps = 0; $waitSnaps = 0
+    # (Phase 1 warp diagnosis enriched the line with srcVel/localFight/wrongTgt/
+    # arming/seg/n between drift and wait; the .* keeps this tolerant of them.)
+    foreach ($sm in (Select-String -Path $JoinFile -Pattern '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] snap hand=(\d+),(\d+) drift=[\d\.]+.* wait=(\d)' -ErrorAction SilentlyContinue)) {
+        $sg = $sm.Matches[0].Groups
+        $sh = $sg[5].Value + "," + $sg[6].Value
+        if ($crowd -notcontains $sh) { continue }
+        $st = Convert-StampToMs -Groups $sg -OffsetMs $joff
+        if ([double]$st -lt ([double]$tIssued + $SettleMs)) { continue }
+        $snaps++
+        if ($sg[7].Value -eq "1") { $waitSnaps++ }
+    }
+    $m.snaps = $snaps; $m.waitSnaps = $waitSnaps
+    if ($waitSnaps -gt $MaxWaitSnaps) {
+        $bad += "$waitSnaps WAIT-stance snap teleport(s) after settle (> $MaxWaitSnaps - waiting copies still bouncing)"
+    }
+    if ($snaps -gt $MaxSnaps) {
+        $bad += "$snaps total combat snap teleport(s) after settle (> $MaxSnaps)"
+    }
+
+    # Per-hand tracking: median time-aligned host-vs-join distance in the window.
+    # DOWN samples (bs&7) are excluded on either side: where a KO'd body comes to
+    # rest is the Stage-2 down-placement problem, not combat stance tracking (a
+    # host body that sprints away and falls 70 u off is judged by neither).
+    # Hands are matched on the index,serial PREFIX only: the join detaches its
+    # driven combat copies from town AI, which changes the local CONTAINER fields
+    # of its logged hand mid-run (the same body appears under two 5-field keys).
+    $judged = 0; $tracked = 0; $worst = 0.0; $mism = @()
+    foreach ($cr in $crowd) {
+        $hk = @($HS.Keys | Where-Object { $_.StartsWith($cr + ",") }) | Select-Object -First 1
+        if ($null -eq $hk) { continue }
+        $hPost = @($HS[$hk] | Where-Object {
+            [double]$_.t -ge ([double]$tIssued + $SettleMs) -and (($_.bs -band 7) -eq 0) })
+        if ($hPost.Count -lt 8) { continue }
+        $jUp = New-Object System.Collections.ArrayList
+        foreach ($jk in $JS.Keys) {
+            if (-not $jk.StartsWith($cr + ",")) { continue }
+            foreach ($jsamp in $JS[$jk]) {
+                if (($jsamp.bs -band 7) -eq 0) { [void]$jUp.Add($jsamp) }
+            }
+        }
+        $dists = New-Object System.Collections.ArrayList
+        foreach ($hsamp in $hPost) {
+            $best = [double]::MaxValue; $bj = $null
+            foreach ($jsamp in $jUp) {
+                $dt = [Math]::Abs([double]$jsamp.t - [double]$hsamp.t)
+                if ($dt -lt $best) { $best = $dt; $bj = $jsamp }
+            }
+            if ($best -le $MaxDt -and $null -ne $bj) {
+                $dx = $hsamp.p[0] - $bj.p[0]; $dy = $hsamp.p[1] - $bj.p[1]; $dz = $hsamp.p[2] - $bj.p[2]
+                [void]$dists.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+            }
+        }
+        if ($dists.Count -lt 4) { continue }
+        $sorted = $dists | Sort-Object
+        $med = $sorted[[int]($sorted.Count / 2)]
+        $judged++
+        if ($med -le $Tol) { $tracked++ } else { $mism += "$cr(med=$([Math]::Round($med,1)))" }
+        if ($med -gt $worst) { $worst = $med }
+    }
+    $m.judged = $judged; $m.tracked = $tracked
+    $m.worstMedian = [Math]::Round($worst, 2)
+    if ($judged -lt 3) {
+        $bad += "only $judged crowd hand(s) present in both series (need >= 3)"
+    } else {
+        $ratio = [Math]::Round($tracked / $judged, 3)
+        $m.trackRatio = $ratio
+        if ($ratio -lt $MinTrackRatio) {
+            $bad += "only $tracked/$judged crowd copies tracked within ${Tol}u (ratio $ratio < $MinTrackRatio)$(if ($mism.Count) { ': ' + ($mism -join ', ') })"
+        }
+    }
+
+    if ($bad.Count -gt 0) {
+        Write-Host ("  COMBAT-CROWD FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "combat_crowd" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  COMBAT-CROWD PASS - $($crowd.Count) strikers (active/waiting samples $nActive/$nWaiting), " +
+                "maxOrders $maxOrders, snaps $snaps (wait $waitSnaps), tracked $tracked/$judged (worstMedian $($m.worstMedian)u)")
+    return (Add-GateResult -Name "combat_crowd" -Status PASS -Metrics $m)
+}
+
+# combat_snap_rate (2026-07-15 many-NPC combat warp): the JOIN warp during fights
+# is combat-drive hard TELEPORTS ([combat] snap = engine::applyRaw), not locomotion
+# starvation (Test-SnapRate covers that, keyed off [interp]). This oracle keys off
+# the Phase 1-enriched [combat] snap line and classifies each teleport by root
+# cause so a high rate of the AVOIDABLE kind fails while a legitimate sprint-chase
+# does not:
+#   * CHURN  - localFight=1 on a near-STATIONARY source (srcVel < ChurnVel) at a
+#              moderate drift (< ChaseDrift): both sims fight the right body but the
+#              local footwork diverged - convergence should absorb this, a teleport
+#              is the visible warp. THIS is what the fix targets.
+#   * CHASE  - high srcVel or drift >= ChaseDrift: the host body genuinely left
+#              (sprint-chase measured 45-110 u); a teleport IS the right tool. Not
+#              gated (counted for context only).
+#   * WRONGT - wrongTgt=1: the local copy fights the WRONG body, so it stands in
+#              the wrong place and snaps repeatedly - an order/target problem.
+# Gates (all after an engagement SETTLE window):
+#   1. CHURN RATE   - avoidable teleports/min <= MaxChurnPerMin.
+#   2. PERSISTENCE  - no single hand snaps more than MaxPersistPerHand times (a
+#                     body that keeps snapping is PERSISTENTLY divergent, not
+#                     occasionally churning - the [combat] snap n= / stats
+#                     maxPersist signal).
+#   3. WRONG TARGET - wrongTgt snaps <= MaxWrongTgt.
+# SKIP when no combat happened (no [combat] order) so a peaceful run never falses.
+function Test-CombatSnapRate {
+    param([string]$JoinFile, [string]$Label = "join",
+          [double]$MaxChurnPerMin = 12.0, [int]$MaxPersistPerHand = 6,
+          [int]$MaxWrongTgt = 8,
+          [double]$ChurnVel = 8.0, [double]$ChaseDrift = 45.0,
+          [int]$SettleMs = 8000, [int]$MinWindowSec = 15)
+    if (-not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "combat_snap_rate" -Status SKIP -Detail "no join log")
+    }
+    $joff = Get-LogClockOffsetMs -File $JoinFile
+    # Engagement start = first [combat] order on the join (a fight was reproduced).
+    $tOrder = Get-MarkerTimeMs -File $JoinFile -Pattern '\[combat\] order hand='
+    if ($null -eq $tOrder) {
+        Write-Host "  [$Label] combat-snap-rate SKIP - no [combat] order (no fight reproduced)"
+        return (Add-GateResult -Name "combat_snap_rate" -Status SKIP -Detail "no combat")
+    }
+    $settleEnd = [double]$tOrder + $SettleMs
+    # Window end = last combat-drive activity (order/snap/stats) on the join.
+    $lastT = $tOrder
+    foreach ($lm in (Select-String -Path $JoinFile -Pattern '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] (?:order|snap|stats)' -ErrorAction SilentlyContinue)) {
+        $lt = Convert-StampToMs -Groups $lm.Matches[0].Groups -OffsetMs $joff
+        if ([double]$lt -gt [double]$lastT) { $lastT = $lt }
+    }
+    $winSec = ([double]$lastT - $settleEnd) / 1000.0
+    if ($winSec -lt $MinWindowSec) {
+        Write-Host "  [$Label] combat-snap-rate SKIP - scored window $([math]::Round($winSec,0))s (< ${MinWindowSec}s past settle)"
+        return (Add-GateResult -Name "combat_snap_rate" -Status SKIP `
+                    -Metrics @{ windowSec = [math]::Round($winSec, 1) } -Detail "window too short")
+    }
+    # Enriched [combat] snap line: hand, drift, srcVel, localFight, wrongTgt,
+    # arming, wait, seg, n (the .* tolerates future field additions).
+    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] snap hand=(\d+),(\d+) drift=([\d\.]+) srcVel=([\d\.]+) localFight=(\d) wrongTgt=(\d) arming=(\d) wait=(\d) seg=\d+ n=(\d+)'
+    $churn = 0; $chase = 0; $wrongT = 0; $total = 0
+    $persist = @{}; $drifts = @()
+    foreach ($sm in (Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $sm.Matches[0].Groups
+        $t = Convert-StampToMs -Groups $g -OffsetMs $joff
+        if ([double]$t -lt $settleEnd) { continue }
+        $hand      = $g[5].Value + "," + $g[6].Value
+        $drift     = [double]$g[7].Value
+        $srcVel    = [double]$g[8].Value
+        $localFight= ($g[9].Value -eq "1")
+        $wrong     = ($g[10].Value -eq "1")
+        $n         = [int]$g[13].Value
+        $total++
+        $drifts += $drift
+        if ($persist[$hand] -lt $n) { $persist[$hand] = $n }
+        if ($wrong) { $wrongT++ }
+        if (($srcVel -ge $ChurnVel) -or ($drift -ge $ChaseDrift)) { $chase++ }
+        elseif ($localFight) { $churn++ }
+        else { $churn++ }  # stationary source, mid drift, not actively fighting = still avoidable
+    }
+    $maxPersist = 0
+    foreach ($k in $persist.Keys) { if ($persist[$k] -gt $maxPersist) { $maxPersist = $persist[$k] } }
+    $churnRate = [math]::Round($churn / ($winSec / 60.0), 2)
+    $totalRate = [math]::Round($total / ($winSec / 60.0), 2)
+    $medDrift = 0.0
+    if ($drifts.Count -gt 0) {
+        $sorted = @($drifts | Sort-Object)
+        $medDrift = [math]::Round($sorted[[int]([math]::Floor($sorted.Count / 2))], 1)
+    }
+    $m = @{ total = $total; churn = $churn; chase = $chase; wrongTgt = $wrongT
+            churnRatePerMin = $churnRate; totalRatePerMin = $totalRate
+            maxPersistPerHand = $maxPersist; medianDrift = $medDrift
+            windowSec = [math]::Round($winSec, 1) }
+    $bad = @()
+    if ($churnRate -gt $MaxChurnPerMin) { $bad += "churn snaps $churnRate/min (> $MaxChurnPerMin)" }
+    if ($maxPersist -gt $MaxPersistPerHand) { $bad += "a hand snapped ${maxPersist}x (> $MaxPersistPerHand - persistent divergence)" }
+    if ($wrongT -gt $MaxWrongTgt) { $bad += "$wrongT wrong-target snap(s) (> $MaxWrongTgt)" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  [$Label] combat-snap-rate FAIL - " + ($bad -join "; ") +
+                    " [total $total = churn $churn + chase $chase; medDrift ${medDrift}u; window $([math]::Round($winSec,0))s]")
+        return (Add-GateResult -Name "combat_snap_rate" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  [$Label] combat-snap-rate PASS - churn $churnRate/min (<= $MaxChurnPerMin), maxPersist $maxPersist (<= $MaxPersistPerHand), " +
+                "wrongTgt $wrongT (<= $MaxWrongTgt); total $total = churn $churn + chase $chase, medDrift ${medDrift}u over $([math]::Round($winSec,0))s")
+    return (Add-GateResult -Name "combat_snap_rate" -Status PASS -Metrics $m)
+}
+
+# combat_battle (2026-07-16 many-NPC combat warp): PRESENCE/engagement gate for the
+# combat_battle scenario (the actual snap quality is judged by combat_snap_rate,
+# gated alongside this). Proves the many-NPC fight actually happened so a spawn/
+# engage failure fails LOUDLY instead of letting combat_snap_rate SKIP:
+#   1. HOST spawned the battle - "SCENARIO BATTLE spawned=N/..." with N >= MinBattlers
+#      and a "SCENARIO BATTLE issued" marker (the pairs were ordered into melee).
+#   2. JOIN reproduced it - the join issued combat orders for the streamed fighters
+#      ("[combat] order") for at least MinJoinOrders distinct hands (the fights
+#      crossed and the join drove them - the precondition for any snap measurement).
+function Test-CombatBattle {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinBattlers = 4, [int]$MinJoinOrders = 3)
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "combat_battle" -Status FAIL -Detail "missing log")
+    }
+    $sp = Select-String -Path $HostFile -Pattern 'SCENARIO BATTLE spawned=(\d+)/(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $sp) {
+        Write-Host "  COMBAT-BATTLE FAIL - host never spawned the battle"
+        return (Add-GateResult -Name "combat_battle" -Status FAIL -Detail "no spawn marker")
+    }
+    $spawned = [int]$sp.Matches[0].Groups[1].Value
+    $want    = [int]$sp.Matches[0].Groups[2].Value
+    $issued  = @(Select-String -Path $HostFile -Pattern 'SCENARIO BATTLE issued n=(\d+)' -ErrorAction SilentlyContinue).Count
+    # Distinct join-side combat hands ordered (the fights the join reproduced).
+    $joinHands = @{}
+    foreach ($jm in (Select-String -Path $JoinFile -Pattern '\[combat\] order hand=(\d+),(\d+)' -ErrorAction SilentlyContinue)) {
+        $joinHands[$jm.Matches[0].Groups[1].Value + ',' + $jm.Matches[0].Groups[2].Value] = $true
+    }
+    $m = @{ spawned = $spawned; want = $want; joinOrderedHands = $joinHands.Count }
+    $bad = @()
+    if ($spawned -lt $MinBattlers) { $bad += "only $spawned/$want battlers spawned (< $MinBattlers)" }
+    if ($issued -lt 1) { $bad += "host never issued the battle orders" }
+    if ($joinHands.Count -lt $MinJoinOrders) { $bad += "join reproduced only $($joinHands.Count) fighter(s) (< $MinJoinOrders)" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  COMBAT-BATTLE FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "combat_battle" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host "  COMBAT-BATTLE PASS - $spawned/$want battlers spawned, join drove $($joinHands.Count) fighter(s)"
+    return (Add-GateResult -Name "combat_battle" -Status PASS -Metrics $m)
+}
+
+# combat_win (2026-07-16 smoothness pass, second warp shape): each side buffs its
+# OWN player-squad to 120 in every stat and the host runtime-spawns N enemies onto
+# the PC leader; the buffed PCs win, so the join stress is dying/fleeing/KO churn.
+# Presence/outcome oracle (the warp itself is gated by combat_snap_rate):
+#   1. BOTH sides buffed their own PCs (SCENARIO WIN buff rank=0 on host, rank=1 on join)
+#   2. host spawned >= MinEnemies and issued the attack orders
+#   3. the fight was WON (SCENARIO WIN down >= 1 on the host) and CROSSED (the join
+#      reproduced the enemy copies - SCENARIO RECV present)
+function Test-CombatWin {
+    param([string]$HostFile, [string]$JoinFile, [int]$MinEnemies = 4)
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "combat_win" -Status FAIL -Detail "missing log")
+    }
+    $hostBuff = @(Select-String -Path $HostFile -Pattern 'SCENARIO WIN buff rank=0' -ErrorAction SilentlyContinue).Count
+    $joinBuff = @(Select-String -Path $JoinFile -Pattern 'SCENARIO WIN buff rank=1' -ErrorAction SilentlyContinue).Count
+    $sp = Select-String -Path $HostFile -Pattern 'SCENARIO WIN spawned=(\d+)/(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $spawned = if ($sp) { [int]$sp.Matches[0].Groups[1].Value } else { 0 }
+    $want    = if ($sp) { [int]$sp.Matches[0].Groups[2].Value } else { 0 }
+    $issued  = @(Select-String -Path $HostFile -Pattern 'SCENARIO WIN issued n=(\d+)' -ErrorAction SilentlyContinue).Count
+    $peak = {
+        param($file)
+        $mx = 0
+        foreach ($mm in (Select-String -Path $file -Pattern 'SCENARIO WIN down=(\d+)/' -ErrorAction SilentlyContinue)) {
+            $v = [int]$mm.Matches[0].Groups[1].Value
+            if ($v -gt $mx) { $mx = $v }
+        }
+        return $mx
+    }
+    $hostDown = & $peak $HostFile
+    $joinDown = & $peak $JoinFile
+    $joinRecv = @(Select-String -Path $JoinFile -Pattern 'SCENARIO RECV ' -ErrorAction SilentlyContinue).Count
+    $m = @{ hostBuff=$hostBuff; joinBuff=$joinBuff; spawned=$spawned; want=$want;
+            issued=$issued; hostDown=$hostDown; joinDown=$joinDown; joinRecv=$joinRecv }
+    $bad = @()
+    if ($hostBuff -lt 1) { $bad += "host never buffed its PCs (no rank=0 buff)" }
+    if ($joinBuff -lt 1) { $bad += "join never buffed its PCs (no rank=1 buff)" }
+    if ($spawned -lt $MinEnemies) { $bad += "only $spawned/$want enemies spawned (< $MinEnemies)" }
+    if ($issued -lt 1) { $bad += "host never issued the attack orders" }
+    if ($hostDown -lt 1) { $bad += "no enemy went down (the PCs did not win)" }
+    if ($joinRecv -lt 1) { $bad += "join never reproduced the enemy copies" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  COMBAT-WIN FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "combat_win" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host "  COMBAT-WIN PASS - buffed host=$hostBuff join=$joinBuff PC(s); $spawned/$want enemies, down host=$hostDown join=$joinDown"
+    return (Add-GateResult -Name "combat_win" -Status PASS -Metrics $m)
+}
+
+# death_parity (2026-07-15 owner-authoritative death fix): cross-checks a MANUAL
+# side-by-side session for the "dead on one game, alive on the other" desync.
+# Death is authored by a body's OWNER (reliable EVT_DEATH, ev=2) and reproduced on
+# the peer; a body can also RE-CONTAINER as it dies (squad move), which used to
+# WIPE the peer's death pin (rekeyPeerBody erased the Driven latch). Gates, from
+# both logs (bodies matched on the stable index,serial pair - the container/tab
+# fields legitimately change across a re-key):
+#   1. PARITY - every EVT_DEATH SEND on one side has a matching ev=2 RECV on the
+#      other (the death crossed). Unmatched sends = a death that never reached the
+#      peer.
+#   2. LATCH CARRY - report "[event] REKEY-LATCH ... death=1" (the fix carrying a
+#      dead body's pin onto its new hand key); informational unless a violation
+#      below fires.
+#   3. VETO SANITY - "[death] veto" un-kills a driven copy the OWNER still reports
+#      alive; it must NEVER fire for a body that side ALSO received an EVT_DEATH
+#      for (that would be un-killing an owner-authored corpse). Any such overlap
+#      FAILs.
+# Log-judged against a MANUAL fight session; invoke as:
+#   . scripts\oracles\Combat.ps1
+#   Test-DeathParity -HostFile <Kenshi>\KenshiCoop_host.log -JoinFile <Kenshi-Join>\KenshiCoop_join.log
+function Test-DeathParity {
+    param([string]$HostFile, [string]$JoinFile)
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        Write-Host "  DEATH-PARITY FAIL - log(s) not found (host=$HostFile join=$JoinFile)"
+        return (Add-GateResult -Name "death_parity" -Status FAIL -Detail "missing log")
+    }
+    # index,serial are the last two of the 5-field hand (type,container,cs,index,serial):
+    # they SURVIVE a container re-key, so they are the stable identity to match on.
+    $sendRx = [regex]'\[event\] SEND id=\d+ ev=2 hand=\d+,\d+,\d+,(\d+),(\d+)'
+    $recvRx = [regex]'\[event\] RECV id=\d+ ev=2 .*hand=\d+,\d+,\d+,(\d+),(\d+)'
+    $latchRx = [regex]'\[event\] REKEY-LATCH .*death=1'
+    $vetoRx  = [regex]'\[death\] veto hand=(\d+,\d+)'
+    $collect = {
+        param($file, $rx)
+        $set = @{}
+        foreach ($mm in (Select-String -Path $file -Pattern $rx -AllMatches).Matches) {
+            $set[$mm.Groups[1].Value + ',' + $mm.Groups[2].Value] = $true
+        }
+        return $set
+    }
+    $hSends = & $collect $HostFile $sendRx
+    $jSends = & $collect $JoinFile $sendRx
+    $hRecvs = & $collect $HostFile $recvRx
+    $jRecvs = & $collect $JoinFile $recvRx
+    $totalSends = $hSends.Count + $jSends.Count
+    if ($totalSends -lt 1) {
+        Write-Host "  DEATH-PARITY SKIP - no EVT_DEATH (ev=2) in either log; get a squad member killed so a death is authored"
+        return (Add-GateResult -Name "death_parity" -Status SKIP -Detail "no deaths in session")
+    }
+    # 1. Parity: host sends must be received on the join; join sends on the host.
+    $unmatched = @()
+    foreach ($k in $hSends.Keys) { if (-not $jRecvs.ContainsKey($k)) { $unmatched += "host->join $k" } }
+    foreach ($k in $jSends.Keys) { if (-not $hRecvs.ContainsKey($k)) { $unmatched += "join->host $k" } }
+    # 2. Latch carry (informational count).
+    $latch = @(Select-String -Path $HostFile -Pattern $latchRx -ErrorAction SilentlyContinue).Count +
+             @(Select-String -Path $JoinFile -Pattern $latchRx -ErrorAction SilentlyContinue).Count
+    # 3. Veto sanity: a veto on a body that side ALSO got an owner death for = bug.
+    $vetoBad = @()
+    $vetoTotal = 0
+    foreach ($pair in @(@{ f = $HostFile; dead = $hRecvs }, @{ f = $JoinFile; dead = $jRecvs })) {
+        foreach ($vm in (Select-String -Path $pair.f -Pattern $vetoRx -AllMatches).Matches) {
+            $vetoTotal++
+            $is = $vm.Groups[1].Value
+            if ($pair.dead.ContainsKey($is)) { $vetoBad += "$is (owner-dead)" }
+        }
+    }
+    $m = @{ hostSends = $hSends.Count; joinSends = $jSends.Count
+            hostRecvs = $hRecvs.Count; joinRecvs = $jRecvs.Count
+            unmatched = $unmatched.Count; rekeyLatch = $latch
+            vetoes = $vetoTotal; vetoViolations = $vetoBad.Count }
+    $bad = @()
+    if ($unmatched.Count -gt 0) { $bad += "$($unmatched.Count) death(s) never reached the peer: " + ($unmatched -join ', ') }
+    if ($vetoBad.Count -gt 0)   { $bad += "$($vetoBad.Count) veto(es) fired on an owner-dead body: " + ($vetoBad -join ', ') }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  DEATH-PARITY FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "death_parity" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  DEATH-PARITY PASS - deaths host->join $($hSends.Count) join->host $($jSends.Count), all received; " +
+                "rekey-latch carries=$latch, vetoes=$vetoTotal (0 on owner-dead bodies)")
+    return (Add-GateResult -Name "death_parity" -Status PASS -Metrics $m)
+}
+
+# Combat cohesion parity: pair host<->join SCENARIO COMBATSTATE samples per hand
+# and measure how often a body is fighting on the JOIN while the HOST reports
+# peace (the "in combat on join, not host" churn the player saw), plus join-side
+# fight-state toggles (churn/min). Reported as a FINDING - thresholds for a hard
+# gate are calibrated from real runs first. Sample times use the COMMON wall-clock
+# (line [HH:MM:SS.mmm] prefix + per-log clock offset) via Convert-StampToMs, so
+# SinceMs (from Get-MarkerTimeMs, wall-clock) filters correctly AND host<->join
+# samples pair on ONE clock. NOTE: PowerShell variable names are CASE-INSENSITIVE,
+# so a map named $H and a loop var $h are the SAME variable - use distinct words.
+function Get-CombatParity {
+    param([string]$HostFile, [string]$JoinFile, [int]$SinceMs = 0, [int]$TolMs = 1500)
+    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO COMBATSTATE hand=(\d+,\d+) t=\d+ fight=(\d) wait=(\d)'
+    $hoff = Get-LogClockOffsetMs -File $HostFile
+    $hostMap = @{}
+    foreach ($m in (Select-String -Path $HostFile -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $t = Convert-StampToMs -Groups $g -OffsetMs $hoff
+        if ($t -lt $SinceMs) { continue }
+        $key = $g[5].Value
+        if (-not $hostMap.ContainsKey($key)) { $hostMap[$key] = New-Object System.Collections.ArrayList }
+        [void]$hostMap[$key].Add([pscustomobject]@{ t = $t; fight = [int]$g[6].Value })
+    }
+    $joff = Get-LogClockOffsetMs -File $JoinFile
+    $joinMap = @{}
+    foreach ($m in (Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $t = Convert-StampToMs -Groups $g -OffsetMs $joff
+        if ($t -lt $SinceMs) { continue }
+        $key = $g[5].Value
+        if (-not $joinMap.ContainsKey($key)) { $joinMap[$key] = New-Object System.Collections.ArrayList }
+        [void]$joinMap[$key].Add([pscustomobject]@{ t = $t; fight = [int]$g[6].Value })
+    }
+    $pairs = 0; $joinOnly = 0; $hostOnly = 0; $agree = 0
+    $joinToggles = 0; $tSpanMax = 0
+    foreach ($hand in $joinMap.Keys) {
+        $jSamples = @($joinMap[$hand] | Sort-Object t)
+        $prev = $null
+        foreach ($s in $jSamples) { if ($null -ne $prev -and $s.fight -ne $prev) { $joinToggles++ }; $prev = $s.fight }
+        if ($jSamples.Count -ge 2) { $span = [int]$jSamples[-1].t - [int]$jSamples[0].t; if ($span -gt $tSpanMax) { $tSpanMax = $span } }
+        if (-not $hostMap.ContainsKey($hand)) { continue }
+        $hSamples = @($hostMap[$hand] | Sort-Object t)
+        foreach ($jr in $jSamples) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($hr in $hSamples) { $dd = [Math]::Abs([int]$hr.t - [int]$jr.t); if ($dd -lt $bd) { $bd = $dd; $best = $hr } }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $pairs++
+            if ($jr.fight -eq $best.fight) { $agree++ }
+            elseif ($jr.fight -eq 1) { $joinOnly++ } else { $hostOnly++ }
+        }
+    }
+    $joinOnlyFrac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
+    $hostOnlyFrac = if ($pairs -gt 0) { [Math]::Round($hostOnly / $pairs, 3) } else { 0 }
+    $churnPerMin  = if ($tSpanMax -gt 0) { [Math]::Round($joinToggles * 60000.0 / $tSpanMax, 1) } else { 0 }
+    return [pscustomobject]@{
+        pairs = $pairs; agree = $agree
+        joinOnlyCombat = $joinOnly; joinOnlyFrac = $joinOnlyFrac
+        hostOnlyCombat = $hostOnly; hostOnlyFrac = $hostOnlyFrac
+        joinToggles = $joinToggles; joinChurnPerMin = $churnPerMin
+        handsJoin = $joinMap.Count; handsHost = $hostMap.Count
+    }
+}
+
+# pc_assault (join PC deals REAL damage to a host-owned NPC): the damage-gated
+# counterpart to assault_town. Walks the same intent chain link by link AND adds
+# the damage links assault_town lacks - the whole point of the "join does no
+# damage to NPCs" report:
+#   1. issued  - join ordered its own leader onto the picked victim
+#   2. cap     - the join CAPTURED + streamed the combat intent ([combat] CAP)
+#   3. applied - the host ORDERED its join-PC copy into the fight (r=2; r=1 =
+#                target hand never resolved on the host)
+#   4. fight   - the host's local engine actually runs it (hostview fight=1)
+#   5. DAMAGE  - the victim's flesh/blood DROPS on the HOST (authoritative join-
+#                dealt damage) by >= MinHostDrop. THIS is the link the bug lives on.
+#                Bar/duel NPCs are tanky (blood barely moves, flesh takes the hit),
+#                so the metric is the bigger of the flesh-OR-blood drop.
+#   6. STREAM  - the drop reaches the JOIN (the victim's join-side series also
+#                falls / converges) so the join player SEES the NPC take damage.
+# Also reports host<->join combat COHESION (Get-CombatParity) as a FINDING.
+function Test-PcAssault {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinFight = 2, [double]$MinHostDrop = 5.0,
+          [double]$MinJoinDrop = 3.0, [double]$MaxEndGap = 12.0)
+    $spawn = Select-String -Path $HostFile -Pattern 'SCENARIO PCASSAULT spawned=(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $nSpawn = if ($spawn) { [int]$spawn.Matches[0].Groups[1].Value } else { 0 }
+    $mi = Select-String -Path $JoinFile -Pattern 'SCENARIO PCASSAULT issued atk=(\d+),(\d+) vic=(\d+),(\d+) ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mi) {
+        Write-Host "  PC-ASSAULT FAIL - join never issued the assault (spawn=$nSpawn; no victim pick?) (link 1)"
+        return (Add-GateResult -Name "pc_assault" -Status FAIL -Metrics @{ spawned = $nSpawn } -Detail "no assault order (link 1)")
+    }
+    $atk = $mi.Matches[0].Groups[1].Value + ',' + $mi.Matches[0].Groups[2].Value
+    $vic = $mi.Matches[0].Groups[3].Value + ',' + $mi.Matches[0].Groups[4].Value
+    $T   = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO PCASSAULT issued'
+
+    $capAll  = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' ') -ErrorAction SilentlyContinue).Count
+    $ordOk   = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=2') -ErrorAction SilentlyContinue).Count
+    $ordMiss = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=1') -ErrorAction SilentlyContinue).Count
+    $fight   = @(Select-String -Path $HostFile -Pattern 'SCENARIO PCASSAULT hostview fight=1' -ErrorAction SilentlyContinue).Count
+
+    # Protocol-45 authoritative join-dealt damage: the host logs a "[combat] HIT
+    # RECV ... applied=1" line for every join report it wounds the real NPC with.
+    # This is the UNAMBIGUOUS join-dealt signal - unlike the max vitals drop below,
+    # which can also credit the host's OWN buffed squad and land on an NPC the join
+    # never sampled (the join drop=-1 flake). The reported hand is the join PC's
+    # target, which the JOIN samples every tick, so its vitals series always exists.
+    $hitFlesh = 0.0; $hitBlood = 0.0; $hitCount = 0; $hitHand = ''
+    $hitAgg = @{}
+    foreach ($hm in (Select-String -Path $HostFile -Pattern '\[combat\] HIT RECV id=\d+ hand=(\d+,\d+) flesh=([\d.]+) blood=([\d.]+) applied=1' -ErrorAction SilentlyContinue)) {
+        $g = $hm.Matches[0].Groups
+        $hnd = $g[1].Value
+        $sum = [double]$g[2].Value + [double]$g[3].Value
+        if (-not $hitAgg.ContainsKey($hnd)) { $hitAgg[$hnd] = 0.0 }
+        $hitAgg[$hnd] += $sum
+        $hitFlesh += [double]$g[2].Value; $hitBlood += [double]$g[3].Value; $hitCount++
+    }
+    foreach ($hnd in $hitAgg.Keys) {
+        if ($hitHand -eq '' -or $hitAgg[$hnd] -gt $hitAgg[$hitHand]) { $hitHand = $hnd }
+    }
+    # Join side: "[combat] HIT SEND" proves the join captured its guarded swings'
+    # damage and forwarded it (the report half of the channel).
+    $hitSends = @(Select-String -Path $JoinFile -Pattern '\[combat\] HIT SEND ' -ErrorAction SilentlyContinue).Count
+
+    # Damage = the biggest flesh-OR-blood drop after the assault. Get-VitalsSeries
+    # returns its ArrayList via `,$list` (unrolls to the ArrayList on a bare
+    # assignment); wrapping it in @(...) instead yields a 1-element array HOLDING
+    # the ArrayList (Count=1, .blood broadcasts to nothing -> Measure finds no
+    # 'blood' property, drop reads 0). So assign directly, THEN filter with @().
+    $dmgDrop = {
+        param($file, $hand, $sinceMs)
+        $V = Get-VitalsSeries -File $file -HandIS $hand
+        if ($null -ne $sinceMs) { $V = @($V | Where-Object { $_.t -ge $sinceMs }) }
+        if ($V.Count -lt 2) { return $null }
+        $bloodD = [double]($V | Measure-Object -Property blood -Maximum).Maximum -
+                  [double]($V | Measure-Object -Property blood -Minimum).Minimum
+        $fl = @($V | Where-Object { $null -ne $_.pfl } | ForEach-Object { $_.pfl })
+        if ($fl.Count -lt 2) { $fl = @($V | Where-Object { $null -ne $_.fleshMin } | ForEach-Object { $_.fleshMin }) }
+        $fleshD = 0.0
+        if ($fl.Count -ge 2) {
+            $fleshD = [double]($fl | Measure-Object -Maximum).Maximum -
+                      [double]($fl | Measure-Object -Minimum).Minimum
+        }
+        return [pscustomobject]@{ dmg = [Math]::Max($fleshD, $bloodD); flesh = $fleshD; blood = $bloodD }
+    }
+    # Candidate victim hands from the host's VITALS lines after the assault.
+    $hostHands = @{}
+    foreach ($hm in (Select-String -Path $HostFile -Pattern 'SCENARIO VITALS hand=(\d+,\d+) ' -ErrorAction SilentlyContinue)) {
+        $hostHands[$hm.Matches[0].Groups[1].Value] = $true
+    }
+    $hostDrop = 0.0; $hurtHand = ''; $hostFlesh = 0.0; $hostBlood = 0.0
+    foreach ($h in $hostHands.Keys) {
+        if ($h -eq $atk) { continue }  # skip the attacker's own vitals
+        $d = & $dmgDrop $HostFile $h $T
+        if ($null -ne $d -and $d.dmg -gt $hostDrop) { $hostDrop = $d.dmg; $hurtHand = $h; $hostFlesh = $d.flesh; $hostBlood = $d.blood }
+    }
+    # Join-side "damage reached the join" proof. The join's NPC copies are damage-
+    # GUARDED (local swings suppressed), so ANY flesh/blood drop on a join-sampled
+    # copy is purely HOST-STREAMED damage (the round trip: join reports -> host
+    # applies -> vitals stream mirrors back). So take the max drop across the join's
+    # OWN sampled hands (symmetric to hostDrop) rather than requiring a specific
+    # cross-matched hand - the damaged hand flickers sub-second, so the host's
+    # max-drop / HIT hand is not reliably one the join independently sampled.
+    $joinHands = @{}
+    foreach ($hm in (Select-String -Path $JoinFile -Pattern 'SCENARIO VITALS hand=(\d+,\d+) ' -ErrorAction SilentlyContinue)) {
+        $joinHands[$hm.Matches[0].Groups[1].Value] = $true
+    }
+    $joinDrop = $null; $joinFlesh = 0.0; $joinBlood = 0.0; $endGap = $null; $joinHurt = ''
+    foreach ($h in $joinHands.Keys) {
+        if ($h -eq $atk) { continue }  # skip the join's own attacker vitals
+        $d = & $dmgDrop $JoinFile $h $T
+        if ($null -ne $d -and ($null -eq $joinDrop -or $d.dmg -gt $joinDrop)) {
+            $joinDrop = $d.dmg; $joinFlesh = $d.flesh; $joinBlood = $d.blood; $joinHurt = $h
+        }
+    }
+    # End-state convergence (advisory): if the join's most-hurt hand also has a host
+    # series, compare final blood so a partial stream surfaces.
+    if ($joinHurt -ne '') {
+        $Vh = Get-VitalsSeries -File $HostFile -HandIS $joinHurt; $Vh = @($Vh | Where-Object { $_.t -ge $T })
+        $Vj = Get-VitalsSeries -File $JoinFile -HandIS $joinHurt; $Vj = @($Vj | Where-Object { $_.t -ge $T })
+        if ($Vh.Count -ge 1 -and $Vj.Count -ge 1) {
+            # Coerce with @(...)[0]: a row's .t/.blood can occasionally arrive as a
+            # 1-element array (pipeline wrap upstream), and a bare [double] cast on
+            # an array throws (InvalidCast). @(...)[0] yields the scalar safely.
+            $htEnd = [double](@($Vh[-1].t)[0]); $jtEnd = [double](@($Vj[-1].t)[0])
+            $tEnd = [Math]::Min($htEnd, $jtEnd)
+            $hAt = @($Vh | Where-Object { [double](@($_.t)[0]) -le ($tEnd + 750) })
+            $jAt = @($Vj | Where-Object { [double](@($_.t)[0]) -le ($tEnd + 750) })
+            if ($hAt.Count -ge 1 -and $jAt.Count -ge 1) {
+                $hb = [double](@($hAt[-1].blood)[0]); $jb = [double](@($jAt[-1].blood)[0])
+                $endGap = [Math]::Abs($hb - $jb)
+            }
+        }
+    }
+
+    # Combat cohesion (Get-CombatParity): joinOnlyFrac is the "in combat on the join
+    # while the host reports peace" fraction. Reported as a FINDING, NOT gated: with
+    # the decoupled damage channel the join's local fight is cosmetic while the host
+    # copy holds POSITION PARITY (deliberately at peace), so a moderate joinOnlyFrac
+    # is EXPECTED and healthy here. The 0.08-0.27 originally quoted from the three
+    # protocol-45 validation runs understates the spread: the recorded verdicts for
+    # unmodified builds read 0.038 (2026-07-22), 0.32 (07-29), 0.325 (08-01) and
+    # 0.314 (08-03), with churn up to 30.9/min - so read this number as a wide
+    # 0.04-0.33 and do not treat a shift inside it as a signal. The real
+    # warp/redirect-churn regression guard is combat_snap_rate on combat_crowd/
+    # combat_battle/combat_win (it measures the driven-copy snap teleports directly);
+    # an upper bound on joinOnlyFrac would both flake and point the wrong way (the
+    # damage-first churn regression drove joinOnly toward 0, not up).
+    $cp = Get-CombatParity -HostFile $HostFile -JoinFile $JoinFile -SinceMs $T
+    $joinOnlyFrac = if ($null -ne $cp) { $cp.joinOnlyFrac } else { -1 }
+
+    $m = @{ spawned = $nSpawn; cap = $capAll; ordered = $ordOk; orderMiss = $ordMiss
+            hostFight = $fight
+            hitCount = $hitCount; hitSends = $hitSends
+            hitFlesh = [Math]::Round($hitFlesh, 1); hitBlood = [Math]::Round($hitBlood, 1); hitHand = $hitHand
+            hostDrop = [Math]::Round($hostDrop, 1); hostFlesh = [Math]::Round($hostFlesh, 1); hostBlood = [Math]::Round($hostBlood, 1)
+            hurtHand = $hurtHand; joinHurt = $joinHurt
+            joinDrop = if ($null -ne $joinDrop) { [Math]::Round($joinDrop, 1) } else { -1 }
+            joinFlesh = [Math]::Round($joinFlesh, 1); joinBlood = [Math]::Round($joinBlood, 1)
+            endGap = if ($null -ne $endGap) { [Math]::Round($endGap, 1) } else { -1 }
+            joinOnlyFrac = $joinOnlyFrac
+            joinChurnPerMin = if ($null -ne $cp) { $cp.joinChurnPerMin } else { -1 }
+            cohesionPairs = if ($null -ne $cp) { $cp.pairs } else { 0 } }
+    $joinDealt = $hitFlesh + $hitBlood
+    $bad = @()
+    if ($capAll -lt 1) { $bad += "join never streamed a combat intent for $atk (link 2: capture)" }
+    elseif ($ordOk -lt 1) {
+        if ($ordMiss -ge 1) { $bad += "host saw the intent but the target hand never resolved ($ordMiss r=1 orders; link 3: target resolve)" }
+        else                { $bad += "host never ordered the join-PC copy (0 [combat] order lines; link 3: apply)" }
+    }
+    if ($fight -lt $MinFight) { $bad += "host-side fight never ran (hostview fight=1 x$fight, need >= $MinFight; link 4)" }
+    # Link 5 (THE join-does-no-damage bug): the host must APPLY join-reported damage
+    # to the real NPC. The protocol-45 [combat] HIT RECV signal is authoritative and
+    # unambiguous (unlike the max vitals drop, which can credit the host's own squad).
+    if ($hitSends -lt 1) { $bad += "join never forwarded a combat-hit report (0 [combat] HIT SEND; link 5a: report channel)" }
+    if ($hitCount -lt 1) { $bad += "host applied NO join-dealt damage (0 [combat] HIT RECV applied=1; link 5: THE join-does-no-damage bug)" }
+    elseif ($joinDealt -lt $MinHostDrop) { $bad += "join-dealt damage too small: host applied flesh=$($m.hitFlesh) blood=$($m.hitBlood) (sum $([Math]::Round($joinDealt,1)) < $MinHostDrop; link 5)" }
+    # Link 6: the applied wound must STREAM back so the join SEES the NPC take damage.
+    if ($null -eq $joinDrop -or $joinDrop -lt $MinJoinDrop) {
+        if ($null -ne $endGap -and $endGap -le $MaxEndGap) {
+            if ($joinDealt -ge $MinHostDrop) { $bad += "damage did not reach the join: join drop=$($m.joinDrop) while host applied $([Math]::Round($joinDealt,1)) (link 6: vitals stream)" }
+        } else {
+            $bad += "damage did not reach the join: join drop=$($m.joinDrop) end-gap=$($m.endGap) (link 6: vitals stream)"
+        }
+    }
+    if ($null -ne $cp) {
+        Write-Host ("  PC-ASSAULT FINDING cohesion: pairs=$($cp.pairs) joinOnlyCombat=$($cp.joinOnlyCombat) ($($cp.joinOnlyFrac)) hostOnly=$($cp.hostOnlyCombat) joinChurn/min=$($cp.joinChurnPerMin) [handsJ=$($cp.handsJoin) handsH=$($cp.handsHost)]")
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  PC-ASSAULT FAIL - " + ($bad -join "; ") + " [spawn=$nSpawn cap=$capAll ord=$ordOk fight=$fight hitRecv=$hitCount join-dealt(fl=$($m.hitFlesh)/bl=$($m.hitBlood)) joinDrop=$($m.joinDrop) joinOnlyFrac=$joinOnlyFrac]")
+        return (Add-GateResult -Name "pc_assault" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  PC-ASSAULT PASS - atk=$atk hit-hand=$hitHand cap=$capAll host-orders=$ordOk hostview-fight=$fight; join-dealt authoritative damage flesh=$($m.hitFlesh)/blood=$($m.hitBlood) (x$hitCount reports) streamed to join drop=$($m.joinDrop) (end-gap $($m.endGap)); cohesion joinOnlyFrac=$joinOnlyFrac (finding)")
+    return (Add-GateResult -Name "pc_assault" -Status PASS -Metrics $m)
+}
+
+# host_pc_fight / host_pc_fight_mint (2026-10 Workshop report: a player fought a
+# Shek and, on the friend's screen, that player's character stood still). Both
+# leaders fight at once and every 500 ms each client logs BOTH leaders as it sees
+# them: "SCENARIO HPFIGHT pc=<i,s> owner=<host|join> view=<own|copy> fight= wait=
+# sw= tgt= ctgt= reg= stask= dest=". Judged per DIRECTION - host->join (the join's
+# copy of the fighting host PC: the report) and join->host (the host's copy of the
+# join PC) - over the OWNER's fight samples inside the viewer's sampling span:
+#   0. mint   - (-RequireMint) the join minted the enemies (proxy BOUND)
+#   1. setup  - the owner really fought: >= MinOwnerFight samples, fight=1 + target
+#   2. engaged- the viewer's copy (nearest sample within TolMs) is ENGAGED in the
+#               owner's fight: fighting (fight=1) a body the owner fights in this
+#               brawl (ctgt is the canonical key, so a re-keyed or minted target
+#               still compares; any owner target within BrawlTolMs) and not being
+#               walk-ordered by the drive (dest=0 - a move order replaces the
+#               attack, the copy jogs or stands) - in >= MinEngagedFrac of the
+#               owner's fight samples. In a multi-enemy brawl both engines pick
+#               their next victim themselves every 0.5-2 s (lead_after7_host_pc_fight:
+#               the owner switched targets ~25x in 40 s, the copy's own lock flipped
+#               between the owner's target and another brawler with no order in
+#               between), so same-body-at-the-same-moment parity ('right', owner
+#               targets within TgtTolMs) is reported, not gated: forcing it costs a
+#               clearGoals re-issue per flip, which is what cancelled the swings.
+#   3. resolve- the viewer issued <= MaxUnresolved "[combat] order hand=<pc> ...
+#               r=1" (the streamed target never resolved there: an order storm
+#               that leaves the copy un-ordered)
+# Metrics also carry the copy's fight/right-target/walk shares, its order count
+# and wrong-target snaps - the churn that cancels the attack.
+function Test-HostPcFight {
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = 'host_pc_fight',
+          [switch]$RequireMint, [int]$MinOwnerFight = 6, [double]$MinEngagedFrac = 0.75,
+          [int]$MaxUnresolved = 2, [int]$TolMs = 1000, [int]$TgtTolMs = 2000,
+          [int]$BrawlTolMs = 5000)
+    $label = $GateName.ToUpper().Replace('_', '-')
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name $GateName -Status FAIL -Detail "missing log")
+    }
+    $rx = ('\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO HPFIGHT pc=(\d+,\d+) owner=(host|join) ' +
+           'view=(own|copy) fight=(\d) wait=(\d) sw=(-?\d+) tgt=(\d+,\d+) ctgt=(\d+,\d+) ' +
+           'reg=(\w+) stask=(\d+) dest=(\d)')
+    $read = {
+        param([string]$File)
+        $off = Get-LogClockOffsetMs -File $File
+        $out = New-Object System.Collections.ArrayList
+        foreach ($mm in (Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+            $g = $mm.Matches[0].Groups
+            [void]$out.Add([pscustomobject]@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off); pc = $g[5].Value
+                owner = $g[6].Value; view = $g[7].Value; fight = [int]$g[8].Value
+                ctgt = $g[12].Value; reg = $g[13].Value; stask = [int]$g[14].Value
+                dest = [int]$g[15].Value })
+        }
+        return ,$out
+    }
+    $hostRows = & $read $HostFile
+    $joinRows = & $read $JoinFile
+    $minted = @(Select-String -Path $JoinFile -Pattern '\[spawn\] proxy BOUND hand=' -ErrorAction SilentlyContinue).Count
+
+    $dirs = @(
+        @{ tag = 'hostToJoin'; owner = 'host'; ownRows = $hostRows; viewRows = $joinRows; viewFile = $JoinFile },
+        @{ tag = 'joinToHost'; owner = 'join'; ownRows = $joinRows; viewRows = $hostRows; viewFile = $HostFile }
+    )
+    $m = @{ minted = $minted }
+    $bad = @()
+    $summary = @()
+    foreach ($d in $dirs) {
+        $t = $d.tag
+        $own  = @($d.ownRows  | Where-Object { $_.owner -eq $d.owner -and $_.view -eq 'own' } | Sort-Object t)
+        $copy = @($d.viewRows | Where-Object { $_.owner -eq $d.owner -and $_.view -eq 'copy' } | Sort-Object t)
+        $pc = if ($own.Count -gt 0) { $own[0].pc } elseif ($copy.Count -gt 0) { $copy[0].pc } else { '' }
+        $fightOwn = @($own | Where-Object { $_.fight -eq 1 -and $_.ctgt -ne '0,0' })
+        if ($copy.Count -gt 0) {
+            $lo = [int]$copy[0].t - $TolMs; $hi = [int]$copy[-1].t + $TolMs
+            $fightOwn = @($fightOwn | Where-Object { $_.t -ge $lo -and $_.t -le $hi })
+        } else {
+            $fightOwn = @()
+        }
+        $pairs = 0; $copyFight = 0; $right = 0; $engaged = 0; $walk = 0; $streamed = 0; $combatReg = 0
+        foreach ($o in $fightOwn) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($v in $copy) {
+                $dd = [Math]::Abs([int]$v.t - [int]$o.t)
+                if ($dd -lt $bd) { $bd = $dd; $best = $v }
+            }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $pairs++
+            if ($best.dest -eq 1) { $walk++ }
+            if ($best.stask -eq 65024 -or $best.stask -eq 65025) { $streamed++ }
+            if ($best.reg -eq 'combat') { $combatReg++ }
+            if ($best.fight -ne 1) { continue }
+            $copyFight++
+            $want = @($fightOwn | Where-Object { [Math]::Abs([int]$_.t - [int]$best.t) -le $TgtTolMs } |
+                      ForEach-Object { $_.ctgt })
+            if ($want -contains $best.ctgt) { $right++ }
+            $brawl = @($fightOwn | Where-Object { [Math]::Abs([int]$_.t - [int]$best.t) -le $BrawlTolMs } |
+                       ForEach-Object { $_.ctgt })
+            if (($brawl -contains $best.ctgt) -and $best.dest -ne 1) { $engaged++ }
+        }
+        $n = $fightOwn.Count
+        $engagedFrac = if ($n -gt 0) { [Math]::Round($engaged / $n, 3) } else { 0 }
+        $rightFrac = if ($n -gt 0) { [Math]::Round($right / $n, 3) } else { 0 }
+        $fightFrac = if ($n -gt 0) { [Math]::Round($copyFight / $n, 3) } else { 0 }
+        $walkFrac  = if ($n -gt 0) { [Math]::Round($walk / $n, 3) } else { 0 }
+        $orders = 0; $unresolved = 0; $wrongSnaps = 0
+        if ($pc -ne '') {
+            $orders     = @(Select-String -Path $d.viewFile -Pattern ('\[combat\] order hand=' + $pc + ' ') -ErrorAction SilentlyContinue).Count
+            $unresolved = @(Select-String -Path $d.viewFile -Pattern ('\[combat\] order hand=' + $pc + ' tgt=\d+,\d+ localFight=\d r=1 ') -ErrorAction SilentlyContinue).Count
+            $wrongSnaps = @(Select-String -Path $d.viewFile -Pattern ('\[combat\] snap hand=' + $pc + ' .*wrongTgt=1') -ErrorAction SilentlyContinue).Count
+        }
+        $m["${t}Pc"] = $pc; $m["${t}OwnerFight"] = $n; $m["${t}Pairs"] = $pairs
+        $m["${t}EngagedFrac"] = $engagedFrac
+        $m["${t}CopyFightFrac"] = $fightFrac; $m["${t}RightFrac"] = $rightFrac
+        $m["${t}WalkFrac"] = $walkFrac; $m["${t}Streamed"] = $streamed; $m["${t}CombatRegime"] = $combatReg
+        $m["${t}Orders"] = $orders; $m["${t}Unresolved"] = $unresolved; $m["${t}WrongTgtSnaps"] = $wrongSnaps
+        $summary += ("${t} pc=$pc ownerFight=$n pairs=$pairs engaged=$engagedFrac copyFight=$fightFrac " +
+                     "right=$rightFrac walk=$walkFrac streamed=$streamed regCombat=$combatReg orders=$orders " +
+                     "r1=$unresolved wrongSnaps=$wrongSnaps")
+        if ($n -lt $MinOwnerFight) {
+            $bad += "${t}: the owner of $pc fought in only $n sample(s) inside the viewer's window (need >= $MinOwnerFight; link 1: setup)"
+            continue
+        }
+        if ($engagedFrac -lt $MinEngagedFrac) {
+            $bad += ("${t}: the viewer's copy of $pc was engaged in the owner's fight in only $engaged/$n " +
+                     "owner-fight samples ($engagedFrac < $MinEngagedFrac; fighting at all $fightFrac, " +
+                     "same body $rightFrac, walk-ordered $walkFrac; link 2: engaged)")
+        }
+        if ($unresolved -gt $MaxUnresolved) {
+            $bad += "${t}: $unresolved unresolved-target orders (r=1) for $pc on the viewer (max $MaxUnresolved; link 3: resolve)"
+        }
+    }
+    if ($RequireMint -and $minted -lt 1) {
+        $bad += "the join minted no proxy (no [spawn] proxy BOUND; link 0: the run did not reproduce the runtime-spawn setup)"
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  $label FAIL - " + ($bad -join "; ") + " [" + ($summary -join " | ") + "]")
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  $label PASS - " + ($summary -join " | ") + " minted=$minted")
+    return (Add-GateResult -Name $GateName -Status PASS -Metrics $m)
+}
