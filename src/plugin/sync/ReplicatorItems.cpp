@@ -2674,6 +2674,16 @@ void Replicator::sendTradeOp(NetLink& net, u8 op, u32 me, const Key& k, u32 hold
     h.tType = isForeignTrader(k) ? (k.t & 0x00FFFFFFu) : k.t;
     h.tContainer = k.c; h.tContainerSerial = k.cs; h.tIndex = k.i; h.tSerial = k.s;
     h.money = -1;
+#ifdef KENSHICOOP_HARNESS
+    // Test hook: two clients on ONE machine load one save, so their trader hands agree
+    // and the cross-machine pairing path never runs. Scrambling the wire serial makes
+    // the receiver's raw hand miss, forcing the template/position pairing (trade_lock).
+    {
+        static int scramble = -1;
+        if (scramble < 0) { const char* e = getenv("KENSHICOOP_TRADE_SCRAMBLE"); scramble = (e && e[0] == '1') ? 1 : 0; }
+        if (scramble && !isForeignTrader(k)) h.tSerial ^= 0x5A5A5A5Au;
+    }
+#endif
     TraderDesc d;
     if (describeTraderKey(k, d)) {
         h.flags |= TRADE_FLAG_DESC;
