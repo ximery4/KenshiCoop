@@ -2094,7 +2094,13 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         // KENSHICOOP_XFER_CENSUS_FAB=0 restores the upstream behaviour.
         static int censusFab = -1;
         if (censusFab < 0) { const char* e = getenv("KENSHICOOP_XFER_CENSUS_FAB"); censusFab = (e && e[0] == '0') ? 0 : 1; }
-        bool srcCensusOnly = censusFab && moved == 0 &&
+        // Lab 2026-10-31 (corpse_loot_race FAIL: hostGain=1 joinGain=1): a CORPSE we
+        // census is a body we author, and moved == 0 there means the unit already left
+        // it (the #40 race), not an unproduced yield - fabricating minted the duplicate.
+        // So only world fixtures (hand type 0: node, campfire, box) qualify; corpses and
+        // any character-typed source keep the #40 refusal.
+        bool srcCensusOnly = censusFab && moved == 0 && sk.t == 0 &&
+                             censusCorpses_.count(sk) == 0 &&
                              censusContainers_.count(sk) != 0 &&
                              ownedContainers_.count(sk) == 0 && ownHands_.count(sk) == 0;
         if (moved < (int)p.quantity && (sAuth != localId || srcCensusOnly)) {
