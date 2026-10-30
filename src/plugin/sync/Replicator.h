@@ -1830,6 +1830,33 @@ private:
                      const TradeTable* t);
     // Set the open shop's touched lines + money to the table. false: not reachable here.
     bool applyTradeTable(GameWorld* gw, const Key& k, const char* why);
+    // FORK 165: trader identity across machines. A trader hand is per-machine, so every
+    // trade op carries the trader's template/faction/position and the receiver pairs it
+    // to its own body (tradePeerKey_, like fixtureMap_ for protocol 55). A trader that
+    // is not loaded here gets a FOREIGN key (high bit + sender id in t), so a lock or
+    // table for it can never land on an unrelated local character that happens to own
+    // the same raw hand. A stock RELEASE for an unloaded trader is parked and retried.
+    struct TraderDesc {
+        char sid[48]; char fac[48]; float x, y, z; bool valid;
+        TraderDesc() : x(0), y(0), z(0), valid(false) { sid[0] = 0; fac[0] = 0; }
+    };
+    struct TradePark {
+        TradeHeader hdr; std::vector<InvItemEntry> items;
+        unsigned long since, lastTry;
+    };
+    std::map<std::pair<u32, Key>, Key> tradePeerKey_; // (sender, wire) -> our trader
+    std::map<Key, TraderDesc>          tradeDesc_;    // foreign key -> sender's description
+    std::vector<TradePark>             tradePark_;    // stock RELEASEs waiting for the trader
+    std::map<std::pair<u32, Key>, unsigned long> tradeMissLog_; // rate limit for UNMATCHED logs
+    static bool isForeignTrader(const Key& k) { return (k.t & 0x80000000u) != 0; }
+    bool describeTraderKey(const Key& k, TraderDesc& d) const;
+    // Translate a received header's trader to OUR key. true = paired with a local body
+    // (or a legacy header without a description); false = not loaded here (out = foreign).
+    bool traderLocalKey(GameWorld* gw, u32 sender, const TradeHeader& h, Key& out);
+    void handleTradeOp(GameWorld* gw, NetLink& net, u32 me, bool isHost, const TradeHeader& h,
+                       const std::vector<InvItemEntry>& tail, const Key& k);
+    // tickTradeLock steps 2-3: lock cleanup for departed players + the local window edges.
+    void tickTradeLocal(GameWorld* gw, NetLink& net, u32 me, bool isHost);
 
     // Phase W1 world-item state.
     // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned
