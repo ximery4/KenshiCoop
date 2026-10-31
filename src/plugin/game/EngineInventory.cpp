@@ -746,10 +746,18 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
                     "conservation channel; nested entries fill it)", g[k].sid, g[k].type, createLoose);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             } else {
-                char b[180]; _snprintf(b, sizeof(b) - 1,
-                    "[recon]   CREATE-SKIP-CONTAINER sid='%s' type=%u shortfall=%d (a fabricated "
-                    "backpack would be empty)", g[k].sid, g[k].type, createLoose);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                // FORK: rate-limited (once per 30 s per call site); the same shortfall repeated
+                // every ~5 s for minutes in the 01.11 session and buried the log.
+                static unsigned long s_skipLog = 0; static unsigned int s_skipSup = 0;
+                unsigned long nowT = GetTickCount();
+                if (s_skipLog == 0 || nowT - s_skipLog >= 30000) {
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[recon]   CREATE-SKIP-CONTAINER sid='%s' type=%u shortfall=%d (a fabricated "
+                        "backpack would be empty; +%u suppressed)", g[k].sid, g[k].type, createLoose,
+                        s_skipSup);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    s_skipLog = nowT ? nowT : 1; s_skipSup = 0;
+                } else ++s_skipSup;
                 if (outContainerShort) *outContainerShort = true;
                 createLoose = 0;
             }
@@ -1060,7 +1068,13 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
             "[recon] NESTED sid='%s' type=%u kids=%u rank=%u local=%u",
             top[t].stringID, top[t].itemType, nk, rank, ncand);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-        if (applyToInventory(gw, sub, kids, nk, truncated)) changed = true;
+        // FORK: a bag that sits INSIDE a bag follows the same rule as a top-level one. The
+        // nested pass used to default allowContainerCreate to false, so a join's bag-in-bag was
+        // skipped for the whole session (01.11: 88 CREATE-SKIP-CONTAINER in 7 min on the host)
+        // and the host's save never got it. The grace in applyInventories still applies; if the
+        // engine refuses the creation nothing is added, so this only retries.
+        if (applyToInventory(gw, sub, kids, nk, truncated, allowContainerCreate,
+                             outContainerShort)) changed = true;
     }
     // Nested entries no top-level entry claimed. Their parent reference points at nothing we
     // can see, so they are reconciled NOWHERE - the same silent hole as a missing container,

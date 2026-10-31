@@ -237,6 +237,58 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
+// FORK ledger v0 (observer only, never mutates): after a reconcile, compare what the author
+// said the container holds (nested bags included) with what this machine now holds, per
+// template. A persistent difference is a fact the host's save will not contain - the 01.11
+// backpack losses showed up only as scattered CREATE-SKIP/APPLY-LOST lines, never as "this
+// character is missing 1x sid". Logs at most once per 60 s per container, and only while a
+// difference stands; KENSHICOOP_LEDGER=0 turns it off.
+static void ledgerObserve(GameWorld* gw, const unsigned int kk[5], const unsigned int cHand[5],
+                          const InvItemEntry* want, unsigned int nWant, bool truncated) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KENSHICOOP_LEDGER"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (!on || !gw || (nWant == 0 && !want)) return;
+    static std::map<std::string, unsigned long> lastLog;
+    InvItemEntry have[INV_ITEMS_MAX];
+    unsigned int nHave = engine::captureContainerContents(gw, cHand, have, INV_ITEMS_MAX, 0, 0,
+                                                          /*includeNested*/ true);
+    struct G { char sid[48]; unsigned int type; int want, have; };
+    G g[96]; unsigned int ng = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        const InvItemEntry* src = pass == 0 ? want : have;
+        unsigned int n = pass == 0 ? nWant : nHave;
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int j = 0;
+            for (; j < ng; ++j)
+                if (g[j].type == src[i].itemType && strcmp(g[j].sid, src[i].stringID) == 0) break;
+            if (j == ng) {
+                if (ng >= 96) continue;
+                memset(&g[ng], 0, sizeof(G));
+                strncpy(g[ng].sid, src[i].stringID, sizeof(g[ng].sid) - 1);
+                g[ng].type = src[i].itemType; ++ng;
+            }
+            int q = src[i].quantity < 1 ? 1 : (int)src[i].quantity;
+            if (pass == 0) g[j].want += q; else g[j].have += q;
+        }
+    }
+    int bad = 0;
+    for (unsigned int j = 0; j < ng; ++j) if (g[j].want != g[j].have) ++bad;
+    if (bad == 0) return;
+    unsigned long now = nowMs();
+    char kbuf[96]; _snprintf(kbuf, sizeof(kbuf) - 1, "%u,%u,%u,%u,%u", kk[0], kk[1], kk[2], kk[3], kk[4]); kbuf[sizeof(kbuf) - 1] = 0;
+    unsigned long& last = lastLog[kbuf];
+    if (last != 0 && now - last < 60000) return;
+    last = now ? now : 1;
+    for (unsigned int j = 0; j < ng; ++j) {
+        if (g[j].want == g[j].have) continue;
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[ledger] DIVERGE hand=%u,%u,%u,%u,%u sid='%s' type=%u want=%d have=%d%s",
+            kk[0], kk[1], kk[2], kk[3], kk[4], g[j].sid, g[j].type, g[j].want, g[j].have,
+            truncated ? " (author list truncated)" : "");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::applyInventories(GameWorld* gw) {
     if (invRecv_.empty()) return;
     // A backpack missing here is first left to the W2 conservation channel, which carries the
@@ -413,6 +465,8 @@ void Replicator::applyInventories(GameWorld* gw) {
         // left one (the engine refused it), wait a full grace again rather than every tick.
         if (!bagShort)                                    it->second.bagShortMs = 0;
         else if (it->second.bagShortMs == 0 || bagCreate) it->second.bagShortMs = bagNow;
+        { const unsigned int kk[5] = { k.t, k.c, k.cs, k.i, k.s };
+          ledgerObserve(gw, kk, cHand, items, n, it->second.truncated); }
         // Keep the transfer detector (or, for a mirrored shop counter / research
         // bench, the vendor detector) blind to the reconcile we just performed.
         if (deltaMirror(it->second)) vendorRebase(gw, k, cHand);
