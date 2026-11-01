@@ -2649,8 +2649,28 @@ void Replicator::sendTradeOp(NetLink& net, u8 op, u32 me, const Key& k, u32 hold
     TradeHeader h;
     memset(&h, 0, sizeof(h));
     h.type = PKT_TRADE; h.op = op; h.ownerId = me; h.holder = holder; h.target = target;
-    h.tType = k.t; h.tContainer = k.c; h.tContainerSerial = k.cs; h.tIndex = k.i; h.tSerial = k.s;
+    // A foreign key goes out in its original sender's hand space (the high byte is
+    // ours); the description is what lets every receiver pair it either way.
+    h.tType = isForeignTrader(k) ? (k.t & 0x00FFFFFFu) : k.t;
+    h.tContainer = k.c; h.tContainerSerial = k.cs; h.tIndex = k.i; h.tSerial = k.s;
     h.money = -1;
+#ifdef KENSHICOOP_HARNESS
+    // Test hook: two clients on ONE machine load one save, so their trader hands agree
+    // and the cross-machine pairing path never runs. Scrambling the wire serial makes
+    // the receiver's raw hand miss, forcing the template/position pairing (trade_lock).
+    {
+        static int scramble = -1;
+        if (scramble < 0) { const char* e = getenv("KENSHICOOP_TRADE_SCRAMBLE"); scramble = (e && e[0] == '1') ? 1 : 0; }
+        if (scramble && !isForeignTrader(k)) h.tSerial ^= 0x5A5A5A5Au;
+    }
+#endif
+    TraderDesc d;
+    if (describeTraderKey(k, d)) {
+        h.flags |= TRADE_FLAG_DESC;
+        strncpy(h.tSid, d.sid, sizeof(h.tSid) - 1);
+        strncpy(h.tFac, d.fac, sizeof(h.tFac) - 1);
+        h.tx = d.x; h.ty = d.y; h.tz = d.z;
+    }
     std::vector<InvItemEntry> tail;
     if (t) {
         h.flags |= TRADE_FLAG_STOCK;
@@ -2711,18 +2731,133 @@ bool Replicator::applyTradeTable(GameWorld* gw, const Key& k, const char* why) {
     return t.applied;
 }
 
+bool Replicator::describeTraderKey(const Key& k, TraderDesc& d) const {
+    if (isForeignTrader(k)) {
+        std::map<Key, TraderDesc>::const_iterator it = tradeDesc_.find(k);
+        if (it == tradeDesc_.end() || !it->second.valid) return false;
+        d = it->second;
+        return true;
+    }
+    Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (!c) return false;
+    float heading = 0.0f, age = 0.0f; bool dead = false;
+    if (!engine::describeCharacter(c, d.sid, sizeof(d.sid), d.fac, sizeof(d.fac),
+                                   &d.x, &d.y, &d.z, &heading, &dead, &age))
+        return false;
+    d.sid[sizeof(d.sid) - 1] = '\0'; d.fac[sizeof(d.fac) - 1] = '\0';
+    d.valid = d.sid[0] != '\0';
+    return d.valid;
+}
+
+bool Replicator::traderLocalKey(GameWorld* gw, u32 sender, const TradeHeader& h, Key& out) {
+    Key w; w.t = h.tType; w.c = h.tContainer; w.cs = h.tContainerSerial;
+    w.i = h.tIndex; w.s = h.tSerial;
+    out = w;
+    if (!(h.flags & TRADE_FLAG_DESC) || !h.tSid[0]) return true; // legacy: raw hand
+    char sid[48]; strncpy(sid, h.tSid, sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0';
+    char fac[48]; strncpy(fac, h.tFac, sizeof(fac) - 1); fac[sizeof(fac) - 1] = '\0';
+    std::pair<u32, Key> pk(sender, w);
+    std::map<std::pair<u32, Key>, Key>::iterator ci = tradePeerKey_.find(pk);
+    if (ci != tradePeerKey_.end()) {
+        const Key& l = ci->second;
+        if (engine::resolveCharByHand(l.i, l.s, l.t, l.c, l.cs)) { out = l; return true; }
+        tradePeerKey_.erase(ci); // body unloaded since: pair again
+    }
+    const float BIND = 20.0f; // a trader stands at its counter; crowds are metres apart
+    // Identity first: the same hand naming the same template at the same place here.
+    TraderDesc mine;
+    if (describeTraderKey(w, mine) && strcmp(mine.sid, sid) == 0 &&
+        (mine.x - h.tx) * (mine.x - h.tx) + (mine.z - h.tz) * (mine.z - h.tz) <= BIND * BIND) {
+        tradePeerKey_[pk] = w;
+        return true;
+    }
+    float dist = -1.0f;
+    Character* c = engine::adoptCandidateNear(gw, sid, fac, h.tx, h.ty, h.tz, 2.0f * BIND,
+                                              0, 0, &dist);
+    unsigned int lh[5];
+    if (c && dist >= 0.0f && dist <= BIND && engine::readHand(c, lh)) {
+        // readHand: index, serial, type, container, containerSerial
+        Key l; l.t = lh[2]; l.c = lh[3]; l.cs = lh[4]; l.i = lh[0]; l.s = lh[1];
+        tradePeerKey_[pk] = l;
+        out = l;
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[trade] PAIR from=%u wire=%u,%u,%u,%u,%u -> local=%u,%u,%u,%u,%u d=%.1f sid='%s'",
+            sender, w.t, w.c, w.cs, w.i, w.s, l.t, l.c, l.cs, l.i, l.s, dist, sid);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+    // Not loaded here: a key in the sender's own space that no local body can own.
+    out.t = 0x80000000u | ((sender & 0x7Fu) << 24) | (w.t & 0x00FFFFFFu);
+    TraderDesc& fd = tradeDesc_[out];
+    strncpy(fd.sid, sid, sizeof(fd.sid) - 1); fd.sid[sizeof(fd.sid) - 1] = '\0';
+    strncpy(fd.fac, fac, sizeof(fd.fac) - 1); fd.fac[sizeof(fd.fac) - 1] = '\0';
+    fd.x = h.tx; fd.y = h.ty; fd.z = h.tz; fd.valid = true;
+    unsigned long now = nowMs();
+    unsigned long& last = tradeMissLog_[pk];
+    if (last == 0 || (now - last) >= 10000) {
+        last = now;
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[trade] UNMATCHED from=%u wire=%u,%u,%u,%u,%u sid='%s' pos=%.1f,%.1f best=%.1f",
+            sender, w.t, w.c, w.cs, w.i, w.s, sid, h.tx, h.tz, dist);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    return false;
+}
+
 void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me, bool isHost) {
     std::deque<InboundTrade> q;
     in.drainTrade(q);
     if (!vendorSync_ || !gw) return;
+    unsigned long nowT = nowMs();
+
+    // 0. Parked stock RELEASEs: retry the pairing once a second, give up after 10 min.
+    for (size_t pi = 0; pi < tradePark_.size(); ) {
+        TradePark& pp = tradePark_[pi];
+        if ((nowT - pp.lastTry) < 1000) { ++pi; continue; }
+        pp.lastTry = nowT;
+        Key lk;
+        if (traderLocalKey(gw, pp.hdr.ownerId, pp.hdr, lk)) {
+            TradePark done = pp;
+            tradePark_.erase(tradePark_.begin() + pi);
+            coop::logLine("[trade] PARK-RESOLVED (trader loaded; applying the parked table)");
+            handleTradeOp(gw, net, me, isHost, done.hdr, done.items, lk);
+            continue;
+        }
+        if ((nowT - pp.since) > 600000) {
+            coop::logLine("[trade] PARK-DROP (trader never loaded here within 10 min)");
+            tradePark_.erase(tradePark_.begin() + pi);
+            continue;
+        }
+        ++pi;
+    }
 
     // 1. Received ops.
     for (size_t qi = 0; qi < q.size(); ++qi) {
         const TradeHeader& h = q[qi].hdr;
-        const std::vector<InvItemEntry>& tail = q[qi].items;
+        Key k;
+        bool paired = traderLocalKey(gw, h.ownerId, h, k);
+        if (!paired && h.op == TRADE_RELEASE && (h.flags & TRADE_FLAG_STOCK) && !isHost) {
+            // A join cannot hand this table to any body yet; keep it for when the
+            // trader loads. (The host still merges and relays under the foreign key.)
+            TradePark pp; pp.hdr = h; pp.items = q[qi].items; pp.since = nowT; pp.lastTry = nowT;
+            tradePark_.push_back(pp);
+            if (tradePark_.size() > 64) tradePark_.erase(tradePark_.begin());
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[trade] PARK from=%u lines=%u (trader not loaded here)",
+                h.ownerId, (unsigned)q[qi].items.size());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        handleTradeOp(gw, net, me, isHost, h, q[qi].items, k);
+    }
+    tickTradeLocal(gw, net, me, isHost);
+}
+
+void Replicator::handleTradeOp(GameWorld* gw, NetLink& net, u32 me, bool isHost,
+                               const TradeHeader& h, const std::vector<InvItemEntry>& tail,
+                               const Key& k) {
+    {
         bool stock = (h.flags & TRADE_FLAG_STOCK) != 0;
-        Key k; k.t = h.tType; k.c = h.tContainer; k.cs = h.tContainerSerial;
-        k.i = h.tIndex; k.s = h.tSerial;
         std::map<Key, u32>::iterator hit = tradeHolder_.find(k);
         u32 holder = hit != tradeHolder_.end() ? hit->second : TRADE_NOBODY;
         char b[200];
@@ -2794,6 +2929,9 @@ void Replicator::tickTradeLock(GameWorld* gw, Inbound& in, NetLink& net, u32 me,
         }
     }
 
+}
+
+void Replicator::tickTradeLocal(GameWorld* gw, NetLink& net, u32 me, bool isHost) {
     // 2. Host: a lock held by a player who left is free again.
     if (isHost) {
         for (std::map<Key, u32>::iterator it = tradeHolder_.begin(); it != tradeHolder_.end(); ) {

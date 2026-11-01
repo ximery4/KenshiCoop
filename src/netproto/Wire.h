@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 65;
+const u16 PROTOCOL_VERSION = 65; // NOTE: TradeHeader grew (TRADE_FLAG_DESC); bump this when merging.
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
@@ -923,6 +923,7 @@ enum TradeOp {
 };
 const u8  TRADE_FLAG_STOCK     = 0x01; // the InvItemEntry tail + money are valid
 const u8  TRADE_FLAG_TRUNCATED = 0x02; // the table did not fit TRADE_LINES_MAX
+const u8  TRADE_FLAG_DESC      = 0x04; // FORK 165: tSid/tFac/tx,ty,tz describe the trader
 const u32 TRADE_NOBODY         = 0xFFFFFFFFu;
 const unsigned int TRADE_LINES_MAX = 2 * INV_ITEMS_MAX;
 struct TradeHeader {
@@ -934,12 +935,19 @@ struct TradeHeader {
     u32  ownerId;    // sender's network player id
     u32  holder;     // lock holder after this op (TRADE_NOBODY when free)
     u32  target;     // GRANT/DENY: the requesting player; RELEASE: the releaser
-    u32  tType;      // trader character hand (raw, save-stable)
+    u32  tType;      // trader character hand in the SENDER's hand space
     u32  tContainer;
     u32  tContainerSerial;
     u32  tIndex;
     u32  tSerial;
     i32  money;      // RELEASE: the shop's absolute money (-1 unknown)
+    // FORK 165: the hand is NOT save-stable across machines (session 2026-10-30: the
+    // same Hive traders were 1,39/1,40 on the host and 1,86/1,87 on the join), so the
+    // receiver pairs the trader by template + faction + position, as protocol 55 does
+    // for fixtures. Valid when TRADE_FLAG_DESC is set.
+    char tSid[48];   // trader CHARACTER template stringID
+    char tFac[48];   // trader faction stringID ("" unknown)
+    f32  tx, ty, tz; // trader position on the sender
 };
 
 // Reserved netId meaning "no/invalid world item".
