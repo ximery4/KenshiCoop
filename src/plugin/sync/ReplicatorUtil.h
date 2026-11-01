@@ -241,6 +241,8 @@ const float FURN_MATCH_DIST = 6.0f;       // self-heal fixture search radius aro
 // frame. The detection feedback publishes at ~4 Hz while a driven sneaker's
 // map is non-empty (arrows animate progress; 4 Hz tracks it acceptably).
 const unsigned long SNEAK_APPLY_MS   = 1000; // min gap between setStealthMode applies
+const int           SNEAK_FIGHT_MAX  = 3;     // same-value applies the engine undid before we stop fighting it
+const unsigned long SNEAK_RETRY_MS   = 30000; // slow retry while backed off
 // Protocol 53: same reasoning for the prone posture. A copy whose engine keeps
 // re-deriving the posture (or an AI-suspended one whose medical model has not
 // caught up yet) must be re-posed at 1 Hz, never fought per frame.

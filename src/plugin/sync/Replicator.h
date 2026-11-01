@@ -1109,6 +1109,13 @@ private:
         unsigned long chainHealTick;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
+        // Tug-of-war guard: the engine keeps clearing (or setting) the mode on this copy right after
+        // we apply the owner's value (host copy of a crawling/animal body: ~1 apply/s forever, the
+        // stealth indicator flickered). Count consecutive applies of the SAME wanted value that did
+        // not hold; after SNEAK_FIGHT_MAX stop applying until the wanted value changes (or a slow retry).
+        int           sneakWantLast;  // value of the last apply (-1 none)
+        int           sneakFight;     // consecutive applies of that value that did not hold
+        unsigned long sneakBackoffMs; // when the back-off started (0 = not backing off)
         // Prone posture sync (protocol 53):
         unsigned long proneTick;      // last setProneState apply (posture-flap throttle)
         bool          crawlDrive;     // in the kinematic crawl regime (regime-edge log)
@@ -1190,7 +1197,8 @@ private:
                    carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
                    haveChainOwner(false), chainHealTick(0),
-                   sneakTick(0), proneTick(0), crawlDrive(false),
+                   sneakTick(0), sneakWantLast(-1), sneakFight(0), sneakBackoffMs(0),
+                   proneTick(0), crawlDrive(false),
                    velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    restEnterMs(0), walkBranchPrev(false),
                    zeroF(0), activeF(0), advMs(0),

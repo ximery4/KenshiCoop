@@ -372,6 +372,28 @@ void Replicator::applyInventories(GameWorld* gw) {
                     "[xfer] defer-expired hand=%u,%u,%u,%u,%u (unadjudicated local diff; applying)",
                     k.t, k.c, k.cs, k.i, k.s);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                // which items differ from the detector's baseline, and whether a pend ever formed:
+                // an unpaired take from a peer container (a corpse) is the loot-dupe path
+                const std::map<XKey, int>& bs = xferBase_[k];
+                int shown = 0;
+                for (std::map<XKey, int>::const_iterator ti = tot.begin(); ti != tot.end() && shown < 4; ++ti) {
+                    std::map<XKey, int>::const_iterator bi = bs.find(ti->first);
+                    int was = (bi != bs.end()) ? bi->second : 0;
+                    if (was == ti->second) continue;
+                    char d2[200]; _snprintf(d2, sizeof(d2) - 1,
+                        "[xfer] defer-diff hand=%u,%u,%u,%u,%u sid='%s' base=%d local=%d pend=%d",
+                        k.t, k.c, k.cs, k.i, k.s, ti->first.first.c_str(), was, ti->second,
+                        (int)xferPend_[k].count(ti->first));
+                    d2[sizeof(d2) - 1] = '\0'; coop::logLine(d2); ++shown;
+                }
+                for (std::map<XKey, int>::const_iterator bi = bs.begin(); bi != bs.end() && shown < 4; ++bi) {
+                    if (tot.find(bi->first) != tot.end()) continue;
+                    char d2[200]; _snprintf(d2, sizeof(d2) - 1,
+                        "[xfer] defer-diff hand=%u,%u,%u,%u,%u sid='%s' base=%d local=0 pend=%d",
+                        k.t, k.c, k.cs, k.i, k.s, bi->first.first.c_str(), bi->second,
+                        (int)xferPend_[k].count(bi->first));
+                    d2[sizeof(d2) - 1] = '\0'; coop::logLine(d2); ++shown;
+                }
             }
             xferDefer_.erase(k);
         }
@@ -1975,7 +1997,9 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
             } else if (now - pe->second.sinceMs >= XFER_PEND_MS) {
                 // Never paired: fold into the baseline and stop watching.
                 if (cv != ci->second.end()) base[*ky] = cv->second; else base.erase(*ky);
-                if (dumpX) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                // always logged (was KENSHICOOP_INV_DUMP only): an unpaired diff is how a
+                // take from a peer container (corpse loot) escapes the transfer intent
+                { char b[200]; _snprintf(b, sizeof(b) - 1,
                     "[xfer] fold hand=%u,%u,%u,%u,%u sid='%s' delta=%d (unpaired)",
                     k.t, k.c, k.cs, k.i, k.s, ky->first.c_str(), delta);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b); }

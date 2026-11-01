@@ -1024,9 +1024,27 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (stealthSync_) {
             bool want  = coop::bodySneaking(out.bodyState);
             int  local = engine::readStealthMode(c);
-            if (local >= 0 && ((local != 0) != want) &&
+            if (d.sneakBackoffMs != 0 && (int)want != d.sneakWantLast) {
+                d.sneakBackoffMs = 0; d.sneakFight = 0;   // the owner changed its mind: fresh start
+            }
+            bool backedOff = d.sneakBackoffMs != 0 && (now - d.sneakBackoffMs) < SNEAK_RETRY_MS;
+            if (local >= 0 && ((local != 0) != want) && !backedOff &&
                 (d.sneakTick == 0 || (now - d.sneakTick) >= SNEAK_APPLY_MS)) {
+                // an apply of the same value a few seconds after the previous one means it did not hold
+                if (d.sneakWantLast == (want ? 1 : 0) && d.sneakTick != 0 && (now - d.sneakTick) < 5000) {
+                    if (++d.sneakFight >= SNEAK_FIGHT_MAX && d.sneakBackoffMs == 0) {
+                        d.sneakBackoffMs = now;
+                        char bb[128]; _snprintf(bb, sizeof(bb) - 1,
+                            "[sneak] BACKOFF hand=%u,%u want=%d (engine keeps undoing it; retry in %lu s)",
+                            out.hIndex, out.hSerial, want ? 1 : 0, SNEAK_RETRY_MS / 1000);
+                        bb[sizeof(bb) - 1] = '\0'; coop::logLine(bb);
+                    }
+                } else if (d.sneakWantLast != (want ? 1 : 0)) {
+                    d.sneakFight = 0;
+                }
+                d.sneakWantLast = want ? 1 : 0;
                 d.sneakTick = now;
+                if (d.sneakBackoffMs != 0) d.sneakBackoffMs = now;   // a slow retry: back off again unless it holds
                 bool ok = engine::applyStealth(c, want);
                 char b[128]; _snprintf(b, sizeof(b) - 1,
                     "[sneak] APPLY hand=%u,%u on=%d ok=%d",

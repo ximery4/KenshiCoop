@@ -290,6 +290,12 @@ private:
                 rowf(id, "sid=%s qty=%u type=%u eq=%d name=%s", items[i].stringID, (unsigned int)items[i].quantity,
                      items[i].itemType, (int)items[i].equipped, names + i * 64);
             reply(id, "END");
+        } else if (!strcmp(cmd, "give")) {
+            // give <sid> <type> <qty> : mint qty of sid into the selected member's inventory (repair/restore tool)
+            if (!haveMe || !a3) { reply(id, "ERR usage: give <sid> <type> <qty>"); return; }
+            int r = engine::addItemsToContainerBySid(ctx.gw, mh, a1, (unsigned int)atoi(a2), atoi(a3), 0, "", "");
+            char b[64]; _snprintf(b, sizeof(b) - 1, "%s added=%d", r > 0 ? "OK" : "ERR", r);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
         } else if (!strcmp(cmd, "buy")) {
             unsigned int t[5];
             if (!haveMe || !a2 || !parseHand(a1, t)) { reply(id, "ERR usage: buy t,c,cs,i,s <sid-part>"); return; }
