@@ -186,9 +186,13 @@ private:
                 float d = sqrtf(dx * dx + dz * dz);
                 if (haveMe && d > r) continue;
                 unsigned int h[5]; handFromEntity(npc[i], h);
-                rowf(id, "h=%u,%u,%u,%u,%u d=%.1f pos=%.1f,%.1f,%.1f task=%u bs=%u",
+                engine::CombatRead cr; memset(&cr, 0, sizeof(cr));
+                engine::readCombatByHand(h, &cr);
+                rowf(id, "h=%u,%u,%u,%u,%u d=%.1f pos=%.1f,%.1f,%.1f task=%u bs=%u ic=%d rg=%d tgt=%u,%u,%u,%u,%u",
                      h[0], h[1], h[2], h[3], h[4], d, npc[i].x, npc[i].y, npc[i].z,
-                     (unsigned int)npc[i].task, (unsigned int)npc[i].bodyState);
+                     (unsigned int)npc[i].task, (unsigned int)npc[i].bodyState,
+                     cr.valid && cr.modeActive ? 1 : 0, cr.ranged ? 1 : 0,
+                     cr.target[0], cr.target[1], cr.target[2], cr.target[3], cr.target[4]);
                 ++shown;
             }
             rowf(id, "total=%u shown=%u", n, shown);
@@ -218,6 +222,18 @@ private:
             if (!me || !a3) { reply(id, "ERR no member or usage: move x y z"); return; }
             bool ok = engine::orderMoveTo(me, (float)atof(a1), (float)atof(a2), (float)atof(a3));
             reply(id, ok ? "OK" : "ERR orderMoveTo failed");
+        } else if (!strcmp(cmd, "sneak")) {
+            if (!me || !a1) { reply(id, "ERR usage: sneak 0|1"); return; }
+            reply(id, engine::applyStealth(me, atoi(a1) != 0) ? "OK" : "ERR sneak failed");
+        } else if (!strcmp(cmd, "combat")) {
+            if (!haveMe) { reply(id, "ERR no member"); return; }
+            engine::CombatRead cr; memset(&cr, 0, sizeof(cr));
+            engine::readCombatByHand(mh, &cr);
+            rowf(id, "valid=%d inCombat=%d mode=%d ranged=%d fleeing=%d hasTarget=%d tgt=%u,%u,%u,%u,%u sneak=%d",
+                 cr.valid ? 1 : 0, cr.inCombat ? 1 : 0, cr.modeActive ? 1 : 0, cr.ranged ? 1 : 0,
+                 cr.fleeing ? 1 : 0, cr.hasTarget ? 1 : 0, cr.target[0], cr.target[1], cr.target[2],
+                 cr.target[3], cr.target[4], engine::readStealthMode(me));
+            reply(id, "END");
         } else if (!strcmp(cmd, "halt")) {
             if (!me) { reply(id, "ERR no member"); return; }
             reply(id, engine::haltMovement(me) ? "OK" : "ERR halt failed");
@@ -242,6 +258,51 @@ private:
             if (!haveMe || !a1 || !parseHand(a1, t)) { reply(id, "ERR usage: trade_buy t,c,cs,i,s"); return; }
             char sid[48]; sid[0] = '\0'; int qty = 0;
             int r = engine::traderBuyOne(ctx.gw, t, mh, sid, sizeof(sid), &qty);
+            char b[128]; _snprintf(b, sizeof(b) - 1, "%s res=%d sid=%s qty=%d", r == 1 ? "OK" : "ERR", r, sid, qty);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "stock")) {
+            unsigned int t[5];
+            if (!a1 || !parseHand(a1, t)) { reply(id, "ERR usage: stock t,c,cs,i,s"); return; }
+            InvItemEntry items[96]; static char names[96 * 64];
+            int n = engine::traderStockList(ctx.gw, t, items, 96, names);
+            if (n < 0) { reply(id, "ERR no shop stock (open the trade window first)"); return; }
+            for (int i = 0; i < n; ++i)
+                rowf(id, "sid=%s qty=%u type=%u eq=%d name=%s", items[i].stringID, (unsigned int)items[i].quantity, items[i].itemType, (int)items[i].equipped, names + i * 64);
+            reply(id, "END");
+        } else if (!strcmp(cmd, "inv")) {
+            if (!haveMe) { reply(id, "ERR no member"); return; }
+            InvItemEntry items[96]; static char names[96 * 64];
+            int n = engine::invList(ctx.gw, mh, items, 96, names);
+            for (int i = 0; i < n; ++i)
+                rowf(id, "sid=%s qty=%u type=%u eq=%d name=%s", items[i].stringID, (unsigned int)items[i].quantity,
+                     items[i].itemType, (int)items[i].equipped, names + i * 64);
+            reply(id, "END");
+        } else if (!strcmp(cmd, "buy")) {
+            unsigned int t[5];
+            if (!haveMe || !a2 || !parseHand(a1, t)) { reply(id, "ERR usage: buy t,c,cs,i,s <sid-part>"); return; }
+            char sid[48]; sid[0] = '\0'; int qty = 0;
+            int r = engine::traderBuySid(ctx.gw, t, mh, a2, sid, sizeof(sid), &qty);
+            char b[128]; _snprintf(b, sizeof(b) - 1, "%s res=%d sid=%s qty=%d", r == 1 ? "OK" : "ERR", r, sid, qty);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "sell")) {
+            unsigned int t[5];
+            if (!haveMe || !a2 || !parseHand(a1, t)) { reply(id, "ERR usage: sell t,c,cs,i,s <sid-part>"); return; }
+            // the shop counter nearest to that trader
+            engine::TraderRead trs[16];
+            unsigned int nt = engine::listTradersNear(ctx.gw, 400.0f, trs, 16);
+            float tx = 0, tz = 0; bool found = false;
+            for (unsigned int i = 0; i < nt; ++i)
+                if (!memcmp(trs[i].hand, t, sizeof(t))) { tx = trs[i].x; tz = trs[i].z; found = true; break; }
+            engine::ShopCounterRead rows[32];
+            unsigned int nc = found ? engine::enumShopCountersNear(ctx.gw, 400.0f, rows, 32) : 0;
+            int best = -1; float bd = 1e30f;
+            for (unsigned int i = 0; i < nc; ++i) {
+                float dx = rows[i].x - tx, dz = rows[i].z - tz, d = dx * dx + dz * dz;
+                if (d < bd) { bd = d; best = (int)i; }
+            }
+            if (best < 0) { reply(id, "ERR trader or counter not found"); return; }
+            char sid[48]; sid[0] = '\0'; int qty = 0;
+            int r = engine::vendorSellSid(ctx.gw, mh, rows[best].hand, a2, sid, sizeof(sid), &qty);
             char b[128]; _snprintf(b, sizeof(b) - 1, "%s res=%d sid=%s qty=%d", r == 1 ? "OK" : "ERR", r, sid, qty);
             b[sizeof(b) - 1] = '\0'; reply(id, b);
         } else if (!strcmp(cmd, "trade_close")) {

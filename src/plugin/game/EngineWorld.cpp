@@ -2227,8 +2227,26 @@ namespace {
 // stack placed in the buyer's inventory exactly once. singleOnly: only a
 // one-unit stack (buyItem moves the whole object; a split leaves a stale shop
 // entry that vanishes at the next window open - run tl4). Caller holds SEH.
+static void itemName(Item* it, char* out, size_t n) {
+    out[0] = 0;
+    if (!it) return;
+    GameData* gd = it->getGameData();
+    if (gd) { strncpy(out, gd->name.c_str(), n - 1); out[n - 1] = 0; }
+}
+static bool hasCI(const char* s, const char* want) {
+    size_t n = strlen(want);
+    for (const char* p = s; *p; ++p) { size_t k = 0; while (k < n && p[k] && tolower((unsigned char)p[k]) == tolower((unsigned char)want[k])) ++k; if (k == n) return true; }
+    return false;
+}
+static bool sidHas(const char* sid, const char* want) {
+    if (!want || !want[0]) return true;
+    size_t n = strlen(want);
+    for (const char* p = sid; *p; ++p) { size_t k = 0; while (k < n && p[k] && tolower((unsigned char)p[k]) == tolower((unsigned char)want[k])) ++k; if (k == n) return true; }
+    return false;
+}
+
 int buyOutOf(Inventory* vinv, RootObject* buyer, bool pickLast, bool singleOnly,
-             char* outSid, unsigned int sidLen, int* outQty) {
+             char* outSid, unsigned int sidLen, int* outQty, const char* sidFilter = 0) {
     Inventory* binv = invOf(buyer);
     if (!vinv || !binv) return -1;
     InvItemEntry ent[96];
@@ -2238,6 +2256,10 @@ int buyOutOf(Inventory* vinv, RootObject* buyer, bool pickLast, bool singleOnly,
     for (unsigned int i = 0; i < ne; ++i) {
         if (!items[i] || ent[i].equipped) continue;
         if (singleOnly && ent[i].quantity > 1) continue;
+        if (sidFilter && sidFilter[0]) {   // FORK: bot item selection by sid or display name
+            char nm[64]; itemName(items[i], nm, sizeof(nm));
+            if (!hasCI(ent[i].stringID, sidFilter) && !hasCI(nm, sidFilter)) continue;
+        }
         pick = (int)i;
         if (!pickLast) break;
     }
@@ -2290,6 +2312,73 @@ int traderBuyOne(GameWorld* gw, const unsigned int traderHand[5],
         shopByTraderHand(gw, traderHand, 0, &vinv);
         if (!vinv) return -1;
         return buyOutOf(vinv, buyer, /*pickLast=*/false, /*singleOnly=*/true, outSid, sidLen, outQty);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// FORK (bot_remote): a trader's shop stock, one entry per stack (sid, quantity).
+int traderStockList(GameWorld* gw, const unsigned int traderHand[5], InvItemEntry* out,
+                    unsigned int maxOut, char* names) {
+    if (!gw || !traderHand || !out) return -1;
+    __try {
+        Inventory* vinv = 0;
+        shopByTraderHand(gw, traderHand, 0, &vinv);
+        if (!vinv) return -1;
+        Item* items[96];
+        InvItemEntry ent[96];
+        unsigned int ne = readInvItems(vinv, ent, items, 96);
+        unsigned int n = 0;
+        for (unsigned int i = 0; i < ne && n < maxOut; ++i)
+            if (items[i]) { if (names) itemName(items[i], names + n * 64, 64); out[n++] = ent[i]; }
+        return (int)n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// FORK (bot_remote): the member's own inventory, one entry per stack, with display names.
+int invList(GameWorld* gw, const unsigned int hand[5], InvItemEntry* out, unsigned int maxOut, char* names) {
+    if (!gw || !hand || !out) return -1;
+    RootObject* ro = resolveObjectByHand(hand);
+    if (!ro) return -1;
+    __try {
+        Inventory* inv = invOf(ro);
+        if (!inv) return -1;
+        Item* items[96];
+        InvItemEntry ent[96];
+        unsigned int ne = readInvItems(inv, ent, items, 96);
+        unsigned int n = 0;
+        for (unsigned int i = 0; i < ne && n < maxOut; ++i)
+            if (items[i]) { if (names) itemName(items[i], names + n * 64, 64); out[n++] = ent[i]; }
+        return (int)n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// FORK: buy the first stack whose sid contains sidFilter (the whole stack: buyItem moves it).
+int traderBuySid(GameWorld* gw, const unsigned int traderHand[5], const unsigned int buyerHand[5],
+                 const char* sidFilter, char* outSid, unsigned int sidLen, int* outQty) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (outQty) *outQty = 0;
+    if (!gw || !traderHand || !buyerHand || !g_buyItemFn || !sidFilter || !sidFilter[0]) return -1;
+    RootObject* buyer = resolveObjectByHand(buyerHand);
+    if (!buyer) return -1;
+    __try {
+        Inventory* vinv = 0;
+        shopByTraderHand(gw, traderHand, 0, &vinv);
+        if (!vinv) return -1;
+        return buyOutOf(vinv, buyer, false, false, outSid, sidLen, outQty, sidFilter);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// FORK: sell the first loose stack of srcHand (the seller) whose sid contains sidFilter
+// to the shop counter at counterHand (the purchase call with the roles swapped).
+int vendorSellSid(GameWorld* gw, const unsigned int srcHand[5], const unsigned int counterHand[5],
+                  const char* sidFilter, char* outSid, unsigned int sidLen, int* outQty) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (outQty) *outQty = 0;
+    if (!gw || !srcHand || !counterHand || !g_buyItemFn || !sidFilter || !sidFilter[0]) return -1;
+    RootObject* src = resolveObjectByHand(srcHand);
+    RootObject* dst = resolveObjectByHand(counterHand);
+    if (!src || !dst) return -1;
+    __try {
+        return buyOutOf(invOf(src), dst, false, false, outSid, sidLen, outQty, sidFilter);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 

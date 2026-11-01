@@ -2452,6 +2452,16 @@ int vendorBuyInto(GameWorld* gw, const unsigned int srcHand[5],
 // SEH-guarded (protocol 60): the shop's cash as the counter reports it
 // (RootObject::getMoney - the money a trade at this counter moves).
 bool readShopCash(const unsigned int cHand[5], int* outCash);
+// FORK (bot_remote): shop stock list, buy / sell the first stack whose sid contains sidFilter
+// (case-insensitive). 1 done, 0 nothing matched, -1 unresolved / fault. SEH-guarded.
+int traderStockList(GameWorld* gw, const unsigned int traderHand[5], InvItemEntry* out,
+                    unsigned int maxOut, char* names /* maxOut*64 display names, or 0 */);
+int invList(GameWorld* gw, const unsigned int hand[5], InvItemEntry* out, unsigned int maxOut,
+            char* names);
+int traderBuySid(GameWorld* gw, const unsigned int traderHand[5], const unsigned int buyerHand[5],
+                 const char* sidFilter, char* outSid, unsigned int sidLen, int* outQty);
+int vendorSellSid(GameWorld* gw, const unsigned int srcHand[5], const unsigned int counterHand[5],
+                  const char* sidFilter, char* outSid, unsigned int sidLen, int* outQty);
 // SEH-guarded: move the counter's cash to `target` through the engine's own
 // takeMoney (a negative amount pays in). *outAfter = the re-read value.
 bool setShopCash(const unsigned int cHand[5], int target, int* outAfter);
