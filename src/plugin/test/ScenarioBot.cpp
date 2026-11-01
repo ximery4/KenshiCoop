@@ -171,9 +171,11 @@ private:
                  ctx.peerReady ? 1 : 0, sel_, n);
             for (unsigned int i = 0; i < n; ++i) {
                 unsigned int h[5]; handFromEntity(sq[i], h);
-                rowf(id, "m=%u h=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f task=%u bs=%u moving=%d", i,
+                char nm[48]; nm[0] = 0;
+                { Character* ch = engine::resolve(sq[i]); if (ch) engine::charName(ch, nm, sizeof(nm)); }
+                rowf(id, "m=%u h=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f task=%u bs=%u moving=%d tab=%d own=%d name=%s", i,
                      h[0], h[1], h[2], h[3], h[4], sq[i].x, sq[i].y, sq[i].z,
-                     (unsigned int)sq[i].task, (unsigned int)sq[i].bodyState, (int)sq[i].cMoving);
+                     (unsigned int)sq[i].task, (unsigned int)sq[i].bodyState, (int)sq[i].cMoving, tabRankOf(sq, n, i), (tabRankOf(sq, n, i) == (int)ctx.localId) ? 1 : 0, nm);
             }
             reply(id, "END");
         } else if (!strcmp(cmd, "npcs")) {
@@ -234,6 +236,17 @@ private:
                  cr.fleeing ? 1 : 0, cr.hasTarget ? 1 : 0, cr.target[0], cr.target[1], cr.target[2],
                  cr.target[3], cr.target[4], engine::readStealthMode(me));
             reply(id, "END");
+        } else if (!strcmp(cmd, "split")) {
+            // eject the selected member into a NEW squad tab (the engine's own separateIntoMyOwnSquad)
+            if (!haveMe) { reply(id, "ERR no member"); return; }
+            unsigned int before[5] = {0, 0, 0, 0, 0}, after[5] = {0, 0, 0, 0, 0};
+            int r = engine::probeMoveSquadMember(ctx.gw, mh, mh, 0, before, after);
+            char b[160]; _snprintf(b, sizeof(b) - 1, "%s res=%d after=%u,%u,%u,%u,%u", r == 1 ? "OK" : "ERR", r,
+                                   after[0], after[1], after[2], after[3], after[4]);
+            b[sizeof(b) - 1] = 0; reply(id, b);
+        } else if (!strcmp(cmd, "savegame")) {
+            if (!a1) { reply(id, "ERR usage: savegame <name>"); return; }
+            reply(id, engine::saveGameAs(a1) ? "OK" : "ERR save failed");
         } else if (!strcmp(cmd, "halt")) {
             if (!me) { reply(id, "ERR no member"); return; }
             reply(id, engine::haltMovement(me) ? "OK" : "ERR halt failed");
