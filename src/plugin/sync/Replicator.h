@@ -2413,7 +2413,8 @@ private:
     //   (doctrine 16; the packet's limbState[] is the self-heal).
     struct MedPub  {
         u32 hash; unsigned long lastSendMs; unsigned char limbPrev[4];
-        MedPub() : hash(0), lastSendMs(0) {
+        unsigned long partsLogMs;   // last [med] SEND-PARTS diagnostic line (owner vs copy comparison)
+        MedPub() : hash(0), lastSendMs(0), partsLogMs(0) {
             for (int i = 0; i < 4; ++i) limbPrev[i] = 0xFF;
         }
     };
@@ -2421,7 +2422,8 @@ private:
     // per limb - first aid on a head wound forwards too.
     struct MedRecv {
         float recvBand[12]; float sentBand[12]; unsigned long lastFwdMs; bool have;
-        MedRecv() : lastFwdMs(0), have(false) {
+        unsigned long partsLogMs;   // last [med] COPY-PARTS diagnostic line
+        MedRecv() : lastFwdMs(0), have(false), partsLogMs(0) {
             for (int i = 0; i < 12; ++i) { recvBand[i] = -1.0f; sentBand[i] = -1.0f; }
         }
     };

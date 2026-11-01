@@ -190,11 +190,13 @@ private:
                 unsigned int h[5]; handFromEntity(npc[i], h);
                 engine::CombatRead cr; memset(&cr, 0, sizeof(cr));
                 engine::readCombatByHand(h, &cr);
-                rowf(id, "h=%u,%u,%u,%u,%u d=%.1f pos=%.1f,%.1f,%.1f task=%u bs=%u ic=%d rg=%d tgt=%u,%u,%u,%u,%u",
+                char nm[48]; nm[0] = 0;
+                { Character* ch = engine::resolve(npc[i]); if (ch) engine::charName(ch, nm, sizeof(nm)); }
+                rowf(id, "h=%u,%u,%u,%u,%u d=%.1f pos=%.1f,%.1f,%.1f task=%u bs=%u ic=%d rg=%d tgt=%u,%u,%u,%u,%u name=%s",
                      h[0], h[1], h[2], h[3], h[4], d, npc[i].x, npc[i].y, npc[i].z,
                      (unsigned int)npc[i].task, (unsigned int)npc[i].bodyState,
                      cr.valid && cr.modeActive ? 1 : 0, cr.ranged ? 1 : 0,
-                     cr.target[0], cr.target[1], cr.target[2], cr.target[3], cr.target[4]);
+                     cr.target[0], cr.target[1], cr.target[2], cr.target[3], cr.target[4], nm);
                 ++shown;
             }
             rowf(id, "total=%u shown=%u", n, shown);
@@ -290,6 +292,44 @@ private:
                 rowf(id, "sid=%s qty=%u type=%u eq=%d name=%s", items[i].stringID, (unsigned int)items[i].quantity,
                      items[i].itemType, (int)items[i].equipped, names + i * 64);
             reply(id, "END");
+        } else if (!strcmp(cmd, "modes")) {
+            // the orders-panel toggles of the selected member: block hold passive taunt ranged stealth
+            if (!me) { reply(id, "ERR no member"); return; }
+            int m = engine::readCombatModes(me);
+            if (m < 0) { reply(id, "ERR unreadable"); return; }
+            rowf(id, "block=%d hold=%d passive=%d taunt=%d ranged=%d stealth=%d", (m & 1) ? 1 : 0, (m & 2) ? 1 : 0,
+                 (m & 4) ? 1 : 0, (m & 8) ? 1 : 0, (m & 16) ? 1 : 0, engine::readStealthMode(me));
+            reply(id, "END");
+        } else if (!strcmp(cmd, "mode")) {
+            // mode block|hold|passive|taunt|ranged 0|1
+            if (!me || !a2) { reply(id, "ERR usage: mode block|hold|passive|taunt|ranged 0|1"); return; }
+            int bit = !strcmp(a1, "block") ? 1 : !strcmp(a1, "hold") ? 2 : !strcmp(a1, "passive") ? 4
+                    : !strcmp(a1, "taunt") ? 8 : !strcmp(a1, "ranged") ? 16 : 0;
+            if (!bit) { reply(id, "ERR unknown mode"); return; }
+            reply(id, engine::applyCombatModes(me, bit, atoi(a2) ? bit : 0) ? "OK" : "ERR mode failed");
+        } else if (!strcmp(cmd, "loot")) {
+            // loot [radius]: move everything from the nearest dead body in reach into the selected member
+            // (the same container move a UI drag makes, so the transfer detector sees it like a real take)
+            if (!haveMe) { reply(id, "ERR no member"); return; }
+            float rad = a1 ? (float)atof(a1) : 12.0f;
+            static engine::CorpseRead cr[16];
+            unsigned int nc = engine::enumNpcBodiesNear(ctx.gw, rad + 60.0f, cr, 16, true);
+            int best = -1; float bd = 1e30f;
+            for (unsigned int i = 0; i < nc; ++i) {
+                float dx = cr[i].x - e.x, dz = cr[i].z - e.z, d = dx * dx + dz * dz;
+                if (d < bd) { bd = d; best = (int)i; }
+            }
+            if (best < 0 || bd > rad * rad) { reply(id, "ERR no corpse in reach"); return; }
+            InvItemEntry items[64];
+            unsigned int n = engine::captureContainerContents(ctx.gw, cr[best].hand, items, 64, 0);
+            int moved = 0;
+            for (unsigned int i = 0; i < n; ++i)
+                moved += engine::moveItemBetweenContainers(ctx.gw, cr[best].hand, mh, items[i].stringID,
+                                                           items[i].itemType, items[i].quantity < 1 ? 1 : (int)items[i].quantity);
+            char b[160]; _snprintf(b, sizeof(b) - 1, "%s corpse=%u,%u,%u,%u,%u items=%u moved=%d d=%.1f",
+                                   moved > 0 ? "OK" : "ERR", cr[best].hand[0], cr[best].hand[1], cr[best].hand[2],
+                                   cr[best].hand[3], cr[best].hand[4], n, moved, sqrt(bd));
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
         } else if (!strcmp(cmd, "give")) {
             // give <sid> <type> <qty> : mint qty of sid into the selected member's inventory (repair/restore tool)
             if (!haveMe || !a3) { reply(id, "ERR usage: give <sid> <type> <qty>"); return; }

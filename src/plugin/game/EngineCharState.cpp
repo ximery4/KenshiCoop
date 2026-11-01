@@ -525,6 +525,40 @@ bool applyStealth(Character* c, bool on) {
     }
 }
 
+// The orders-panel combat toggles (CharStats flags; the panel buttons only flip these bytes).
+int readCombatModes(Character* c) {
+    if (!c) return -1;
+    __try {
+        CharStats* s = c->stats;
+        if (!s) return -1;
+        int m = 0;
+        if (s->_defensiveMode)    m |= 1;
+        if (s->_holdPositionMode) m |= 2;
+        if (s->passiveCombatMode) m |= 4;
+        if (s->tauntMode)         m |= 8;
+        if (s->rangedMode)        m |= 16;
+        return m;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+bool applyCombatModes(Character* c, int mask, int values) {
+    if (!c) return false;
+    __try {
+        CharStats* s = c->stats;
+        if (!s) return false;
+        if (mask & 1)  s->_defensiveMode    = (values & 1)  != 0;
+        if (mask & 2)  s->_holdPositionMode = (values & 2)  != 0;
+        if (mask & 4)  s->passiveCombatMode = (values & 4)  != 0;
+        if (mask & 8)  s->tauntMode         = (values & 8)  != 0;
+        if (mask & 16) s->rangedMode        = (values & 16) != 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool applyStealthSeer(GameWorld* gw, Character* sneaker,
                       const unsigned int npcHand[5], unsigned char see, float prog) {
     (void)gw;

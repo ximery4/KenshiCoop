@@ -14,6 +14,8 @@
 
 namespace coop {
 
+static void logMedParts(const char* tag, unsigned int hi, unsigned int hs, const engine::MedicalRead& m);
+
 // Quantized fingerprint of a medical snapshot (FNV-1a over rounded fields):
 // sub-noise wobble (blood regen ticks at ~0.01) must not chatter the reliable
 // channel, so blood/flesh/bandaging quantize to 0.5 units and bleed to 0.05.
@@ -213,6 +215,10 @@ void Replicator::publishMedical(GameWorld* gw, NetLink& net, u32 ownerId) {
                 (unsigned)mr.limbState[0], (unsigned)mr.limbState[1],
                 (unsigned)mr.limbState[2], (unsigned)mr.limbState[3]);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (mp.partsLogMs == 0 || (now - mp.partsLogMs) >= 10000) {
+                mp.partsLogMs = now;
+                logMedParts("SEND-PARTS", k.i, k.s, mr);
+            }
         }
     }
     // Age out entries no longer published (left the owned set / NPC set went
@@ -223,6 +229,21 @@ void Replicator::publishMedical(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (!live) medPub_.erase(mit++);
         else ++mit;
     }
+}
+
+// Diagnostic (01.11.2026 wound-state mismatch between windows): one line per body with EVERY anatomy
+// part as type.side:flesh/max/bandage. Written on the owner at send time and on the receiving copy
+// right after writeMedical (same format), so a log comparison shows whether the copy's flesh, local
+// max health or bandage differs from the owner's. Throttled by the caller.
+static void logMedParts(const char* tag, unsigned int hi, unsigned int hs, const engine::MedicalRead& m) {
+    char b[640];
+    int n = _snprintf(b, sizeof(b) - 1, "[med] %s hand=%u,%u blood=%.1f parts=", tag, hi, hs, m.blood);
+    for (unsigned int i = 0; i < m.nParts && i < 12 && n > 0 && n < (int)sizeof(b) - 40; ++i) {
+        if (!m.parts[i].used) continue;
+        n += _snprintf(b + n, sizeof(b) - 1 - n, "%u.%u:%.0f/%.0f/%.0f ", (unsigned)m.parts[i].partType,
+                       (unsigned)m.parts[i].side, m.parts[i].flesh, m.parts[i].maxHealth, m.parts[i].bandaging);
+    }
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
 void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId) {
@@ -273,6 +294,16 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         // engage (the posture apply in applyTargets is the other half).
         w.crippled    = (p.flags & MED_CRIPPLED) != 0;
         engine::writeMedical(c, w);
+        {   // owner's values vs what this copy holds right after the write (every 10 s per body)
+            MedRecv& dr = medRecv_[k];
+            unsigned long dn = nowMs();
+            if (dr.partsLogMs == 0 || dn - dr.partsLogMs >= 10000) {
+                dr.partsLogMs = dn;
+                logMedParts("RCV-PARTS", k.i, k.s, w);
+                engine::MedicalRead back; memset(&back, 0, sizeof(back));
+                if (engine::readMedical(c, &back) && back.valid) logMedParts("COPY-PARTS", k.i, k.s, back);
+            }
+        }
         // Limb-state self-heal (Phase C/D): reconcile stump/crushed/robotic
         // state with the owner's. The reliable EVT_AMPUTATE/EVT_CRUSH events
         // carry the transition moment; this closes any gap (late join, missed

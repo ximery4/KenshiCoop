@@ -1688,6 +1688,10 @@ int readStealthMode(Character* c);
 // Toggle the engine's own stealth mode on the LOCAL body (sneak-walk pose,
 // stealthUpdate scanning, skill use - the full chain). Idempotent. SEH-guarded.
 bool applyStealth(Character* c, bool on);
+// Orders-panel combat toggles as a bitmask: 1 block, 2 hold position, 4 passive, 8 taunt, 16 ranged.
+// readCombatModes returns -1 when unreadable; applyCombatModes sets only the bits in `mask` to `values`.
+int  readCombatModes(Character* c);
+bool applyCombatModes(Character* c, int mask, int values);
 // Replay one detection entry between the LOCAL pair: resolve the seer by hand
 // and run Character::notifyICanSeeYouSneaking on the local sneaker - exactly
 // what the seer's own vision check would have done, so the marker arrows and
