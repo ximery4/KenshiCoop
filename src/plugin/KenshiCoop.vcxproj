@@ -195,6 +195,9 @@
     <ClCompile Include="test\ScenarioSession.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
     </ClCompile>
+    <ClCompile Include="test\ScenarioBot.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
     <!-- ENet (Windows source set). unix.c is intentionally excluded. -->
     <ClCompile Include="..\..\third_party\enet\enet\callbacks.c" />
     <ClCompile Include="..\..\third_party\enet\enet\compress.c" />

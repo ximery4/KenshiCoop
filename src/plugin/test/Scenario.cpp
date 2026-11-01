@@ -23,6 +23,7 @@ Scenario* makeScenario(const std::string& name) {
     if ((s = makeCharStateScenario(name))) return s;
     if ((s = makeBuildingScenario(name)))  return s;
     if ((s = makeSessionScenario(name)))   return s;
+    if ((s = makeBotScenario(name)))       return s; // FORK: bot_remote
     return 0;
 }
 
