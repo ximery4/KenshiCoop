@@ -289,6 +289,27 @@ static void ledgerObserve(GameWorld* gw, const unsigned int kk[5], const unsigne
     }
 }
 
+// Per-item totals the cross-owner transfer detector compares between scans. They MUST include what
+// the container's worn bags hold: a looted or dragged item lands inside the character's backpack, so
+// a top-level-only count saw the take from a corpse (a loss) with no matching gain, never paired it,
+// and the host's corpse still held the item - the corpse-loot dupe of 01.11.2026 (the transfer intent
+// was never sent; the unpaired diff then folded into the baseline). A move between loose inventory
+// and the worn bag nets to zero here, so it no longer shows up as a spurious loss either. Returns
+// false when the container does not fit the 64-entry read: totals would be incomplete, so the
+// detector must not compare them.
+static bool captureXferTotals(GameWorld* gw, const unsigned int cHand[5],
+                              std::map<std::pair<std::string, u32>, int>& tot) {
+    InvItemEntry items[64];
+    bool truncated = false;
+    unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0, &truncated, true);
+    if (truncated) return false;
+    for (unsigned int i = 0; i < n; ++i) {
+        int q = items[i].quantity; if (q < 1) q = 1;
+        tot[std::make_pair(std::string(items[i].stringID), (u32)items[i].itemType)] += q;
+    }
+    return true;
+}
+
 void Replicator::applyInventories(GameWorld* gw) {
     if (invRecv_.empty()) return;
     // A backpack missing here is first left to the W2 conservation channel, which carries the
@@ -353,13 +374,9 @@ void Replicator::applyInventories(GameWorld* gw) {
         if (xferScanMs_ != 0 && xferSeeded_.count(k) != 0 &&
             engine::resolveObjectByHand(cHand) != 0) {
             const unsigned long XFER_DEFER_MS = 3000;
-            InvItemEntry cur[64];
-            unsigned int nc = engine::captureContainerContents(gw, cHand, cur, 64, 0);
             std::map<XKey, int> tot;
-            for (unsigned int i = 0; i < nc; ++i) {
-                int q = cur[i].quantity; if (q < 1) q = 1;
-                tot[XKey(std::string(cur[i].stringID), cur[i].itemType)] += q;
-            }
+            // worn-bag contents count too (see captureXferTotals); an unreadable (truncated) copy defers nothing
+            if (!captureXferTotals(gw, cHand, tot)) tot = xferBase_[k];
             if (tot != xferBase_[k]) {
                 unsigned long now = nowMs();
                 unsigned long& since = xferDefer_[k];
@@ -1874,14 +1891,12 @@ void Replicator::xferRebase(GameWorld* gw, const Key& k) {
     unsigned int cHand[5];
     handForContainerKey(k, cHand, peerContainerOwner(k));
     std::map<XKey, int>& base = xferBase_[k];
-    base.clear();
     if (engine::resolveObjectByHand(cHand) != 0) {
-        InvItemEntry items[64];
-        unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
-        for (unsigned int i = 0; i < n; ++i) {
-            int q = items[i].quantity; if (q < 1) q = 1;
-            base[XKey(std::string(items[i].stringID), items[i].itemType)] += q;
-        }
+        std::map<XKey, int> fresh;
+        if (captureXferTotals(gw, cHand, fresh)) base.swap(fresh);
+        else base.clear();
+    } else {
+        base.clear();
     }
     xferSeeded_[k] = true;
     xferPend_.erase(k);
@@ -1959,11 +1974,7 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
         handForContainerKey(*it, cHand, peerContainerOwner(*it));
         if (engine::resolveObjectByHand(cHand) == 0) continue;
         std::map<XKey, int>& tot = cur[*it];
-        unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
-        for (unsigned int i = 0; i < n; ++i) {
-            int q = items[i].quantity; if (q < 1) q = 1;
-            tot[XKey(std::string(items[i].stringID), items[i].itemType)] += q;
-        }
+        if (!captureXferTotals(gw, cHand, tot)) { cur.erase(*it); continue; }   // too big to compare: leave the baseline
         if (!xferSeeded_[*it]) { xferBase_[*it] = tot; xferSeeded_[*it] = true; cur.erase(*it); }
     }
 
@@ -2059,7 +2070,7 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
             // may need them if it has to fabricate a missing non-gear copy.
             pkt.level = GRADE_NA;
             unsigned int dHand[5] = { f.dst.t, f.dst.c, f.dst.cs, f.dst.i, f.dst.s };
-            unsigned int nd = engine::captureContainerContents(gw, dHand, items, 64, 0);
+            unsigned int nd = engine::captureContainerContents(gw, dHand, items, 64, 0, 0, true);
             for (unsigned int j = 0; j < nd; ++j) {
                 if (items[j].itemType != f.key.second) continue;
                 if (strcmp(items[j].stringID, f.key.first.c_str()) != 0) continue;
@@ -2182,7 +2193,14 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                              censusCorpses_.count(sk) == 0 &&
                              censusContainers_.count(sk) != 0 &&
                              ownedContainers_.count(sk) == 0 && ownHands_.count(sk) == 0;
-        if (moved < (int)p.quantity && (sAuth != localId || srcCensusOnly)) {
+        // Lab 2026-11-01 (corpse_loot_race: 1 of 5 runs hostGain=1 joinGain=1, and the same dupe in the
+        // live session): a corpse the host authors can be absent from the ~1 Hz census at the moment the
+        // intent arrives (it is outside the census radius for that pass), so its author reads as unknown
+        // (sAuth = OWNER_ID_ALL, cens=0) and the "peer's copy is short, fabricate" branch minted a second
+        // unit. An UNKNOWN author of a character-typed source (corpse / body) never justifies minting:
+        // refuse, the author rolls its optimistic move back. A world fixture (hand type 0) keeps its path.
+        bool unknownCharSrc = (sAuth == OWNER_ID_ALL && sk.t != 0);
+        if (moved < (int)p.quantity && ((sAuth != localId && !unknownCharSrc) || srcCensusOnly)) {
             // Our src copy is short (desync) - fabricate the shortfall into dst so the
             // trade still lands. Non-gear always did this; gear joined once spike 451
             // made weapon fabrication work (armour always could). Dupe safety: the
