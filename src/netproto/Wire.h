@@ -25,7 +25,9 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 65; // NOTE: TradeHeader grew (TRADE_FLAG_DESC); bump this when merging.
+// FORK (ximery4/KenshiCoop): fork wire versions live at 165+ so a fork DLL can never
+// handshake with an upstream build. 165 = 65 + trader identity in TradeHeader.
+const u16 PROTOCOL_VERSION = 165;
 
 // Session size: the host (player id 0) plus up to MAX_PLAYERS-1 joins (ids
 // 1..MAX_PLAYERS-1). Star topology: joins talk only to the host, which relays
