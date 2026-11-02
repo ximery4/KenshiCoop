@@ -758,7 +758,16 @@ void __fastcall refreshInv_hook(ActivePlatoon* self, bool firstTime) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     bool skip = isTrader == 1 && (lh[1] != 0 || lh[2] != 0) && g_vendorRefreshGate &&
                 g_vendorRefreshGate(lh[1], lh[2]);
+    // FORK 2026-11-02: the engine calls this ~90x/s for a parked trader (102957 lines in one 30-min session);
+    // log the first call per leader and then at most once per 10 s (the refresh itself is untouched).
+    static unsigned int s_lastLeader = 0xFFFFFFFFu; static unsigned long s_lastLogMs = 0; static unsigned long s_quiet = 0;
+    bool logIt = false;
     if (isTrader == 1) {
+        unsigned long nowT = GetTickCount();
+        if (lh[4] != s_lastLeader || firstTime || (nowT - s_lastLogMs) >= 10000) { logIt = true; s_lastLeader = lh[4]; s_lastLogMs = nowT; }
+        else ++s_quiet;
+    }
+    if (logIt) {
         char b[176];
         _snprintf(b, sizeof(b) - 1,
                   "[vendor] %s first=%d leader=%u,%u,%u,%u,%u",

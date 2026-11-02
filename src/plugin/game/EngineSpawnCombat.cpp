@@ -1911,9 +1911,12 @@ bool writeMedical(Character* c, const MedicalRead& in) {
                 if ((unsigned char)p->whatAmI != pr.partType ||
                     (unsigned char)p->side    != pr.side) continue;
                 // -1 = the OWNER's field is unreadable; never write that.
-                if (pr.flesh     >= 0.0f) p->flesh       = pr.flesh;
+                // FORK: real flesh/bandage go NEGATIVE (a crippled part reads -43); the unreadable
+                // sentinel is exactly -1, so test for that, not for "< 0" (live 2026-11-02: copies
+                // kept the healed value while the owner showed a serious injury).
+                if (pr.flesh     != -1.0f) p->flesh       = pr.flesh;
                 if (pr.fleshStun >= 0.0f) p->fleshStun   = pr.fleshStun;
-                if (pr.bandaging >= 0.0f) p->bandaging   = pr.bandaging;
+                if (pr.bandaging != -1.0f) p->bandaging   = pr.bandaging;
                 if (pr.juryRig   >= 0.0f) p->juryRigging = pr.juryRig;
             }
         } else {
@@ -2281,6 +2284,17 @@ bool vetoLocalDeath(Character* c) {
         med->dead       = false; // Character::isDead() reads this -> clears BODY_DEAD
         med->unconcious = false;
         if (med->blood < 80.0f) med->blood = 80.0f; // healthy floor (raise only)
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool vetoLocalKo(Character* c) {
+    if (!c) return false;
+    knockDown(c, false); // own SEH: clears the forced KO timer + releases the ragdoll
+    __try {
+        c->medical.unconcious = false;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;

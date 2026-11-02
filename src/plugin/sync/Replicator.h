@@ -1025,6 +1025,7 @@ private:
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
         bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
+        unsigned long koUpSinceMs;    // FORK: first tick the owner stream read upright under a KO latch (0 = not counting)
         bool         carriedDown;     // a KO'd passenger, remembered ACROSS the drop. Leaving a
                                       //   shoulder is a physical transient: the body detaches and
                                       //   falls for a few frames before the engine re-flags it
@@ -1181,7 +1182,7 @@ private:
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
                    taskNoneTick(0), taskLapseTick(0), taskLapses(0),
                    detached(false), downApplied(false),
-                   koLatched(false), deathLatched(false), carriedDown(false),
+                   koLatched(false), deathLatched(false), koUpSinceMs(0), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),

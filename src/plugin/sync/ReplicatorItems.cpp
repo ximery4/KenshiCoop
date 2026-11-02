@@ -2025,8 +2025,17 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     struct Fire { Key src; Key dst; XKey key; int qty; };
     std::vector<Fire> fires;
     std::set<Key> consumed;
+    // FORK 2026-11-02 (live block 2: Gr lost 8 items 10 s after load; the loss paired with a host-container
+    // gain that was just a snapshot settling and the host "accepted 4/4" into a building chest). Load-time
+    // reconciles are not drags: no pairing for the first XFER_WARMUP_MS after this detector first ran;
+    // unpaired diffs still fold into the baseline after XFER_PEND_MS.
+    const unsigned long XFER_WARMUP_MS = 20000;
+    static unsigned long s_firstScanMs = 0;
+    if (s_firstScanMs == 0) s_firstScanMs = now;
+    const bool warm = (now - s_firstScanMs) < XFER_WARMUP_MS;
     for (std::map<Key, std::map<XKey, XferPend> >::iterator li = xferPend_.begin();
          li != xferPend_.end(); ++li) {
+        if (warm) break;
         if (consumed.count(li->first) || cur.find(li->first) == cur.end()) continue;
         for (std::map<XKey, XferPend>::iterator le = li->second.begin();
              le != li->second.end(); ++le) {

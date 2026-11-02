@@ -316,6 +316,10 @@ private:
             unsigned int nc = engine::enumNpcBodiesNear(ctx.gw, rad + 60.0f, cr, 16, true);
             int best = -1; float bd = 1e30f;
             for (unsigned int i = 0; i < nc; ++i) {
+                // a2 = ";"-separated hands the panel already looted (a host-rejected take rolls back, so the same body keeps looking full)
+                char hs[64]; _snprintf(hs, sizeof(hs) - 1, "%u,%u,%u,%u,%u", cr[i].hand[0], cr[i].hand[1], cr[i].hand[2], cr[i].hand[3], cr[i].hand[4]);
+                hs[sizeof(hs) - 1] = '\0';
+                if (a2 && strstr(a2, hs)) continue;
                 float dx = cr[i].x - e.x, dz = cr[i].z - e.z, d = dx * dx + dz * dz;
                 if (d < bd) { bd = d; best = (int)i; }
             }

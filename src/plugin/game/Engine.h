@@ -1783,6 +1783,11 @@ bool reviveSubject(GameWorld* gw, const unsigned int subjHand[5]);
 // owner's reliable EVT_DEATH. Returns true if it actually vetoed a local death.
 bool vetoLocalDeath(Character* c);
 
+// FORK 2026-11-02: a DRIVEN copy that the local medical model knocked out (PS_KO) while the
+// owner streams it upright and no reliable KO latch holds it: release the forced KO and clear
+// medical.unconcious (same levers as vetoLocalDeath, no death touched). Returns true on ok.
+bool vetoLocalKo(Character* c);
+
 // player_combat victim pick: the UPRIGHT non-squad world NPC nearest the body at
 // refHand (excluding, optionally, up to two prior hands - pass 0 for none; the
 // second exclude lets a window drop a DUD striker that never engages without

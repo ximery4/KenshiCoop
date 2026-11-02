@@ -1888,6 +1888,26 @@ void Replicator::censusFreezeDivergedAi(Character* c, const Key& k, float drift)
     bool over = (drift > censusParkDist_); // censusParkDist_ > 0 implied (drift >= 0)
     std::map<Key, unsigned long>::iterator it = censusFrozen_.find(k);
     bool wasFrozen = (it != censusFrozen_.end());
+    // A body whose park is FUTILE (3 parks in a row left it where it stood, see parkDivergedCopy) can
+    // not be brought home, and freezing it anyway only turns it into a statue far from where the owner
+    // fights it (01.11.2026: a beak thing frozen on the host for minutes, 1699 FREEZE lines, while it
+    // fought in the other windows). Release it to its own sim until a park lands again (the 60 s retry
+    // resets the streak).
+    {
+        std::map<Key, CensusFix>::iterator ff = censusFix_.find(k);
+        const unsigned int PARK_FUTILE_N = 3;   // = PARK_FUTILE_MAX in parkDivergedCopy
+        if (ff != censusFix_.end() && ff->second.fails >= PARK_FUTILE_N) {
+            if (wasFrozen) {
+                censusFrozen_.erase(it);
+                char nm[48]; engine::charName(c, nm, sizeof(nm));
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[census] UNFREEZE futile hand=%u,%u name='%s' d=%.0f (the park does not move it; local sim resumes)",
+                    k.i, k.s, nm, drift);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return;
+        }
+    }
     if (over) {
         censusFrozen_[k] = now;                 // (re)arm / refresh the hold
         if (!wasFrozen) engine::endAction(c);   // drop the in-progress flee/attack once

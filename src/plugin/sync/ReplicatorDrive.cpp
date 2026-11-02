@@ -892,6 +892,22 @@ void Replicator::applyTargets(GameWorld* gw) {
         // that the body woke up, and the latch would otherwise hold it down until
         // an EVT_REVIVE that the pre-53 edge detector never sent. deathLatched
         // still wins absolutely - a corpse does not crawl.
+        // FORK 2026-11-02 (live block 2: Staerfas lay KO on the peer 00:50-00:56 after an ownership
+        // hand-off - the new owner stood and had no edge to publish, so EVT_REVIVE never came).
+        // The continuous stream is authoritative once it has read upright for KO_HEAL_MS in a row:
+        // drop a KO latch (never a death latch) so the copy wakes without a reliable event.
+        if (d.koLatched && !d.deathLatched) {
+            if (d.fresh && !d.carriedDown && !coop::bodyIsDown(out.bodyState)) {
+                if (d.koUpSinceMs == 0) d.koUpSinceMs = now;
+                else if (now - d.koUpSinceMs >= KO_HEAL_MS) {
+                    d.koLatched = false; d.koUpSinceMs = 0;
+                    char kb[112]; _snprintf(kb, sizeof(kb) - 1,
+                        "[ko] LATCH-HEAL hand=%u,%u (owner streams upright %lu ms)",
+                        out.hIndex, out.hSerial, (unsigned long)KO_HEAL_MS);
+                    kb[sizeof(kb) - 1] = '\0'; coop::logLine(kb);
+                }
+            } else d.koUpSinceMs = 0;
+        } else d.koUpSinceMs = 0;
         bool crawling = proneSync_ && coop::bodyIsCrawling(out.bodyState) &&
                         !d.deathLatched;
         // A latched EVT_DEATH/EVT_KNOCKOUT forces the down treatment every tick,
@@ -1078,6 +1094,10 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (local >= 0 && local != (int)want &&
                 (d.proneTick == 0 || (now - d.proneTick) >= PRONE_APPLY_MS)) {
                 d.proneTick = now;
+                // FORK 2026-11-02: the copy sits in PS_KO (4) because ITS medical model knocked it
+                // out, while the owner streams it upright and no reliable latch holds it down: wake it.
+                // (live block 2: 952 x "want=0 was=4" on the peer, the engine re-KO'd it each second.)
+                if (local == 4 && want != 4 && !d.koLatched && !d.deathLatched) engine::vetoLocalKo(c);
                 bool ok = engine::applyProneState(c, (int)want);
                 char b[128]; _snprintf(b, sizeof(b) - 1,
                     "[prone] APPLY hand=%u,%u want=%u was=%d ok=%d",
