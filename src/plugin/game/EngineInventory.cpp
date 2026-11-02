@@ -624,6 +624,7 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
         // author's grade instead of the factory default. GRADE_NA = the author had none.
         unsigned char lvlEq, lvlLoose;
         char manufacturer[48]; char material[48]; // weapon provenance (needed to recreate)
+        bool mixEq, mixLoose;                     // FORK: the desired entries of this template carry DIFFERENT conditions (no single value to apply)
     };
     Grp g[128];
     unsigned int ng = 0;
@@ -639,8 +640,8 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
         }
         if (j < ng) {
             int q = (items[i].quantity < 1) ? 1 : items[i].quantity;
-            if (items[i].equipped) { g[j].desiredEq += q; g[j].qualEq = items[i].quality; g[j].lvlEq = items[i].level; }
-            else                   { g[j].desiredLoose += q; g[j].qualLoose = items[i].quality; g[j].lvlLoose = items[i].level; }
+            if (items[i].equipped) { if (g[j].desiredEq > 0 && g[j].qualEq != items[i].quality) g[j].mixEq = true; g[j].desiredEq += q; g[j].qualEq = items[i].quality; g[j].lvlEq = items[i].level; }
+            else                   { if (g[j].desiredLoose > 0 && g[j].qualLoose != items[i].quality) g[j].mixLoose = true; g[j].desiredLoose += q; g[j].qualLoose = items[i].quality; g[j].lvlLoose = items[i].level; }
             // Carry the weapon's manufacturer/material (first desired entry of the group);
             // empty for non-weapons. Needed when the create path fabricates the item.
             if (!g[j].manufacturer[0] && items[i].manufacturer[0])
@@ -770,6 +771,29 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
                                        g[k].manufacturer, g[k].material, lv);
             if (dbg) { char b[120]; _snprintf(b, sizeof(b)-1, "[recon]   CREATE-LOOSE n=%d (loose+eqDefer) ok=%d", createLoose, ok?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b); }
             if (ok) changed = true;
+        }
+        // 3b) CONDITION SYNC (FORK 2026-11-02). This reconcile matches by template and COUNT, so an item
+        //    that already exists here was never touched when only its condition changed: the owner's
+        //    medkit was used up, the copy's stayed full (field report, medkits / backpack contents).
+        //    Apply the owner's condition to the real item when the template's desired entries all agree
+        //    on one value (a mixed set has no single value to give). Containers are skipped.
+        //    KENSHICOOP_INV_QUALITY_SYNC=0 restores the old behaviour.
+        {
+            static int qSync = -1;
+            if (qSync < 0) { const char* e = getenv("KENSHICOOP_INV_QUALITY_SYNC"); qSync = (e && e[0] == '0') ? 0 : 1; }
+            if (qSync && !curTruncated && !isContainerItemType(g[k].type)) {
+                for (unsigned int i = 0; i < ncur; ++i) {
+                    if (!curItems[i] || cur[i].itemType != g[k].type) continue;
+                    if (strcmp(cur[i].stringID, g[k].sid) != 0) continue;
+                    bool eq = cur[i].equipped != 0;
+                    if (eq ? (g[k].mixEq || g[k].desiredEq <= 0) : (g[k].mixLoose || g[k].desiredLoose <= 0)) continue;
+                    int want = eq ? g[k].qualEq : g[k].qualLoose;
+                    if (want <= 0 || (int)cur[i].quality == want) continue;
+                    __try { curItems[i]->quality = (float)want / 100.0f; changed = true; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    if (dbg) { char b[140]; _snprintf(b, sizeof(b) - 1, "[recon]   QUALITY sid='%s' %d -> %d", g[k].sid, (int)cur[i].quality, want);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                }
+            }
         }
         // 4) RESIDUAL REMOVE (genuine removals; destroy surplus). Moved items were nulled
         //    in curItems above, so removeByKey won't touch them.
@@ -925,6 +949,74 @@ int dropItemFromNestedContainer(GameWorld* gw, const unsigned int cHand[5], cons
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return dropped;
+}
+
+// SEH-guarded (FORK 2026-11-02): relocate `qty` of (sid,type) from inside a CARRIED CONTAINER (backpack) of the
+// character at srcHand into the TOP-LEVEL inventory of dstHand, conserving the real object. moveItemBetweenContainers
+// reads the source top-level only, so a transfer whose item sat in the source character's backpack answered
+// moved=0 (field report: boots / good medkit from a backpack were refused and rolled back). Returns the count moved.
+int moveItemOutOfNestedContainer(GameWorld* gw, const unsigned int srcHand[5], const unsigned int dstHand[5],
+                                 const char* sid, unsigned int typeCat, int qty, bool suspendVeto) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    int moved = 0;
+    bool vetoSav = g_invVetoSuspend; if (suspendVeto) g_invVetoSuspend = true;
+    __try {
+        RootObject* dstRo = resolveObjectByHand(dstHand);
+        Inventory* dst = dstRo ? invOf(dstRo) : 0;
+        int bags = dst ? nestedContainerCount(gw, srcHand) : 0;
+        for (int which = 0; which < bags && moved < qty; ++which) {
+            for (;;) {
+                Inventory* sub = nestedInventoryOf(gw, srcHand, (unsigned int)which);
+                if (!sub || sub == dst) break;
+                InvItemEntry cur[INV_ITEMS_MAX];
+                Item* curItems[INV_ITEMS_MAX];
+                unsigned int n = readInvItems(sub, cur, curItems, INV_ITEMS_MAX, 0);
+                int idx = -1;
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (!curItems[i] || cur[i].itemType != typeCat) continue;
+                    if (strcmp(cur[i].stringID, sid) != 0) continue;
+                    idx = (int)i; break;
+                }
+                if (idx < 0) break;
+                int have = cur[idx].quantity; if (have < 1) have = 1;
+                int take = qty - moved; if (take > have) take = have;
+                Item* taken = sub->removeItemDontDestroy_returnsItem(curItems[idx], take, false);
+                if (!taken) break;
+                if (!dst->tryAddItem(taken, take)) { sub->tryAddItem(taken, take); break; }
+                moved += take;
+                if (moved >= qty) break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_invVetoSuspend = vetoSav;
+    return moved;
+}
+
+// SEH-guarded TEST HOOK (FORK 2026-11-02): set the condition of every item of (sid,type) in the character's own inventory and in
+// its carried containers to `bucket` (hundredths, 10000 = pristine). Lets a stand drive "the owner used the item up".
+int setItemQualityBySid(GameWorld* gw, const unsigned int cHand[5], const char* sid, unsigned int typeCat, int bucket) {
+    if (!gw || !sid || !sid[0] || bucket < 0) return 0;
+    int n = 0;
+    __try {
+        RootObject* ro = resolveObjectByHand(cHand);
+        Inventory* inv = ro ? invOf(ro) : 0;
+        if (!inv) return 0;
+        InvItemEntry cur[INV_ITEMS_MAX];
+        Item* items[INV_ITEMS_MAX];
+        unsigned int c = readInvItems(inv, cur, items, INV_ITEMS_MAX, 0);
+        for (unsigned int i = 0; i < c; ++i)
+            if (items[i] && cur[i].itemType == typeCat && strcmp(cur[i].stringID, sid) == 0) { items[i]->quality = (float)bucket / 100.0f; ++n; }
+        int bags = nestedContainerCount(gw, cHand);
+        for (int w = 0; w < bags; ++w) {
+            Inventory* sub = nestedInventoryOf(gw, cHand, (unsigned int)w);
+            if (!sub) continue;
+            InvItemEntry sc[INV_ITEMS_MAX]; Item* si[INV_ITEMS_MAX];
+            unsigned int k = readInvItems(sub, sc, si, INV_ITEMS_MAX, 0);
+            for (unsigned int i = 0; i < k; ++i)
+                if (si[i] && sc[i].itemType == typeCat && strcmp(sc[i].stringID, sid) == 0) { si[i]->quality = (float)bucket / 100.0f; ++n; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return n;
 }
 
 // SEH-guarded: how many of (sid,type) sit INSIDE the carried container `which` (summed

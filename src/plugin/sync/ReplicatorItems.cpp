@@ -1323,7 +1323,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 // be a bag-to-bag trade mid-detection - keep holding rather than
                 // committing the drop-fallback (the detector either fires the intent,
                 // which registers a suppression, or folds the diff and releases us).
-                if (r <= 1 && xferPendingLoss(*it, pe->first.c_str())) r = MAX_RETRY;
+                if (r <= 1 && (xferPendingLoss(*it, pe->first.c_str()) || xferPendingGainElsewhere(*it, pe->first.c_str()))) r = MAX_RETRY;
                 if (--r > 0) {
                     if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[wd] decrease-pending hand=%u,%u,%u,%u,%u sid='%s' prev=%d now=%d retry=%d",
@@ -1911,6 +1911,18 @@ bool Replicator::xferPendingLoss(const Key& k, const char* sid) {
     return false;
 }
 
+// FORK 2026-11-02: another container (not k) has a pending GAIN of this sid: the count edge on k may be one half of a
+// bag-to-bag trade whose pairing has not settled yet (item came out of a backpack, the receiving side is a copy
+// that registers later). The drop census holds instead of authoring a ground drop that would double the trade.
+bool Replicator::xferPendingGainElsewhere(const Key& k, const char* sid) {
+    for (std::map<Key, std::map<XKey, XferPend> >::iterator ci = xferPend_.begin(); ci != xferPend_.end(); ++ci) {
+        if (!(ci->first < k) && !(k < ci->first)) continue;
+        for (std::map<XKey, XferPend>::iterator e = ci->second.begin(); e != ci->second.end(); ++e)
+            if (e->second.delta > 0 && e->first.first == sid) return true;
+    }
+    return false;
+}
+
 bool Replicator::wdSuppressed(const Key& k, const char* sid, unsigned long now) {
     std::map<std::pair<Key, std::string>, unsigned long>::iterator it =
         wdSuppress_.find(std::make_pair(k, std::string(sid)));
@@ -2176,6 +2188,19 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         // conservation move (never fabricates or destroys), so gear survives.
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
                                                       p.itemType, (int)p.quantity);
+        // FORK 2026-11-02: the item may sit in a BACKPACK of the source character (the top-level search above
+        // cannot see in there): moved=0 here answered reject, the author rolled the item back and it
+        // "vanished" (field report: good medkit / samurai boots from a backpack). Relocate it out of the bag.
+        if (moved < (int)p.quantity) {
+            int nm = engine::moveItemOutOfNestedContainer(gw, sHand, dHand, p.stringID, p.itemType,
+                                                          (int)p.quantity - moved);
+            if (nm > 0) {
+                moved += nm;
+                char nb[160]; _snprintf(nb, sizeof(nb) - 1, "[xfer] NESTED-SRC id=%u sid='%s' moved=%d (out of the source's bag)",
+                                        p.xferId, p.stringID, nm);
+                nb[sizeof(nb) - 1] = '\0'; coop::logLine(nb);
+            }
+        }
         int fab = 0;
         int fabWhy = -1; // FORK: -1 not attempted, 0 ok, 1-4 engine fail reason, 5 skipped
         // Upstream #40 race: when WE author the source (a corpse or chest we census,

@@ -699,6 +699,14 @@ int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const c
 int dropItemFromNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
                                 unsigned int typeCat, int qty, void** outLastDropped = 0);
 
+// FORK 2026-11-02: move `qty` of (sid,type) out of a CARRIED CONTAINER of srcHand into the top-level inventory of
+// dstHand (real-object relocation, veto suspended unless told otherwise). Returns the count moved.
+int moveItemOutOfNestedContainer(GameWorld* gw, const unsigned int srcHand[5], const unsigned int dstHand[5],
+                                 const char* sid, unsigned int typeCat, int qty, bool suspendVeto = true);
+
+// TEST HOOK: set the condition (hundredths, 10000 = pristine) of every (sid,type) item the character holds, bags included.
+int setItemQualityBySid(GameWorld* gw, const unsigned int cHand[5], const char* sid, unsigned int typeCat, int bucket);
+
 // SEH-guarded (protocol 48): summed quantity of (sid,type) INSIDE carried container `which`.
 // Returns -1 when the character carries no such container, so a caller can distinguish "the
 // bag has not arrived yet" from "the bag is here and the item is missing".
@@ -1787,6 +1795,10 @@ bool vetoLocalDeath(Character* c);
 // owner streams it upright and no reliable KO latch holds it: release the forced KO and clear
 // medical.unconcious (same levers as vetoLocalDeath, no death touched). Returns true on ok.
 bool vetoLocalKo(Character* c);
+
+// FORK 2026-11-02: make a DRIVEN copy engine-dead when its owner reports the body dead (EVT_DEATH / BODY_DEAD).
+// Without it the copy stays "unconscious" while the owner reads "dead". Idempotent; true if it changed anything.
+bool applyRemoteDeath(Character* c);
 
 // player_combat victim pick: the UPRIGHT non-squad world NPC nearest the body at
 // refHand (excluding, optionally, up to two prior hands - pass 0 for none; the

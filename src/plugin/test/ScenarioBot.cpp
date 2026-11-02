@@ -132,8 +132,8 @@ private:
 
     // The selected squad member: its EntityState (hand + pos) and live Character*.
     bool selected(const ScenarioContext& ctx, EntityState* e, Character** c, unsigned int h[5]) {
-        EntityState sq[32];
-        unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+        static EntityState sq[128];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, 128);
         if (n == 0) return false;
         unsigned int i = (sel_ < n) ? sel_ : 0;
         *e = sq[i];
@@ -165,8 +165,8 @@ private:
         const bool haveMe = selected(ctx, &e, &me, mh);
 
         if (!strcmp(cmd, "state")) {
-            EntityState sq[32];
-            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 32);
+            static EntityState sq[128];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, 128);
             rowf(id, "t=%lu host=%d peer=%d sel=%u n=%u", ctx.elapsedMs, ctx.isHost ? 1 : 0,
                  ctx.peerReady ? 1 : 0, sel_, n);
             for (unsigned int i = 0; i < n; ++i) {
@@ -180,8 +180,8 @@ private:
             reply(id, "END");
         } else if (!strcmp(cmd, "npcs")) {
             float r = a1 ? (float)atof(a1) : 100.0f;
-            EntityState npc[64];
-            unsigned int n = engine::captureNpcs(ctx.gw, npc, 64);
+            static EntityState npc[256];
+            unsigned int n = engine::captureNpcs(ctx.gw, npc, 256);
             unsigned int shown = 0;
             for (unsigned int i = 0; i < n; ++i) {
                 float dx = haveMe ? npc[i].x - e.x : 0, dz = haveMe ? npc[i].z - e.z : 0;
@@ -287,10 +287,20 @@ private:
         } else if (!strcmp(cmd, "inv")) {
             if (!haveMe) { reply(id, "ERR no member"); return; }
             InvItemEntry items[96]; static char names[96 * 64];
+            if (a1 && !strcmp(a1, "deep")) {
+                // inv deep: also what worn containers (backpacks) hold; parent=N means nested inside entry N-1
+                unsigned int nd = engine::captureContainerContents(ctx.gw, mh, items, 96, 0, 0, true);
+                for (unsigned int i = 0; i < nd; ++i)
+                    rowf(id, "#%u sid=%s qty=%u type=%u q=%u eq=%d parent=%u", i, items[i].stringID,
+                         (unsigned int)items[i].quantity, items[i].itemType, (unsigned int)items[i].quality,
+                         (int)items[i].equipped, (unsigned int)items[i].parentIdx);
+                reply(id, "END");
+                return;
+            }
             int n = engine::invList(ctx.gw, mh, items, 96, names);
             for (int i = 0; i < n; ++i)
-                rowf(id, "sid=%s qty=%u type=%u eq=%d name=%s", items[i].stringID, (unsigned int)items[i].quantity,
-                     items[i].itemType, (int)items[i].equipped, names + i * 64);
+                rowf(id, "sid=%s qty=%u type=%u q=%u eq=%d name=%s", items[i].stringID, (unsigned int)items[i].quantity,
+                     items[i].itemType, (unsigned int)items[i].quality, (int)items[i].equipped, names + i * 64);
             reply(id, "END");
         } else if (!strcmp(cmd, "modes")) {
             // the orders-panel toggles of the selected member: block hold passive taunt ranged stealth
@@ -333,6 +343,52 @@ private:
             char b[160]; _snprintf(b, sizeof(b) - 1, "%s corpse=%u,%u,%u,%u,%u items=%u moved=%d d=%.1f",
                                    moved > 0 ? "OK" : "ERR", cr[best].hand[0], cr[best].hand[1], cr[best].hand[2],
                                    cr[best].hand[3], cr[best].hand[4], n, moved, sqrt(bd));
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "givebag")) {
+            // givebag <sid> <type> <qty>: mint qty of sid INSIDE the selected member's backpack (test fixture)
+            if (!haveMe || !a3) { reply(id, "ERR usage: givebag <sid> <type> <qty>"); return; }
+            int r = engine::addItemToNestedContainer(ctx.gw, mh, a1, (unsigned int)atoi(a2), atoi(a3), 0);
+            char b[64]; _snprintf(b, sizeof(b) - 1, "%s added=%d", r > 0 ? "OK" : "ERR", r);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "setq")) {
+            // setq <sid> <type> <q>: set the condition (hundredths, 10000 = pristine) of the selected member's (sid,type) items, bags included
+            if (!haveMe || !a3) { reply(id, "ERR usage: setq <sid> <type> <q>"); return; }
+            int r = engine::setItemQualityBySid(ctx.gw, mh, a1, (unsigned int)atoi(a2), atoi(a3));
+            char b[64]; _snprintf(b, sizeof(b) - 1, "%s set=%d", r > 0 ? "OK" : "ERR", r);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "bagmove")) {
+            // bagmove <dst t,c,cs,i,s> <sid> <type> <qty>: move from the selected member (top level first, then its
+            // backpack) into dst's inventory, as a player's drag between two characters would
+            char dstS[64], sidS[64]; unsigned int ty = 0; int qn = 0;
+            unsigned int dh[5];
+            if (!haveMe || sscanf(tail, "%63s %63s %u %d", dstS, sidS, &ty, &qn) != 4 || !parseHand(dstS, dh)) {
+                reply(id, "ERR usage: bagmove t,c,cs,i,s <sid> <type> <qty>"); return; }
+            int mv = engine::moveItemBetweenContainers(ctx.gw, mh, dh, sidS, ty, qn);
+            int top = mv;
+            if (mv < qn) mv += engine::moveItemOutOfNestedContainer(ctx.gw, mh, dh, sidS, ty, qn - mv);
+            char b[80]; _snprintf(b, sizeof(b) - 1, "%s moved=%d top=%d", mv > 0 ? "OK" : "ERR", mv, top);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "heal")) {
+            // heal [all|t,c,cs,i,s]: bandage every damaged part (the medic_order scaffold; the flesh then
+            // self-heals up to the bandage level). Default = selected member, "all" = the whole local squad.
+            int parts = 0, who = 0;
+            if (a1 && !strcmp(a1, "all")) {
+                static EntityState sq[128];
+                unsigned int n = engine::captureSquad(ctx.gw, false, sq, 128);
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (tabRankOf(sq, n, i) != (int)ctx.localId) continue; // own squad only (copies of others are not ours to treat)
+                    unsigned int h[5]; handFromEntity(sq[i], h);
+                    parts += engine::healSubjectBandage(ctx.gw, h); ++who;
+                }
+            } else if (a1) {
+                unsigned int t[5];
+                if (!parseHand(a1, t)) { reply(id, "ERR usage: heal [all|t,c,cs,i,s]"); return; }
+                parts = engine::healSubjectBandage(ctx.gw, t); who = 1;
+            } else {
+                if (!haveMe) { reply(id, "ERR no member"); return; }
+                parts = engine::healSubjectBandage(ctx.gw, mh); who = 1;
+            }
+            char b[64]; _snprintf(b, sizeof(b) - 1, "OK who=%d parts=%d", who, parts);
             b[sizeof(b) - 1] = '\0'; reply(id, b);
         } else if (!strcmp(cmd, "give")) {
             // give <sid> <type> <qty> : mint qty of sid into the selected member's inventory (repair/restore tool)

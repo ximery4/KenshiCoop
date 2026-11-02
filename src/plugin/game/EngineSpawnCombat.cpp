@@ -2301,6 +2301,26 @@ bool vetoLocalKo(Character* c) {
     }
 }
 
+// FORK 2026-11-02: the owner reported this body DEAD (reliable EVT_DEATH or the streamed BODY_DEAD bit) but a
+// DRIVEN copy was only held down, so it read "unconscious" while the owner reads "dead" (field report; a feigned
+// death is a separate state and never reaches here). Make the copy engine-dead, the same medical flags the
+// engine sets on a real death (isDead() reads medical.dead), so the corpse is a real corpse here too.
+// Idempotent; returns true only when it changed something.
+bool applyRemoteDeath(Character* c) {
+    if (!c) return false;
+    if (g_isDeadCharFn && g_isDeadCharFn(c)) return false;
+    knockDown(c, true); // own SEH: collapse + hold on the ground
+    __try {
+        MedicalSystem* med = &c->medical;
+        med->unconcious = true;
+        med->blood      = 0.0f;
+        med->dead       = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
                       const unsigned int excludeHand[5], unsigned int outHand[5],
                       const unsigned int excludeHand2[5]) {

@@ -926,6 +926,16 @@ void Replicator::applyTargets(GameWorld* gw) {
             unsigned short localBs = engine::readBodyState(c);
             if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
             else                          { engine::holdDown(c); d.carriedDown = false; }
+            // FORK 2026-11-02: the owner reports the body DEAD (reliable EVT_DEATH latch or the streamed
+            // BODY_DEAD bit): make the copy engine-dead too, instead of leaving it "unconscious" while the
+            // owner reads "dead" (lootable corpse, wrong status). A feigned death never sets either.
+            if ((d.deathLatched || (out.bodyState & BODY_DEAD)) && d.fresh &&
+                !(engine::readBodyState(c) & BODY_DEAD) && (now - d.deathApplyMs) >= 1000) {
+                d.deathApplyMs = now;
+                bool did = engine::applyRemoteDeath(c);
+                char b[128]; _snprintf(b, sizeof(b) - 1, "[death] APPLY-REMOTE hand=%u,%u ok=%d", out.hIndex, out.hSerial, did ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
             // A ragdoll/KO falls independently on each client (and the join's local
             // AI may have walked the body elsewhere before the down state arrived),
             // so co-locate it with the host's down position when it has drifted.

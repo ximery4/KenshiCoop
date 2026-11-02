@@ -1026,6 +1026,7 @@ private:
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
         bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
         unsigned long koUpSinceMs;    // FORK: first tick the owner stream read upright under a KO latch (0 = not counting)
+        unsigned long deathApplyMs;   // FORK: last tick applyRemoteDeath ran on this copy (throttle)
         bool         carriedDown;     // a KO'd passenger, remembered ACROSS the drop. Leaving a
                                       //   shoulder is a physical transient: the body detaches and
                                       //   falls for a few frames before the engine re-flags it
@@ -1182,7 +1183,7 @@ private:
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
                    taskNoneTick(0), taskLapseTick(0), taskLapses(0),
                    detached(false), downApplied(false),
-                   koLatched(false), deathLatched(false), koUpSinceMs(0), carriedDown(false),
+                   koLatched(false), deathLatched(false), koUpSinceMs(0), deathApplyMs(0), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
@@ -2135,6 +2136,7 @@ private:
     // True while the transfer detector is watching an unresolved LOSS of `sid` from
     // container `k` - the W2 census fallback defers its drop verdict for it.
     bool xferPendingLoss(const Key& k, const char* sid);
+    bool xferPendingGainElsewhere(const Key& k, const char* sid);
     bool wdSuppressed(const Key& k, const char* sid, unsigned long now);
     // True while the W2 gear census still has an unresolved DECREASE for container `k`
     // (a drop intent is debouncing its ground correlation). publishInventories holds the
