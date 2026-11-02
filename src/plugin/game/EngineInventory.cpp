@@ -1074,7 +1074,15 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
     }
     bool changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated,
                                     allowContainerCreate, outContainerShort);
-    if (nNested == 0) return changed;
+    // FORK 2026-11-02: no early return when the snapshot has NO nested entries. The publisher always
+    // describes bag contents, so "no children" means the bag is EMPTY now; skipping it left a phantom
+    // item in a bag that had just been emptied (4-player stand: a unit moved out of a backpack stayed in
+    // the bag on the two bystander windows for minutes, and the host saves copies of client bags).
+    // A truncated snapshot stays additive-only (below), so an incomplete description never empties a bag.
+    // KENSHICOOP_NESTED_EMPTY=0 restores the old skip.
+    static int emptyBags = -1;
+    if (emptyBags < 0) { const char* e = getenv("KENSHICOOP_NESTED_EMPTY"); emptyBags = (e && e[0] == '0') ? 0 : 1; }
+    if (nNested == 0 && (!emptyBags || truncated)) return changed;
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
     // to fill, and a bag identified from the stale read would be the wrong object (or gone).
@@ -1100,7 +1108,7 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         unsigned int nk = 0;
         for (unsigned int i = 0; i < count && nk < INV_ITEMS_MAX; ++i)
             if (items[i].parentIdx == (unsigned char)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
-        if (nk == 0) continue;
+        if (nk == 0 && (!emptyBags || truncated)) continue;
         claimed += nk;
 
         // Which copy of this template is it, in the SENDER's order? The sender's Nth bag of a
@@ -1144,6 +1152,7 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
+        if (!sub && nk == 0) continue;   // an item without kids that owns no inventory is simply not a bag
         if (!sub) {
             // The bag is not here (still relocating over the conservation channel, or this
             // client genuinely lacks it). Its contents are NOT reconciled anywhere else, so
