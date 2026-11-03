@@ -1,68 +1,91 @@
-# Fork block 4 (blocks 3, 4, 4b-4d on top of v0.58.1)
+# Fork blocks 3-4d (on top of v0.58.1)
 
 This branch (`fork-block4`) continues v0.58.1 (wire protocol 165, 2-8 players).
 Priority: **keep characters and inventories intact first, world state second.**
 Everything here was written and tested by one person with an AI assistant; treat
-it as experimental. Source of truth is the code; this page is a summary.
+it as experimental. The code is the source of truth; this page is a summary.
 
-## What changed
+> **Corrected 2026-11-03.** An earlier revision of this page overstated the evidence
+> and named the wrong cause for several problems. The corrections are listed at the
+> end ("What was wrong in the first revision"). **Block 4d does NOT fix item loss when
+> looting corpses** - see "Known problems".
 
-- **Inventory / loot**
-  - Nested bags (bag inside a bag) are created and emptied correctly on copies
-    (`KENSHICOOP_NESTED_EMPTY`, default on).
-  - Transfers out of a backpack; item condition sync; census holds dropped for
-    gains still pending.
-  - Corpse looting: refusal protection (#40) kept; new `[xfer] MOVE0` diagnostic
-    line says why a transfer moved nothing. The root cause of the refusals seen in
-    a real session is **not found yet**.
-- **Death / KO**: real death applied on copies, KO latch self-heal, copies cannot
-  KO themselves.
+## What changed in blocks 3-4d
+
+- **Inventory**: nested bags (bag inside a bag) are created and emptied correctly on
+  copies (`KENSHICOOP_NESTED_EMPTY`, default on); transfers out of a backpack; item
+  condition sync; census holds dropped for gains still pending.
+- **Death / KO**: real death applied on copies, KO latch self-heal, copies cannot KO
+  themselves, wound values below zero are written to copies.
 - **Traders**: traders are paired across machines by template/faction/position.
-- **Squads (block 4d)**: when a unit is moved between squad tabs and control flips
-  to the other machine, the flip is now announced (`flipWire_`), which should stop
-  the duplicated unit seen after moving a bought animal to another squad.
-  **Untested in a live session.**
-- **Corpse census hold (4d)**: a corpse that briefly drops out of the 1 Hz census
-  is kept for `KENSHICOOP_CORPSE_HOLD_MS` (default 15000) instead of being
-  forgotten at once. Aimed at "item next to the looted one disappears".
-  **Untested live.**
-- **Beds (4d)**: if a copy stays in a bed while its owner is moving, the fast-exit
-  escalates after 4 attempts (explicit furniture exit + halt). **Unverified.**
-- **Steam lobby status (4d)**: the join no longer stays on "Connecting to host..."
-  once the session is up.
-- **Logging (4c)**: `KENSHICOOP_*` keys in `coop_config.json` are now exported to
-  the environment (so debug switches can be set from the file); `[inv] RECV-CORPSE`
-  lines.
+- **Squads (4d)**: when a unit is moved between squad tabs and control flips to the
+  other machine, the flip is announced (`flipWire_`). Tested in the two-copy lab
+  (`squad_sync`, `recruit_join` PASS); **not verified in a live session**, and the lab
+  case has matching serials while the live case did not.
+- **Corpse census hold (4d)**: a corpse that briefly drops out of the 1 Hz census is
+  kept for `KENSHICOOP_CORPSE_HOLD_MS` (default 15000). It does not address the item
+  loss described below.
+- **Beds (4d)**: after repeated failed exits the fast-exit escalates (explicit exit +
+  halt). Unverified; see below for the likely real cause.
+- **Steam lobby status (4d)**: the join no longer stays on "Connecting to host...".
+- **Logging (4c/4d)**: `KENSHICOOP_*` keys in `coop_config.json` are exported to the
+  environment; `[inv] RECV-CORPSE` and `[xfer] MOVE0` diagnostic lines.
 
-## Test evidence (honest)
+## Test evidence
 
-- Local two-copy lab, block4d Harness build: regression battery of 15 scenarios
-  -> 13 PASS. `inv_nested_bag` and `inv_join_bag` FAIL inside the battery because
-  of the battery's save/dump settings (known); run with `Run-Block4Bags.ps1`
-  `inv_join_bag` passes (nested-bag was not re-checked separately for 4d).
-  `squad_sync` and `recruit_join` PASS.
-- `corpse_loot` is **flaky** (fails in some runs, also with the nested-empty fix
-  disabled). Not fixed; the census hold may reduce it, not measured.
-- 4 game windows on one PC (LAN/UDP transport): cross-owner transfers worked in
-  all four windows, no body-state mismatches; world divergence was measured and
-  stayed small but not zero.
-- Steam: one real session on two different Steam accounts, over an hour, no
-  disconnects (blocks 4b/4c builds). Single-account loopback cannot validate Steam.
-  The 4d changes have **not** been run over Steam yet.
+- Local two-copy lab, block 4d Harness build: 15-scenario regression battery, 13 PASS.
+  The two FAILs (`inv_nested_bag`, `inv_join_bag`) were a **setup error in the battery
+  script** (wrong save / missing `KENSHICOOP_INV_DUMP`); run with the right setup both
+  PASS (`reports/block4_bags.txt`). `squad_sync` and `recruit_join` PASS.
+- `corpse_loot` is **flaky** in the lab (also with the nested-empty fix disabled).
+- 4 game windows on one PC (LAN/UDP transport, bots): cross-owner transfers worked in
+  all four windows, body state and inventories matched, **but the position check
+  failed**: about 5% of character comparisons were outside the 120-unit tolerance
+  (mean error 26-39 units, worst case 4791), 23 persistent differences against a limit
+  of 2. NPC positions stayed within tolerance but only about 10 NPCs were compared.
+- Steam: two real sessions on two different Steam accounts (54 and 20 minutes, with a
+  save/reload between them), no disconnects, RTT 5-8 ms. Single-account loopback
+  cannot validate Steam. Block 4d itself has **not** been run over Steam.
 
-## Problems seen in the real Steam sessions (not fixed)
+## Known problems (found in the Steam sessions, analysis in the maintainer's notes)
 
-- Loot refusals: the second player's take returns `moved=0` although corpse
-  hashes match; likely dual authorship of the same corpse by both censuses.
+- **Item loss when looting corpses (not fixed in 4d).** Reconstructed from both logs:
+  the owner's inventory snapshot reaches the other machine before the transfer intent;
+  that machine's copy of the character is then full, so the engine refuses the add
+  (`[mk] tryAddItem-fail`), the receiver answers "moved 0", the author rolls the loot
+  back out of its own character, and the other author of the same corpse then
+  broadcasts the corpse without those items. 28 units were lost in the first session
+  (38 intents, 26 incomplete). Rollback also removes by item template, not by instance,
+  so an identical item already in the bag can be removed.
+- **Stale key after a squad move.** A moved character gets a different key on the two
+  machines; inventory snapshots and transfers kept using the wire key, so one
+  character's inventory stopped updating on the join for 50 minutes (613 empty applies)
+  and six production pickups were refused.
+- **A duplicate pet entered the save.** The host created a stand-in in a new squad tab
+  (host fallback) and saved it; after loading, both sides had the extra tab.
+- **Beds.** One character stayed in a bed on the join while the owner ran around
+  (1174 fast-exit calls, none succeeded). The owner never sent a bed-enter event, so
+  the first guess (missing key translation for a built bedroll) is probably wrong; the
+  join's own AI laying the copy down again is the likelier cause. Unverified.
 - Weather (e.g. acid rain) is not synchronised; needs a protocol bump (166).
-- Built furniture (a placed bedroll): the furniture path has no key translation
-  for session-built objects, so a joiner may appear standing on the host's bed.
-- NPCs can freeze for long periods in the census (`FREEZE`).
-- A rollback loop on gamedata 1913 (an AI character taking wheat from storage).
+- NPCs outside the stream are simulated independently on both machines and reconciled
+  by teleport/freeze; a join had one NPC frozen for most of a 52-minute session.
 - A harmless crash while the game is shutting down.
 - Pre-existing items in `KNOWN_BUGS.md` still apply.
 
+## What was wrong in the first revision of this page
+
+| Earlier claim | Correction |
+|---|---|
+| Loot refusals: root cause unknown, likely dual corpse authorship | Two causes found: the copy refuses the add, and a stale key after squad moves. Dual authorship turns the refusal into a permanent loss |
+| Real Steam session "over an hour" | Two sessions, 54 and 20 minutes |
+| 4-window test: divergence "small" / "no mismatches" | Bodies and inventories matched; positions did not (see above) |
+| Rollback loop on gamedata 1913 in the real sessions | It appeared only in bot runs, not in the Steam logs |
+| `inv_nested_bag` not re-checked | PASS on 4d with the correct battery setup |
+| Corpse hold addresses "item next to the looted one disappears" | It does not; see Known problems |
+| Bedroll key translation is the bed bug | Probably not (no enter event was sent) |
+
 ## Build
 
-Same as upstream: see `BUILD_SETUP.md`. Release DLL SHA256 for the tagged build is
-in the release notes.
+Same as upstream: see `BUILD_SETUP.md`. Release DLL SHA256 for each tag is in the
+release notes.

@@ -60,8 +60,11 @@ Scenario names refer to `scripts/scenarios.psd1`; run one with
 
 ## Fork block 4 additions (2026-11)
 
-See `FORK_BLOCK4.md`: `corpse_loot` is flaky, corpse loot can be refused with
-`moved=0` for an unknown reason, weather is not synced, session-built furniture
-(bedroll) is not key-translated, long NPC freezes, a rollback loop on gamedata
-1913, and a harmless shutdown crash. The block 4d fixes (wolf duplicate on squad
-move, corpse census hold, bed fast-exit) are untested over Steam.
+See `FORK_BLOCK4.md` (corrected 2026-11-03): corpse loot loses items (the copy
+refuses the add, the author rolls back, a second corpse author erases the rest),
+a character's inventory stops updating after a squad-tab move (stale key), a
+duplicate pet can be saved into a new tab, a copy can stay in bed while its owner
+walks, weather is not synced, long NPC freezes, and a harmless shutdown crash.
+`corpse_loot` is flaky in the lab. The block 4d fixes (squad-move flip announce,
+corpse census hold, bed fast-exit) are untested over Steam and do not fix the item
+loss.
