@@ -14,6 +14,8 @@ one shared money pool, game speed, and more - and saves are coordinated: any sav
 either player makes becomes one shared save, streamed to both machines
 automatically.
 
+> **Fork branch `fork-block4`:** inventory/loot, death, trader and squad-move fixes on top of v0.58.1 - see [docs/FORK_BLOCK4.md](docs/FORK_BLOCK4.md) for what is and is not verified.
+>
 > **Status: work in progress.** This is a hobby project under active
 > development. Expect rough edges, desyncs, and crashes. Sessions support up
 > to 8 players (host + 7); 2 players is the most-tested setup.

@@ -1103,6 +1103,10 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // A chained edge (recruit then move, move then move) leaves the OLD key's
     // pin dead - drop it so the pin sets track only live hands.
     pinPeer_.erase(oldK);
+    // FORK 2026-11-03: the peer now streams this body under newK, so our own claim on its OLD hand (we pinned
+    // it when WE moved the body into the peer's tab) must go; left in place it kept publishing the body
+    // beside the peer's stream.
+    if (!destOwned) pinOwned_.erase(oldK);
     if (destOwned) pinPeer_.erase(newK);
     // Carry the down/death LATCH across the re-key. A body that dies (or is
     // KO'd) and then re-containers (host un-squads a corpse, tab move) streams
@@ -1330,7 +1334,7 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
                       lk.i == newK.i && lk.s == newK.s);
     bool pinnedLocal = false;
     if (haveLh && (lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) && !sameAsNew) {
-        if (ownIt) { pinPeer_.erase(lk); pinOwned_.insert(lk); }
+        if (ownIt) { pinPeer_.erase(lk); pinOwned_.insert(lk); flipWire_[lk.s] = newK; }
         else       { pinOwned_.erase(lk); pinPeer_[lk] = author; }
         if (ok) moveEcho_[lk.s] = nowMs();  // the engine may renumber the serial
         pinnedLocal = true;

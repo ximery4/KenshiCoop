@@ -952,6 +952,10 @@ void tick() {
 
 const char* status() { return g_status; }
 
+void noteConnected() {
+    if (strncmp(g_status, "Connecting to host", 18) == 0) setStatus("Connected to host");
+}
+
 void reset() {
     if (g_ready && g_lobby != 0 && g_leaveLobby) g_leaveLobby(g_mm, g_lobby);
     if (g_ready && g_weAreHost) clearPresence();

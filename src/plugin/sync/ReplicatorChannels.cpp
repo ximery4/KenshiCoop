@@ -2478,6 +2478,38 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
                     edges[i].after[0], edges[i].after[1], edges[i].after[2],
                     edges[i].after[3], edges[i].after[4]);
                 eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
+                // FORK 2026-11-03: a control flip (the peer moved its body into a tab WE own) is not a pure
+                // echo: the body streams from now on under OUR local hand, and the peer only knows the key
+                // it chose. Tell it (old = its key, new = our hand) so it re-keys its real body instead of
+                // minting a duplicate proxy of it.
+                std::map<u32, Key>::iterator fw = flipWire_.find(serial);
+                if (fw == flipWire_.end() && edges[i].after[4]) fw = flipWire_.find(edges[i].after[4]);
+                if (fw != flipWire_.end()) {
+                    Key wk = fw->second;
+                    flipWire_.erase(fw);
+                    bool differs = !(wk.t == edges[i].after[0] && wk.c == edges[i].after[1] &&
+                                     wk.cs == edges[i].after[2] && wk.i == edges[i].after[3] &&
+                                     wk.s == edges[i].after[4]);
+                    if (differs) {
+                        EventPacket fe;
+                        memset(&fe, 0, sizeof(fe));
+                        fe.type    = (u8)PKT_EVENT;
+                        fe.event   = EVT_SQUAD_MOVE;
+                        fe.ownerId = ownerId;
+                        fe.eventId = nextEventId_++;
+                        fe.sType = wk.t; fe.sContainer = wk.c; fe.sContainerSerial = wk.cs;
+                        fe.sIndex = wk.i; fe.sSerial = wk.s;
+                        fe.aType = edges[i].after[0]; fe.aContainer = edges[i].after[1];
+                        fe.aContainerSerial = edges[i].after[2];
+                        fe.aIndex = edges[i].after[3]; fe.aSerial = edges[i].after[4];
+                        net.queueEvent(fe);
+                        char fb[200]; _snprintf(fb, sizeof(fb) - 1,
+                            "[squad] EVT flip-announce old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u (control flip: peer key -> our hand)",
+                            fe.sType, fe.sContainer, fe.sContainerSerial, fe.sIndex, fe.sSerial,
+                            fe.aType, fe.aContainer, fe.aContainerSerial, fe.aIndex, fe.aSerial);
+                        fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
+                    }
+                }
                 continue;
             }
         }

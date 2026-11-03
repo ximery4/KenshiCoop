@@ -314,6 +314,7 @@ void Replicator::resetSession() {
     pinOwned_.clear();
     pinPeer_.clear();
     moveEcho_.clear();
+    flipWire_.clear();
     exitedOwn_.clear();
     // Protocol 35: the rank latch + the engine's pointer->hand baseline both
     // describe the OLD world (containers and Character* dangle after a swap);
@@ -612,6 +613,19 @@ void Replicator::ingestInv(Inbound& in) {
         bool fresh = invRecv_.count(k) == 0;
         InvRecv& r = invRecv_[k];
         if (fresh) { r.bench = BENCH_UNKNOWN; r.bagShortMs = 0; } // explicit: never trust value-init here
+        if ((it->flags & INV_FLAG_CORPSE) != 0) {
+            // FORK diagnostics (corpse_loot flake): one line per CHANGED corpse snapshot, so a missing
+            // update on the receiver can be told apart from one that was never sent.
+            unsigned int uOld = 0, uNew = 0;
+            for (size_t ui = 0; ui < r.items.size(); ++ui) uOld += (r.items[ui].quantity < 1) ? 1u : (unsigned int)r.items[ui].quantity;
+            for (size_t ui = 0; ui < it->items.size(); ++ui) uNew += (it->items[ui].quantity < 1) ? 1u : (unsigned int)it->items[ui].quantity;
+            if (fresh || uOld != uNew) {
+                char cb[200]; _snprintf(cb, sizeof(cb) - 1,
+                    "[inv] RECV-CORPSE key=%u,%u,%u,%u,%u from=%u entries=%u units=%u->%u fresh=%d",
+                    k.t, k.c, k.cs, k.i, k.s, (unsigned)it->ownerId, (unsigned)it->items.size(), uOld, uNew, fresh ? 1 : 0);
+                cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+            }
+        }
         r.ownerId   = it->ownerId;
         r.items     = it->items; // latest snapshot supersedes
         r.dirty     = true;

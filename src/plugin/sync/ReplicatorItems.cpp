@@ -79,6 +79,18 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             // wire key is the body's STREAM key: its own hand, or the key we
             // drive it under when it is a bound proxy of a peer's stream (the
             // peer resolves that key to its own body directly).
+            // FORK 2026-11-03 (corpse_loot flake + Steam session): a body that stops being enumerated stops being
+            // published, and an unpublished corpse's loot is judged by the peer against an author it can no longer
+            // find. The 100-unit sphere around the interest centers made bodies flap in and out of the census every
+            // 1-10 s (191 / 228 LEFT-CENSUS lines in one hour). A corpse that still resolves is therefore kept for
+            // CORPSE_HOLD_MS after it was last seen. KENSHICOOP_CORPSE_HOLD_MS=0 restores the plain census.
+            static unsigned long corpseHoldMs = (unsigned long)-1;
+            if (corpseHoldMs == (unsigned long)-1) {
+                const char* e = getenv("KENSHICOOP_CORPSE_HOLD_MS");
+                corpseHoldMs = e ? (unsigned long)atol(e) : 15000UL;
+            }
+            static std::map<Key, unsigned long> corpseMissing;   // key -> first pass it was missing (main thread only)
+            std::map<Key, Key> oldCorpses = censusCorpses_;
             censusCorpses_.clear();
             if (corpseSync_) {
                 const unsigned int MAX_CORPSE = 32;
@@ -96,8 +108,29 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                     censusContainers_.insert(wire);
                     censusCorpses_[wire] = local;
                 }
-            }
-        }
+                unsigned long cnowHold = nowMs();
+                for (std::map<Key, Key>::const_iterator oc = oldCorpses.begin(); oc != oldCorpses.end(); ++oc) {
+                    if (censusCorpses_.find(oc->first) != censusCorpses_.end()) continue;
+                    unsigned long& since = corpseMissing[oc->first];
+                    bool first = (since == 0);
+                    if (first) since = cnowHold;
+                    unsigned int lh[5] = { oc->second.t, oc->second.c, oc->second.cs, oc->second.i, oc->second.s };
+                    if ((cnowHold - since) < corpseHoldMs && engine::resolveObjectByHand(lh) != 0) {
+                        censusContainers_.insert(oc->first);     // still there: keep authoring it
+                        censusCorpses_[oc->first] = oc->second;
+                        continue;
+                    }
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[inv] CORPSE LEFT-CENSUS key=%u,%u,%u,%u,%u (published=%d; not enumerated for %lu ms%s)",
+                        oc->first.t, oc->first.c, oc->first.cs, oc->first.i, oc->first.s,
+                        invPub_.count(oc->first) ? 1 : 0, cnowHold - since,
+                        engine::resolveObjectByHand(lh) != 0 ? "" : ", body gone");
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    corpseMissing.erase(oc->first);
+                }
+                for (std::map<Key, Key>::const_iterator nc = censusCorpses_.begin(); nc != censusCorpses_.end(); ++nc)
+                    corpseMissing.erase(nc->first);   // enumerated again: the miss clock restarts
+            }        }
         owned.insert(censusContainers_.begin(), censusContainers_.end());
     }
     if (owned.empty()) return;
@@ -2200,6 +2233,30 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                                         p.xferId, p.stringID, nm);
                 nb[sizeof(nb) - 1] = '\0'; coop::logLine(nb);
             }
+        }
+        // FORK 2026-11-03 diagnostics (Steam session 02.11: 21 of 38 peer intents answered moved=0 although
+        // both copies of the corpse agreed on contents): say WHY nothing moved - source unresolved, item absent
+        // from the source, or the destination not resolvable - so the next session names the failing end.
+        if (moved == 0) {
+            InvItemEntry dbs[INV_ITEMS_MAX]; InvItemEntry dbd[INV_ITEMS_MAX];
+            const bool sRes = engine::resolveObjectByHand(sHand) != 0;
+            const bool dRes = engine::resolveObjectByHand(dHand) != 0;
+            unsigned int ns = sRes ? engine::captureContainerContents(gw, sHand, dbs, INV_ITEMS_MAX, 0, 0, true) : 0;
+            unsigned int nd2 = dRes ? engine::captureContainerContents(gw, dHand, dbd, INV_ITEMS_MAX, 0, 0, true) : 0;
+            int srcHas = 0, dstHas = 0;
+            for (unsigned int ci = 0; ci < ns; ++ci)
+                if (dbs[ci].itemType == p.itemType && strcmp(dbs[ci].stringID, p.stringID) == 0)
+                    srcHas += (dbs[ci].quantity < 1) ? 1 : (int)dbs[ci].quantity;
+            for (unsigned int ci = 0; ci < nd2; ++ci)
+                if (dbd[ci].itemType == p.itemType && strcmp(dbd[ci].stringID, p.stringID) == 0)
+                    dstHas += (dbd[ci].quantity < 1) ? 1 : (int)dbd[ci].quantity;
+            char m0[300]; _snprintf(m0, sizeof(m0) - 1,
+                "[xfer] MOVE0 id=%u sid='%s' want=%u src=%u,%u,%u,%u,%u resolved=%d entries=%u has=%d | "
+                "dst=%u,%u,%u,%u,%u resolved=%d entries=%u has=%d | srcCorpseCensus=%d",
+                p.xferId, p.stringID, (unsigned)p.quantity, sHand[0], sHand[1], sHand[2], sHand[3], sHand[4],
+                sRes ? 1 : 0, ns, srcHas, dHand[0], dHand[1], dHand[2], dHand[3], dHand[4], dRes ? 1 : 0, nd2, dstHas,
+                censusCorpses_.count(sk) != 0 ? 1 : 0);
+            m0[sizeof(m0) - 1] = '\0'; coop::logLine(m0);
         }
         int fab = 0;
         int fabWhy = -1; // FORK: -1 not attempted, 0 ok, 1-4 engine fail reason, 5 skipped

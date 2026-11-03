@@ -1300,6 +1300,7 @@ void coopPanelDrive(bool atTitle) {
     // is live - never at the menu or during character creation.
     const bool hostReady = g_gameStarted && g_lastGw && coop::engine::gameplayLive(g_lastGw);
     coop::steaminvite::setHostReady(hostReady);
+    if (!g_cfg.isHost && g_gameStarted && g_net.isRunning() && !g_session.peers.empty()) coop::steaminvite::noteConnected();
     const bool lobbyHosting = coop::steaminvite::hostingLobby();
     // Heartbeat for after-the-fact debugging: one line every 30 s.
     {

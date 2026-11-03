@@ -57,3 +57,11 @@ Scenario names refer to `scripts/scenarios.psd1`; run one with
   reproduced on the join.
 - The smoothness/march advisories fail; they were already worse on baseline.
 - The far-NPC census (1 Hz) was left untouched on purpose.
+
+## Fork block 4 additions (2026-11)
+
+See `FORK_BLOCK4.md`: `corpse_loot` is flaky, corpse loot can be refused with
+`moved=0` for an unknown reason, weather is not synced, session-built furniture
+(bedroll) is not key-translated, long NPC freezes, a rollback loop on gamedata
+1913, and a harmless shutdown crash. The block 4d fixes (wolf duplicate on squad
+move, corpse census hold, bed fast-exit) are untested over Steam.

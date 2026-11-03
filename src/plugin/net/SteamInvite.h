@@ -88,6 +88,9 @@ void tick();
 
 // One-line human status for the panel/overlay (never null; "" when idle).
 const char* status();
+// FORK 2026-11-03: call once the client is connected and in the world: replaces the stale 'Connecting to host...'
+// (the status stayed that way for the whole session on the client).
+void noteConnected();
 
 // ---- Lobby view for the main-menu lobby window (main thread) ----------------
 // The lobby we are in (as host or joining player): owner + members straight

@@ -104,6 +104,13 @@ void loadConfig(Config& c) {
     // coop_config.json (next to the DLL) supplies the interactive-install
     // defaults; env vars still override every one of them (test harness).
     std::map<std::string, std::string> f = readConfigFile();
+    // FORK 2026-11-02: a "KENSHICOOP_*" key in coop_config.json acts as that environment variable (a real
+    // environment variable still wins). A Steam-launched game cannot be given env vars, and the
+    // diagnostics switches (KENSHICOOP_INV_DUMP, KENSHICOOP_DEBUG_CENSUS, ...) are read straight from the
+    // environment, so this is how a normal two-PC session turns the extended logging on.
+    for (std::map<std::string, std::string>::const_iterator fi = f.begin(); fi != f.end(); ++fi)
+        if (fi->first.compare(0, 11, "KENSHICOOP_") == 0 && !fi->second.empty() && !std::getenv(fi->first.c_str()))
+            _putenv_s(fi->first.c_str(), fi->second.c_str());
 
     std::string mode = envOr("KENSHICOOP_MODE", fileOr(f, "role", "host").c_str());
     c.isHost      = (mode != "join");

@@ -1027,6 +1027,9 @@ private:
         bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
         unsigned long koUpSinceMs;    // FORK: first tick the owner stream read upright under a KO latch (0 = not counting)
         unsigned long deathApplyMs;   // FORK: last tick applyRemoteDeath ran on this copy (throttle)
+        unsigned int  bedExitN;       // FORK 2026-11-03: consecutive bed fast-exits that did not take (see ReplicatorDrive)
+        unsigned long bedExitFirstMs; // FORK: start of the current fast-exit streak
+        unsigned long bedExitLogMs;   // FORK: last fast-exit log line (throttle)
         bool         carriedDown;     // a KO'd passenger, remembered ACROSS the drop. Leaving a
                                       //   shoulder is a physical transient: the body detaches and
                                       //   falls for a few frames before the engine re-flags it
@@ -1183,7 +1186,7 @@ private:
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
                    taskNoneTick(0), taskLapseTick(0), taskLapses(0),
                    detached(false), downApplied(false),
-                   koLatched(false), deathLatched(false), koUpSinceMs(0), deathApplyMs(0), carriedDown(false),
+                   koLatched(false), deathLatched(false), koUpSinceMs(0), deathApplyMs(0), bedExitN(0), bedExitFirstMs(0), bedExitLogMs(0), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
@@ -2770,6 +2773,11 @@ private:
     // times in 230 ms. Keyed on the character SERIAL - the one hand field a
     // re-container preserves - and consumed on the first matching edge.
     std::map<u32, unsigned long> moveEcho_;
+    // FORK 2026-11-03: character serial -> the hand the PEER keyed this body under when its squad move put it
+    // into a tab WE own (control flip). We stream the body under our own local hand, which differs from that
+    // key; the peer must be told, or it mints a duplicate proxy of its own unit (Steam session 02.11: the
+    // bought bone wolf moved into the other player's squad appeared twice). Consumed by publishSquadMoves.
+    std::map<u32, Key> flipWire_;
     // Hands we published as having LEFT our squad. The exit clears the pins and
     // captureSquad stops returning the body, so both drive guards (ownHands_,
     // pinOwned_) go quiet at once and the peer's in-flight tail for that hand

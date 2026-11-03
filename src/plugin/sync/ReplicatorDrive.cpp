@@ -796,10 +796,31 @@ void Replicator::applyTargets(GameWorld* gw) {
                 engine::endAction(c);
                 d.furnNoSeeTick = 0;
                 d.taskApplied = false; d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
-                char bfe[160]; _snprintf(bfe, sizeof(bfe) - 1,
-                    "[furn] BED FAST-EXIT occ=%u,%u ok=%d hostMoving=1",
-                    out.hIndex, out.hSerial, ok ? 1 : 0);
-                bfe[sizeof(bfe) - 1] = '\0'; coop::logLine(bfe);
+                // FORK 2026-11-03 (Steam session 02.11): a copy that stays in the bed after the exit is retried
+                // on EVERY tick - 410 fast-exits in 4.5 min for the host's Mr on a bedroll, 1174 for another
+                // body, while the host ran through the forest and the client saw the character asleep.
+                // ok=1 only means the engine call returned; the body still read as in-bed next tick. After a
+                // short streak, release it through the occupant's OWN inWhat (no furniture hand at all - a
+                // furnishing the client minted for a host-built bedroll resolves under a different hand than
+                // the one the read returned) and say which end stays stuck. Log once per second, not per tick.
+                if (d.bedExitFirstMs == 0 || (now - d.bedExitFirstMs) > 3000) { d.bedExitFirstMs = now; d.bedExitN = 0; }
+                ++d.bedExitN;
+                bool ok2 = true;
+                if (d.bedExitN >= 4) {
+                    ok2 = engine::applyFurniture(gw, c, 0, 1, false);
+                    engine::endAction(c);
+                    engine::haltMovement(c);
+                }
+                if ((now - d.bedExitLogMs) >= 1000) {
+                    d.bedExitLogMs = now;
+                    char bfe[200]; _snprintf(bfe, sizeof(bfe) - 1,
+                        "[furn] BED FAST-EXIT occ=%u,%u ok=%d hostMoving=1 streak=%u%s furn=%u,%u,%u,%u,%u resolves=%d",
+                        out.hIndex, out.hSerial, ok ? 1 : 0, d.bedExitN,
+                        (d.bedExitN >= 4) ? (ok2 ? " via-inWhat=ok" : " via-inWhat=FAIL") : "",
+                        lfr.furn[0], lfr.furn[1], lfr.furn[2], lfr.furn[3], lfr.furn[4],
+                        engine::resolveObjectByHand(lfr.furn) != 0 ? 1 : 0);
+                    bfe[sizeof(bfe) - 1] = '\0'; coop::logLine(bfe);
+                }
             } else if (localKind != 0) {
                 // Third-party placement authority (protocol 36): a HOST-sim
                 // actor (a guard jailing an arrested player) put this PEER-
