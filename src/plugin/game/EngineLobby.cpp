@@ -525,6 +525,10 @@ void build(const Model& m) {
         int x0 = PAD + 10;
         if (r.id != 0) { addAvatar(c, PAD + 4, ry + 3, 34, r); x0 = PAD + 46; }
         const int textW = W - PAD - x0 - (r.action.empty() ? 10 : btnW + 16);
+        // A line from the name to its button: on a wide window they are far apart. Clipped by the widget.
+        if (!r.action.empty())
+            addText(c, x0, ry + 2, textW, 20, std::string(300, '_'), SKIN_TEXT, FONT_SMALL, COL_GREY,
+                    MyGUI::Align::Left | MyGUI::Align::VCenter);
         addText(c, x0, ry + 2, textW, 20, r.name, SKIN_TEXT, FONT_TEXT, COL_WHITE,
                 MyGUI::Align::Left | MyGUI::Align::VCenter);
         addText(c, x0, ry + 21, textW, 18, r.sub, SKIN_TEXT, FONT_SMALL, r.subCol,

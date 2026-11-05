@@ -97,6 +97,7 @@ enum PacketType {
     PKT_VENDOR_CASH      = 53,// RELIABLE merchant cash at a mirrored counter (host -> joins, protocol 60); VendorCashPacket
     PKT_NATIVE_TAKEN     = 54,// RELIABLE save-native ground item picked up (any -> all, protocol 61); NativeTakenPacket
     PKT_JOIN_STATE       = 55,// RELIABLE squad name / faction name / permanent-job row (protocol 64); JoinStatePacket
+    PKT_CORE2            = 57,// RELIABLE core2 item session (off by default, docs/CORE2_DESIGN.md); opaque body, never relayed
     PKT_TRADE            = 56 // RELIABLE trader lock + shop hand-over (protocol 65); TradeHeader + InvItemEntry tail
 };
 

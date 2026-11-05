@@ -849,6 +849,22 @@ void setBlockXfer(bool on);
 // Returns true if both detours installed.
 bool installXferBlockHook();
 
+// ---- core2 shadow read (docs/CORE2_DESIGN.md) -------------------------------
+struct C2Row {
+    char sid[48];
+    unsigned int qty;
+    float quality;
+    unsigned short section;   // hash of the section name; the same on every machine
+    short x, y, w, h, nest;   // grid place; nest = 0 direct, 1 in a bag, 2 in a bag in a bag
+    void* item;               // Item*, identity on this machine only
+};
+// Every item of the object's inventory with its place. Reads only; SEH-guarded.
+unsigned int readC2Rows(RootObject* ro, C2Row* out, unsigned int maxOut);
+struct C2PathCount { int kind; void* ret; unsigned long count; };   // kind 0 remove, 1 add
+void setC2PathCount(bool on);
+void c2NotePath(int kind, void* returnAddress);
+unsigned int readC2Paths(C2PathCount* out, unsigned int maxOut);
+
 // SEH-guarded (store_probe): like addTestItemsToContainer, but walks the common
 // stackable templates until the container ACCEPTS one - storage buildings are
 // usually item-type-limited (a Fabric Chest refuses iron plates), which the fixed
@@ -930,6 +946,8 @@ bool installItemDropHook();
 // Drain captured drop edges into out[] (up to maxOut); clears the queue. Returns
 // the number written.
 unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut);
+// Did this owner really drop this template in the last windowMs? Seen by the dropItem detour.
+bool recentDropEdge(const unsigned int ownerHand[5], const char* sid, unsigned long windowMs);
 
 // ---- Conservation channel item types (single source of truth) --------------
 // itemType 2 = WEAPON, 3 = ARMOUR/clothing, 46 = worn CONTAINER (backpack). All

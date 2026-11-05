@@ -190,6 +190,11 @@ struct InboundVendorCash {
 };
 
 // One received trader lock / shop hand-over op (protocol 65).
+struct InboundCore2 {
+    u32             ownerId; // who sent it; 0 on a join = the host
+    std::vector<u8> bytes;
+};
+
 struct InboundTrade {
     u32                       ownerId; // == hdr.ownerId (WorldQ::eraseOwner)
     TradeHeader               hdr;
@@ -486,7 +491,7 @@ public:
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
-        vendorDelta_(worldReset_), vendorCash_(worldReset_), trade_(worldReset_),
+        vendorDelta_(worldReset_), vendorCash_(worldReset_), trade_(worldReset_), core2_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   joinState_(worldReset_),  deed_(worldReset_),
@@ -647,6 +652,13 @@ public:
         EnterCriticalSection(&cs_); vendorCash_.push_back(ivc); LeaveCriticalSection(&cs_);
     }
     // NET thread: one trader lock / shop hand-over op (protocol 65).
+    void pushCore2(u32 from, const unsigned char* data, unsigned int len) {
+        InboundCore2 c; c.ownerId = from; c.bytes.assign(data, data + len);
+        EnterCriticalSection(&cs_); core2_.push_back(c); LeaveCriticalSection(&cs_);
+    }
+    void drainCore2(std::deque<InboundCore2>& out) {
+        EnterCriticalSection(&cs_); out.swap(core2_); LeaveCriticalSection(&cs_);
+    }
     void pushTrade(const TradeHeader& hdr, const InvItemEntry* items, unsigned int count) {
         InboundTrade t; t.ownerId = hdr.ownerId; t.hdr = hdr;
         if (items && count > 0) t.items.assign(items, items + count);
@@ -1004,6 +1016,7 @@ private:
     WorldQ<InboundWorldClaim>      wic_;
     WorldQ<InboundNativeTaken>     nativeTaken_;
     WorldQ<InboundTrade>           trade_;
+    WorldQ<InboundCore2>           core2_;
     WorldQ<InboundNpcCensus>       npcCensus_;
     WorldQ<InboundWorldDrop>       wd_;
     WorldQ<InboundInvXfer>         invXfer_;

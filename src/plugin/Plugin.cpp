@@ -42,6 +42,7 @@
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
+#include "sync/Core2Shadow.h"
 #ifdef KENSHICOOP_HARNESS
 #include "test/Scenario.h" // scenario runner: Harness/Debug builds only (Phase 1)
 #endif
@@ -2582,6 +2583,12 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // Replication publish (pre-engine, worldLive-gated): ingest received targets,
     // then stream every owned channel so applied state is current this tick.
     tickReplicatePublish(gw, worldLive);
+    if (worldLive && coop::core2shadow::enabled()) {
+        std::deque<coop::InboundCore2> c2;
+        g_inbound.drainCore2(c2);
+        for (size_t i = 0; i < c2.size(); ++i) coop::core2shadow::receive(c2[i].ownerId, c2[i].bytes, GetTickCount());
+        coop::core2shadow::tick(gw, GetTickCount(), g_net, g_cfg.isHost);
+    }
     // CharCreate: join character editor + apply received creations (protocol 57).
     tickCharGen(gw, worldLive);
     // Squad tab names after the players who drive them (protocol 59).
@@ -3144,7 +3151,8 @@ void installEngineDetours() {
     // the detours install only when the veto is on or the xfer_block test runs.
     coop::engine::setInvOwnerClassifier(&coopInvOwnerClass);
     coop::engine::setBlockXfer(g_cfg.blockXfer);
-    if (g_cfg.blockXfer || g_cfg.scenario == "xfer_block") {
+    if (coop::core2shadow::enabled()) coop::engine::setC2PathCount(true);
+    if (g_cfg.blockXfer || g_cfg.scenario == "xfer_block" || coop::core2shadow::enabled()) {
         if (coop::engine::installXferBlockHook())
             coopLog(g_cfg.blockXfer
                 ? "[xfer] drag detours installed; cross-owner trade veto ON (drop to transfer)"

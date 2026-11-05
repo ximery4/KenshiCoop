@@ -810,6 +810,13 @@ void Replicator::applyTargets(GameWorld* gw) {
                     ok2 = engine::applyFurniture(gw, c, 0, 1, false);
                     engine::endAction(c);
                     engine::haltMovement(c);
+                    // Block5 (Steam session 02.11: 1174 fast-exits with ok=1 on one body, no ENTER ever sent by the owner):
+                    // the copy's OWN AI keeps laying it back down, since a conscious bed sleeper is never AI-suspended.
+                    // Hold the AI off while the owner is moving; the suspend is dropped each tick by the drive
+                    // and re-added here only for as long as the streak lasts. KENSHICOOP_BED_SUSPEND=0 disables.
+                    static int bedSusp = -1;
+                    if (bedSusp < 0) { const char* e = getenv("KENSHICOOP_BED_SUSPEND"); bedSusp = (e && e[0] == '0') ? 0 : 1; }
+                    if (bedSusp) engine::addAiSuspend(c);
                 }
                 if ((now - d.bedExitLogMs) >= 1000) {
                     d.bedExitLogMs = now;

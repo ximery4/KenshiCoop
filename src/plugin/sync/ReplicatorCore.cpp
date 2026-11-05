@@ -95,6 +95,7 @@ Replicator::Replicator()
       jsSeqOut_(1), jsSampleMs_(0), joinStateSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
+      rekeyContainers_(!(getenv("KENSHICOOP_REKEY_CONTAINERS") && getenv("KENSHICOOP_REKEY_CONTAINERS")[0] == '0')),
       storeSync_(false), contCensusMs_(0), corpseSync_(false),
       vendorSync_(false), vendorScanMs_(0), nextVendorDeltaId_(1), vendorCashMs_(0),
       tradeOpen_(false), tradeHaveFirst_(false), tradeMoneyFirst_(-1), tradeMoneyLast_(-1),
@@ -296,6 +297,7 @@ void Replicator::resetSession() {
     xferLatch_.clear();
     xferDefer_.clear();
     xferOut_.clear();
+    ownTakeMs_.clear();
     appliedXfers_.clear();
     wdSuppress_.clear();
     xferScanMs_ = 0;

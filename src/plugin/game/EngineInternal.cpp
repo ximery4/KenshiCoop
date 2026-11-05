@@ -11,6 +11,8 @@
 // The include prelude (Boost guards first) rides EngineInternal.h.
 
 #include "EngineInternal.h"
+#include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
 
 namespace coop {
 namespace engine {
@@ -838,6 +840,7 @@ static bool sourceHandOfItem(Item* item, unsigned int out[5]) {
 
 Item* __fastcall removeDontDestroy_hook(Inventory* self, Item* it, int howmany,
                                         bool returnCopyIfSomeLeft) {
+    c2NotePath(0, _ReturnAddress());
     Item* r = g_removeDontDestroyOrig(self, it, howmany, returnCopyIfSomeLeft);
     if ((g_blockXfer || xferDumpFlag()) && !g_invVetoSuspend) {
         __try {
@@ -855,6 +858,7 @@ Item* __fastcall removeDontDestroy_hook(Inventory* self, Item* it, int howmany,
 }
 
 bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
+    c2NotePath(1, _ReturnAddress());
     if ((g_blockXfer || xferDumpFlag()) && !g_invVetoSuspend && g_invOwnerClass &&
         self && item) {
         int decision = 0; // 1 = block
@@ -949,6 +953,22 @@ typedef void (__fastcall* DropItemFn)(Inventory* self, Item* it);
 DropItemFn g_dropItemOrig = 0;
 std::vector<ItemDropEdge> g_dropEdges;
 
+// Real drops seen by the hook: lets the gear census tell a throw on the ground from a trade or a sale.
+namespace {
+struct RecentDrop { unsigned int serial; char sid[48]; unsigned long ms; };
+RecentDrop g_recentDrops[32];
+unsigned int g_recentDropAt = 0;
+}
+
+bool recentDropEdge(const unsigned int ownerHand[5], const char* sid, unsigned long windowMs) {
+    const unsigned long now = GetTickCount();
+    for (unsigned int i = 0; i < 32; ++i) {
+        const RecentDrop& r = g_recentDrops[i];
+        if (r.ms != 0 && r.serial == ownerHand[4] && now - r.ms <= windowMs && strcmp(r.sid, sid) == 0) return true;
+    }
+    return false;
+}
+
 void __fastcall dropItem_hook(Inventory* self, Item* it) {
     g_dropItemOrig(self, it);
     // A drop may internally remove the item (setting the veto's pending-remove
@@ -966,6 +986,11 @@ void __fastcall dropItem_hook(Inventory* self, Item* it) {
                 strncpy(e.stringID, gd->stringID.c_str(), sizeof(e.stringID) - 1);
                 e.stringID[sizeof(e.stringID) - 1] = '\0';
                 e.itemType = (unsigned int)gd->type;
+                RecentDrop& rd = g_recentDrops[g_recentDropAt++ % 32];
+                rd.serial = e.ownerHand[4];
+                strncpy(rd.sid, e.stringID, sizeof(rd.sid) - 1);
+                rd.sid[sizeof(rd.sid) - 1] = '\0';
+                rd.ms = GetTickCount();
             }
             int qty = it->quantity; if (qty < 1) qty = 1;
             e.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);

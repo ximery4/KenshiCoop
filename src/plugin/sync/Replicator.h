@@ -2096,6 +2096,8 @@ private:
     // keyed by our own xferId. Holds exactly what the verdict has to undo - the
     // two peer ends and the item key - because by the time the answer arrives
     // the detector has long since rebased and cannot reconstruct it.
+    // block5b: (source, template) -> when WE last took it out of that source (see applyTransfers ALREADY-LANDED).
+    std::map<std::pair<Key, std::string>, unsigned long> ownTakeMs_;
     struct XferOut {
         Key           src;
         Key           dst;
@@ -2702,6 +2704,7 @@ private:
     u32           fixtureSeqOut_;
     unsigned long fixtureSampleMs_;
     bool          fixtureSync_;
+    bool          rekeyContainers_;
     // Translate a peer fixture key to the local hand for the same object.
     // False when we have no pairing (yet) - the caller keeps the raw hand.
     // preferSender = the client whose hand space `wire` is in (the snapshot's
@@ -2724,6 +2727,19 @@ private:
                              u32 sender = OWNER_ID_ALL) const {
         if (corpseLocalHand(k, out))
             return;
+        // FORK 2026-11-03 (Steam session 02.11, block5): a squad member moved to another tab is re-keyed
+        // on its author's side, and the drive already learned wire-key -> LOCAL hand for it ([rekey] line).
+        // Inventory snapshots and transfer intents kept using the wire key verbatim, so on this client they
+        // resolved to nothing: 613 empty applies on one character in 50 minutes, six production pickups refused
+        // (why=2). KENSHICOOP_REKEY_CONTAINERS=0 restores the verbatim key.
+        if (rekeyContainers_ && ownedContainers_.count(k) == 0 && ownHands_.count(k) == 0) {
+            std::map<Key, Key>::const_iterator rk = rekeyLogged_.find(k);
+            if (rk != rekeyLogged_.end()) {
+                out[0] = rk->second.t; out[1] = rk->second.c; out[2] = rk->second.cs;
+                out[3] = rk->second.i; out[4] = rk->second.s;
+                return;
+            }
+        }
         if (ownedContainers_.count(k) == 0 && ownHands_.count(k) == 0 &&
             localHandForFixtureKey(k, out, sender))
             return;

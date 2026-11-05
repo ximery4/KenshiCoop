@@ -1366,6 +1366,19 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                     curPtrs[pe->first] = prevC.ptrs[pe->first]; // and keep the departed Item* handle(s)
                     continue;
                 }
+                // No ground copy and the drop detour saw no drop of it: a trade, a sale, a move to a
+                // peer's character. Mirroring that as a drop lost items and made ghosts (session 03.11).
+                // KENSHICOOP_WD_FALLBACK_ANY=1 restores the old guess.
+                static int fallbackAny = -1;
+                if (fallbackAny < 0) { const char* e = getenv("KENSHICOOP_WD_FALLBACK_ANY"); fallbackAny = (e && e[0] == '1') ? 1 : 0; }
+                if (!fallbackAny && !engine::recentDropEdge(cHand, pe->first.c_str(), 30000UL)) {
+                    prevC.retries.erase(pe->first); prevC.retryArmMs.erase(pe->first);
+                    if (dumpWd) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[wd] not-a-drop hand=%u,%u,%u,%u,%u sid='%s' delta=%d (no drop edge)",
+                        it->t, it->c, it->cs, it->i, it->s, pe->first.c_str(), delta);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    continue;
+                }
                 // Debounce expired: the weapon really LEFT this owned character (we never mutate
                 // owned inventories ourselves, so this is a genuine user action). Author the drop
                 // at the OWNER's position as the mirror target - the weapon was dropped at its
@@ -2106,6 +2119,9 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
 
     for (unsigned int i = 0; i < fires.size(); ++i) {
         const Fire& f = fires[i];
+        // block5b: remember that WE took this template out of this source just now (own->own moves included), so an
+        // incoming intent for the same unit is a real race with our own player and not a transfer that already landed.
+        ownTakeMs_[std::make_pair(f.src, f.key.first)] = now;
         bool srcOwn = ownedContainers_.count(f.src) != 0 || ownHands_.count(f.src) != 0;
         bool dstOwn = ownedContainers_.count(f.dst) != 0 || ownHands_.count(f.dst) != 0;
         if (!srcOwn || !dstOwn) {
@@ -2219,12 +2235,31 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         unsigned int dHand[5]; handForContainerKey(dk, dHand, peerContainerOwner(dk));
         // Relocate OUR copy of the real item between the same two containers - the
         // conservation move (never fabricates or destroys), so gear survives.
-        int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
-                                                      p.itemType, (int)p.quantity);
+        // TEST LEVER (block5): KENSHICOOP_TEST_XFER_REFUSE_DST=1 makes this client behave as the live Steam session did -
+        // our copy of the SENDER's character refuses the add (full grid) - so the answer path can be exercised
+        // deterministically. Never set outside the lab.
+        static int refuseDst = -1;
+        if (refuseDst < 0) { const char* e = getenv("KENSHICOOP_TEST_XFER_REFUSE_DST"); refuseDst = (e && e[0] == '1') ? 1 : 0; }
+        const bool leverRefuse = refuseDst && dAuth == p.ownerId;
+        // TEST LEVER (block5b): KENSHICOOP_TEST_XFER_PRELAND=1 makes the transfer look "already landed": before the intent
+        // is processed the unit is taken out of OUR source and put into OUR copy of the sender's character, as the
+        // sender's snapshots did in the live session (host MOVE0: src has=0, dst has>=want). Lab only.
+        static int preland = -1;
+        if (preland < 0) { const char* e = getenv("KENSHICOOP_TEST_XFER_PRELAND"); preland = (e && e[0] == '1') ? 1 : 0; }
+        bool prelandDone = false;
+        if (preland && dAuth == p.ownerId) {
+            prelandDone = true;
+            engine::removeItemsFromContainerBySid(gw, sHand, p.stringID, p.itemType, 1000); // ALL of it: src has=0, as live
+            engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType, (int)p.quantity, (int)p.quality,
+                                             p.manufacturer, p.material, p.level);
+        }
+        int moved = (leverRefuse || prelandDone) ? 0
+                                : engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
+                                                                    p.itemType, (int)p.quantity);
         // FORK 2026-11-02: the item may sit in a BACKPACK of the source character (the top-level search above
         // cannot see in there): moved=0 here answered reject, the author rolled the item back and it
         // "vanished" (field report: good medkit / samurai boots from a backpack). Relocate it out of the bag.
-        if (moved < (int)p.quantity) {
+        if (moved < (int)p.quantity && !leverRefuse && !prelandDone) {
             int nm = engine::moveItemOutOfNestedContainer(gw, sHand, dHand, p.stringID, p.itemType,
                                                           (int)p.quantity - moved);
             if (nm > 0) {
@@ -2234,9 +2269,38 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                 nb[sizeof(nb) - 1] = '\0'; coop::logLine(nb);
             }
         }
+        // FORK 2026-11-03 block5 (Steam session 02.11: 26 of 38 peer intents came back short and the author rolled
+        // the loot back out of its own character - 28 units gone for good). The destination here is the SENDER's
+        // character (we only hold a cosmetic copy of it), and our copy refused the add (full grid, or a stale key):
+        // that says nothing about the sender's real inventory, which already holds the item. What this client must
+        // answer is only "did the source lose it" - so take the shortfall out of OUR source and accept; the
+        // sender's own snapshots carry the item into the destination. Nothing is created, nothing is double-kept:
+        // the unit leaves the source here and exists in the sender's real bag. Refused (moved=0, nothing removed)
+        // when our source does not hold the unit (the upstream #40 race). Containers never go this way (a destroyed
+        // bag would lose its contents). KENSHICOOP_XFER_SRC_ONLY=0 restores the old answer.
+        int srcOnly = 0;
+        {
+            static int srcOnlyOn = -1;
+            if (srcOnlyOn < 0) { const char* e = getenv("KENSHICOOP_XFER_SRC_ONLY"); srcOnlyOn = (e && e[0] == '0') ? 0 : 1; }
+            if (srcOnlyOn && moved < (int)p.quantity && sAuth == localId && dAuth == p.ownerId &&
+                ownedContainers_.count(dk) == 0 && ownHands_.count(dk) == 0 &&
+                !engine::isContainerItemType(p.itemType)) {
+                int rem = engine::removeItemsFromContainerBySid(gw, sHand, p.stringID, p.itemType,
+                                                                (int)p.quantity - moved);
+                if (rem > 0) {
+                    moved += rem; srcOnly = rem;
+                    char sb[200]; _snprintf(sb, sizeof(sb) - 1,
+                        "[xfer] SRC-ONLY id=%u sid='%s' took=%d of %u from our source; the sender's real bag holds it "
+                        "(our copy of the destination refused the add)",
+                        p.xferId, p.stringID, rem, (unsigned)p.quantity);
+                    sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+                }
+            }
+        }
         // FORK 2026-11-03 diagnostics (Steam session 02.11: 21 of 38 peer intents answered moved=0 although
         // both copies of the corpse agreed on contents): say WHY nothing moved - source unresolved, item absent
         // from the source, or the destination not resolvable - so the next session names the failing end.
+        int diagSrcHas = -1, diagDstHas = -1; // set by the MOVE0 probe below (-1 = not probed)
         if (moved == 0) {
             InvItemEntry dbs[INV_ITEMS_MAX]; InvItemEntry dbd[INV_ITEMS_MAX];
             const bool sRes = engine::resolveObjectByHand(sHand) != 0;
@@ -2250,6 +2314,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
             for (unsigned int ci = 0; ci < nd2; ++ci)
                 if (dbd[ci].itemType == p.itemType && strcmp(dbd[ci].stringID, p.stringID) == 0)
                     dstHas += (dbd[ci].quantity < 1) ? 1 : (int)dbd[ci].quantity;
+            diagSrcHas = srcHas; diagDstHas = dstHas;
             char m0[300]; _snprintf(m0, sizeof(m0) - 1,
                 "[xfer] MOVE0 id=%u sid='%s' want=%u src=%u,%u,%u,%u,%u resolved=%d entries=%u has=%d | "
                 "dst=%u,%u,%u,%u,%u resolved=%d entries=%u has=%d | srcCorpseCensus=%d",
@@ -2257,6 +2322,51 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                 sRes ? 1 : 0, ns, srcHas, dHand[0], dHand[1], dHand[2], dHand[3], dHand[4], dRes ? 1 : 0, nd2, dstHas,
                 censusCorpses_.count(sk) != 0 ? 1 : 0);
             m0[sizeof(m0) - 1] = '\0'; coop::logLine(m0);
+        }
+        // FORK 2026-11-03 block5b (live session block5, client reports 13:44 skins / 14:06 armour / 14:12 boots lost):
+        // the host's MOVE0 shows the same picture each time - OUR source is already empty (has=0) while our copy of the
+        // SENDER's character already holds the item (dst has>=want): the sender's snapshots had carried the move before
+        // its intent arrived. Answering "reject" made the sender roll its loot back out of its own character - the unit
+        // then exists nowhere. The transfer has in fact landed: accept it and change nothing. Cost: if two players took
+        // the same unit in the same instant (upstream #40) both keep one - a spare item, never a lost one.
+        // KENSHICOOP_XFER_LANDED_ACCEPT=0 restores the refusal.
+        int noop = 0;
+        {
+            static int landedOn = -1;
+            if (landedOn < 0) { const char* e = getenv("KENSHICOOP_XFER_LANDED_ACCEPT"); landedOn = (e && e[0] == '0') ? 0 : 1; }
+            // An own take of the same template out of this source within 15 s means the empty source is OUR player's doing:
+            // a genuine race (upstream #40, corpse_loot_race) - refuse, as before, so no spare unit is created.
+            std::map<std::pair<Key, std::string>, unsigned long>::const_iterator ot = ownTakeMs_.find(std::make_pair(sk, std::string(p.stringID)));
+            bool ownTakeRecent = (ot != ownTakeMs_.end()) && (now - ot->second) < 15000;
+            // The detector needs ~1 s to settle and pair a take, but a rival intent can arrive sooner: a still-pending LOSS of
+            // this template at this source is our own player's take that has not been paired yet - the same race.
+            if (!ownTakeRecent) {
+                std::map<Key, std::map<XKey, XferPend> >::const_iterator pi = xferPend_.find(sk);
+                if (pi != xferPend_.end()) {
+                    std::map<XKey, XferPend>::const_iterator pj = pi->second.find(XKey(std::string(p.stringID), p.itemType));
+                    if (pj != pi->second.end() && pj->second.delta < 0) ownTakeRecent = true;
+                }
+            }
+            // A corpse WE author is not in the detector's tracked set, so our own player's take from it leaves no loss to
+            // see - but it leaves a GAIN of the same template in one of OUR own containers (unpaired, pending). That is the
+            // same race (upstream #40): refuse, so no spare unit appears. Peer containers do not count: the sender's own
+            // gain is exactly what a landed transfer looks like.
+            if (!ownTakeRecent) {
+                XKey xk(std::string(p.stringID), p.itemType);
+                for (std::map<Key, std::map<XKey, XferPend> >::const_iterator gi = xferPend_.begin(); gi != xferPend_.end(); ++gi) {
+                    if (ownedContainers_.count(gi->first) == 0 && ownHands_.count(gi->first) == 0) continue;
+                    std::map<XKey, XferPend>::const_iterator gj = gi->second.find(xk);
+                    if (gj != gi->second.end() && gj->second.delta > 0) { ownTakeRecent = true; break; }
+                }
+            }
+            if (landedOn && !ownTakeRecent && moved == 0 && diagSrcHas == 0 && diagDstHas >= (int)p.quantity && dAuth == p.ownerId &&
+                !engine::isContainerItemType(p.itemType)) {
+                noop = (int)p.quantity;
+                char lb[220]; _snprintf(lb, sizeof(lb) - 1,
+                    "[xfer] ALREADY-LANDED id=%u sid='%s' want=%u srcHas=0 dstHas=%d: the sender's snapshots carried it; accepted, nothing changed",
+                    p.xferId, p.stringID, (unsigned)p.quantity, diagDstHas);
+                lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+            }
         }
         int fab = 0;
         int fabWhy = -1; // FORK: -1 not attempted, 0 ok, 1-4 engine fail reason, 5 skipped
@@ -2291,7 +2401,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         // unit. An UNKNOWN author of a character-typed source (corpse / body) never justifies minting:
         // refuse, the author rolls its optimistic move back. A world fixture (hand type 0) keeps its path.
         bool unknownCharSrc = (sAuth == OWNER_ID_ALL && sk.t != 0);
-        if (moved < (int)p.quantity && ((sAuth != localId && !unknownCharSrc) || srcCensusOnly)) {
+        if (noop == 0 && moved < (int)p.quantity && ((sAuth != localId && !unknownCharSrc) || srcCensusOnly)) {
             // Our src copy is short (desync) - fabricate the shortfall into dst so the
             // trade still lands. Non-gear always did this; gear joined once spike 451
             // made weapon fabrication work (armour always could). Dupe safety: the
@@ -2325,9 +2435,10 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                 L.delta -= applied; L.deadlineMs = now + XFER_GRACE_MS;
                 if (L.delta == 0) xferLatch_[sk].erase(key);
             }
-            if (!dstOwn) {
+            // The units taken source-only never entered our copy of the destination: no latch for them there.
+            if (!dstOwn && (applied - srcOnly) > 0) {
                 XferLatch& L = xferLatch_[dk][key];
-                L.delta += applied; L.deadlineMs = now + XFER_GRACE_MS;
+                L.delta += (applied - srcOnly); L.deadlineMs = now + XFER_GRACE_MS;
                 if (L.delta == 0) xferLatch_[dk].erase(key);
             }
         }
@@ -2346,10 +2457,11 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         ack.ownerId     = localId;
         ack.xferOwnerId = p.ownerId;
         ack.xferId      = p.xferId;
-        ack.applied     = (u16)((applied < 0) ? 0 : (applied > 65535 ? 65535 : applied));
+        const int ackApplied = applied + noop; // noop: already landed via snapshots, nothing was changed here
+        ack.applied     = (u16)((ackApplied < 0) ? 0 : (ackApplied > 65535 ? 65535 : ackApplied));
         ack.requested   = p.quantity;
-        ack.verdict     = (u8)((applied <= 0) ? XFER_ACK_REJECT
-                             : (applied >= (int)p.quantity) ? XFER_ACK_ACCEPT
+        ack.verdict     = (u8)((ackApplied <= 0) ? XFER_ACK_REJECT
+                             : (ackApplied >= (int)p.quantity) ? XFER_ACK_ACCEPT
                              : XFER_ACK_PARTIAL);
         net.queueInvXferAck(ack);
         char b[240]; _snprintf(b, sizeof(b) - 1,
@@ -3191,7 +3303,23 @@ void Replicator::tickTradeLocal(GameWorld* gw, NetLink& net, u32 me, bool isHost
         if (tradeHaveFirst_) {
             t = &tradeTable_[k0];
             tradeTouched(tradeFirst_, tradeLast_, t->lines);
-            if (tradeMoneyLast_ >= 0) t->money = tradeMoneyLast_;
+            // FORK 2026-11-03 (live session block5, Hub innkeeper: host 13517 -> 0 after the client merely OPENED and closed
+            // the shop - release lines=0 money=0): the money of a RELEASE is absolute, so a client whose copy of the
+            // merchant was stale (0) overwrote the host's true cash with it. Publish the cash only when THIS session
+            // changed it; an untouched read is not news and must not travel. KENSHICOOP_TRADE_MONEY_ALWAYS=1 restores
+            // the old behaviour.
+            static int moneyAlways = -1;
+            if (moneyAlways < 0) { const char* e = getenv("KENSHICOOP_TRADE_MONEY_ALWAYS"); moneyAlways = (e && e[0] == '1') ? 1 : 0; }
+            if (tradeMoneyLast_ >= 0) {
+                if (moneyAlways || tradeMoneyLast_ != tradeMoneyFirst_) {
+                    t->money = tradeMoneyLast_;
+                } else if (t->money != tradeMoneyLast_) {
+                    char mb[200]; _snprintf(mb, sizeof(mb) - 1,
+                        "[trade] MONEY-KEEP trader=%u,%u,%u,%u,%u first=%d last=%d table=%d (cash unchanged this session; not published)",
+                        k0.t, k0.c, k0.cs, k0.i, k0.s, tradeMoneyFirst_, tradeMoneyLast_, t->money);
+                    mb[sizeof(mb) - 1] = '\0'; coop::logLine(mb);
+                }
+            }
             t->applied = true;
         }
         sendTradeOp(net, TRADE_RELEASE, me, k0, TRADE_NOBODY, me, t);
@@ -3204,6 +3332,40 @@ void Replicator::tickTradeLocal(GameWorld* gw, NetLink& net, u32 me, bool isHost
         // trades on the engine's own (stale) stock.
         std::map<Key, TradeTable>::iterator ti = tradeTable_.find(k);
         if (ti != tradeTable_.end() && !ti->second.applied) applyTradeTable(gw, k, "open");
+        else if (ti == tradeTable_.end() || (ti->second.lines.empty() && ti->second.money < 0)) {
+            // FORK 2026-11-03 (live session block5, innkeeper of the Hub): the merchant the client opened was a DIFFERENT
+            // BODY (hand 1,126,...) of the same template standing at the same spot as the one the host's table was
+            // keyed by (1,9,...) - a fight re-keys and duplicates town NPCs on the client - so the pending table (13517
+            // money, the stock) never reached the shop the client actually traded with: empty stock, 0 money, and
+            // the client's RELEASE then wrote 0 over the host's cash. A pending table keyed by another body of the
+            // same template within 20 u is the same merchant: apply it to this one. KENSHICOOP_TRADE_ALIAS=0 disables.
+            static int aliasOn = -1;
+            if (aliasOn < 0) { const char* e = getenv("KENSHICOOP_TRADE_ALIAS"); aliasOn = (e && e[0] == '0') ? 0 : 1; }
+            TraderDesc here;
+            if (aliasOn && describeTraderKey(k, here)) {
+                for (std::map<Key, TradeTable>::iterator t2 = tradeTable_.begin(); t2 != tradeTable_.end(); ++t2) {
+                    if (!(t2->first < k) && !(k < t2->first)) continue;
+                    if (t2->second.applied) continue;
+                    TraderDesc other;
+                    if (!describeTraderKey(t2->first, other) || strcmp(other.sid, here.sid) != 0) continue;
+                    float dx = other.x - here.x, dz = other.z - here.z;
+                    if (dx * dx + dz * dz > 20.0f * 20.0f) continue;
+                    Key from = t2->first;
+                    TradeTable copy = t2->second;
+                    copy.applied = false;
+                    tradeTable_[k] = copy;
+                    applyTradeTable(gw, k, "open-alias");
+                    std::map<Key, TradeTable>::iterator orig = tradeTable_.find(from);
+                    if (orig != tradeTable_.end()) orig->second.applied = true;
+                    char ab[200]; _snprintf(ab, sizeof(ab) - 1,
+                        "[trade] ALIAS-APPLY table of %u,%u,%u,%u,%u (money=%d lines=%u) applied to the merchant opened here %u,%u,%u,%u,%u",
+                        from.t, from.c, from.cs, from.i, from.s, copy.money, (unsigned)copy.lines.size(),
+                        k.t, k.c, k.cs, k.i, k.s);
+                    ab[sizeof(ab) - 1] = 0; coop::logLine(ab);
+                    break;
+                }
+            }
+        }
         std::map<Key, u32>::iterator it = tradeHolder_.find(k);
         if (it != tradeHolder_.end() && it->second != me) {
             engine::closeTradeWindow();

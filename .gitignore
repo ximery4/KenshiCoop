@@ -81,3 +81,6 @@ nul
 
 # Local-only maintainer notes (release process, etc.) - not for the public repo
 *.local.md
+
+# core2 headless test outputs
+build_tests/

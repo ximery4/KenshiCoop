@@ -54,7 +54,16 @@ public:
             // ACTOR: drop the leader's weapon once (unequip to loose first if worn).
             if (step_ == 0 && ctx.elapsedMs >= 8000) {
                 step_ = 1;
-                int dr = engine::dropItemFromInventory(ctx.gw, hand_, baseSid_, baseType_, 1);
+                // Test lever: the gear leaves without a throw, the way a sale or a move to a peer's
+                // character does. The verdict below then fails on purpose; judge by the [wd] lines.
+                const char* noDrop = getenv("KENSHICOOP_TEST_WD_NODROP");
+                if (noDrop && noDrop[0] == '1') {
+                    engine::unequipItemToLoose(ctx.gw, hand_, baseSid_, baseType_, 1);
+                    int gone = engine::removeItemsFromContainerBySid(ctx.gw, hand_, baseSid_, baseType_, 1);
+                    char nb[120]; _snprintf(nb, sizeof(nb) - 1, "WDROP lever: removed without a drop n=%d", gone);
+                    nb[sizeof(nb) - 1] = '\0'; coop::logLine(nb);
+                }
+                int dr = (noDrop && noDrop[0] == '1') ? 1 : engine::dropItemFromInventory(ctx.gw, hand_, baseSid_, baseType_, 1);
                 if (dr == 0) {
                     int un = engine::unequipItemToLoose(ctx.gw, hand_, baseSid_, baseType_, 1);
                     if (un > 0) dr = engine::dropItemFromInventory(ctx.gw, hand_, baseSid_, baseType_, 1);

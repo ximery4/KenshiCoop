@@ -1975,6 +1975,34 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         PeerBuildKey pkey(it->ownerId, k);
         if (peerBuilds_.find(pkey) != peerBuilds_.end())
             continue; // already minted (or mint already refused) - dedupe
+        // FORK 2026-11-03 (live session block5, "snail house" ceiling flicker): the host placed a two-storey building
+        // (key ...1035) and 4 s later MINTED a second one from a peer PLACE (key ...1041) at the SAME spot - the
+        // peer's mint of our building was echoed straight back as a placement of its own. Two coincident buildings
+        // z-fight (blinking ceilings). A peer cannot legitimately place the same template on top of a building WE
+        // placed and still hold, so that PLACE is the echo of ours: do not mint it. Remember the key as seen (its STATE
+        // rows then skip silently). KENSHICOOP_BUILD_ECHO_GUARD=0 disables.
+        {
+            static int echoGuard = -1;
+            if (echoGuard < 0) { const char* e = getenv("KENSHICOOP_BUILD_ECHO_GUARD"); echoGuard = (e && e[0] == '0') ? 0 : 1; }
+            bool dupOfOwn = false;
+            if (echoGuard) {
+                for (std::map<Key, OwnBuild>::const_iterator ob2 = ownBuilds_.begin(); ob2 != ownBuilds_.end(); ++ob2) {
+                    if (ob2->second.removed || !ob2->second.haveAnn) continue;
+                    const BuildPlacePacket& a = ob2->second.ann;
+                    if (strcmp(a.sid, p.sid) != 0) continue;
+                    float dx = a.x - p.x, dy = a.y - p.y, dz = a.z - p.z;
+                    if (dx < 3.0f && dx > -3.0f && dz < 3.0f && dz > -3.0f && dy < 10.0f && dy > -10.0f) { dupOfOwn = true; break; }
+                }
+            }
+            if (dupOfOwn) {
+                peerBuilds_[pkey]; // seen, never minted
+                char db[224]; _snprintf(db, sizeof(db) - 1,
+                    "[build] MINT-DUP-SKIP key=%u.%u.%u.%u.%u sid='%s' pos=%.1f,%.1f,%.1f (same template on top of a building WE placed: echo, not minted)",
+                    p.key[0], p.key[1], p.key[2], p.key[3], p.key[4], p.sid, p.x, p.y, p.z);
+                db[sizeof(db) - 1] = '\0'; coop::logLine(db);
+                continue;
+            }
+        }
         PeerBuild& pb = peerBuilds_[pkey];
         // Mint INCOMPLETE always: the placer's STATE rows drive progress from
         // here (a real UI placement starts at 0 anyway).

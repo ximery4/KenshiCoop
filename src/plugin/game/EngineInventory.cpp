@@ -352,6 +352,44 @@ GameData* fallbackWeaponManufacturer(GameWorld* gw) {
     return cached;
 }
 
+// FORK 2026-11-03 (block5b): the grid LAYOUT of an inventory is not synchronised - each machine's engine places
+// an item wherever the first free spot is - so a copy can hold exactly the author's items yet have no free block
+// big enough for one more (fragmentation): live session 03.11 logged 80 "[mk] tryAddItem-fail" on gear the author
+// had room for, and a refused add on our copy of the sender's character used to cost the sender its loot. When the
+// add is refused, compact every NON-worn section with the engine's own auto-arrange and retry ONCE.
+// KENSHICOOP_ADD_REARRANGE=0 disables. External linkage is not needed; used below in this TU.
+static int g_rearrangeAdds = 0;
+static bool rearrangeSections(Inventory* inv) {
+    if (!inv || !g_getSectionsFn) return false;
+    __try {
+        lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+        unsigned int ns = secs ? secs->size() : 0;
+        for (unsigned int s = 0; s < ns; ++s) {
+            InventorySection* sec = (*secs)[s];
+            if (!sec || sec->isAnEquippedItemSection) continue;
+            sec->autoArrange();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+static bool addWithRearrange(Inventory* inv, Item* it, int qty) {
+    if (inv->tryAddItem(it, qty)) return true;               // virtual
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KENSHICOOP_ADD_REARRANGE"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (!on) return false;
+    if (!rearrangeSections(inv)) return false;
+    bool ok = inv->tryAddItem(it, qty);
+    ++g_rearrangeAdds;
+    if (g_rearrangeAdds <= 20 || (g_rearrangeAdds % 50) == 0) {
+        char b[140]; _snprintf(b, sizeof(b) - 1,
+            "[inv] REARRANGE-ADD n=%d retried after auto-arrange ok=%d", g_rearrangeAdds, ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    return ok;
+}
+
 // SEH-guarded: create `qty` of the template (sid, typeCat) and add it to inv. The
 // join reconstructs items locally (their hands are host-only / unresolvable), so a
 // fresh blank handle is fine - the host stays authoritative for the contents. When
@@ -429,7 +467,7 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
         }
         if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; }
         if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
-        if (!inv->tryAddItem(it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
+        if (!addWithRearrange(inv, it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
         // Equipment is non-stackable (qty 1); move the just-added item into its slot.
         if (equip && g_equipItemFn) g_equipItemFn(inv, it);
         // gotLvl is what the factory actually baked in; when it disagrees with the wire's
@@ -1493,7 +1531,7 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                 int take = qty - moved; if (take > have) take = have;
                 Item* taken = src->removeItemDontDestroy_returnsItem(curItems[i], take, false); // virtual
                 if (!taken) continue;
-                if (!dst->tryAddItem(taken, take)) {          // virtual: real-object relocation
+                if (!addWithRearrange(dst, taken, take)) {    // virtual: real-object relocation
                     src->tryAddItem(taken, take);             // destination refused - put it back
                     g_invVetoSuspend = vetoSav;
                     return moved;

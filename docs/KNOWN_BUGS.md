@@ -68,3 +68,9 @@ walks, weather is not synced, long NPC freezes, and a harmless shutdown crash.
 `corpse_loot` is flaky in the lab. The block 4d fixes (squad-move flip announce,
 corpse census hold, bed fast-exit) are untested over Steam and do not fix the item
 loss.
+
+## Fork block 5c (2026-11-04)
+
+See `FORK_BLOCK5C.md`: what worked in a 76-minute two-PC Steam session and what did not (building copies without an owner
+faction, a refused transfer not returning the units to the source copy, copies refusing items that the author holds in a bag,
+enemy copies killed and revived by the local fight, frozen knock-out timer on copies, buildings from a save not synchronised).

@@ -136,6 +136,7 @@ public:
     // MAIN thread: queue a trader lock / shop hand-over op (protocol 65); items
     // (the shop stock) are sent only when hdr.flags has TRADE_FLAG_STOCK.
     void queueTrade(const TradeHeader& hdr, const InvItemEntry* items, unsigned int count);
+    void queueCore2(const std::vector<u8>& body, u32 targetMask = PEER_MASK_ALL);
     // MAIN thread: queue a save-native pickup notice (protocol 61, any -> all;
     // the host relays a join's to the other joins).
     void queueNativeTaken(const NativeTakenPacket& pkt);
@@ -320,6 +321,8 @@ private:
         std::vector<InvItemEntry> items;
     };
     std::vector<OutTrade>    outTrade_;
+    struct OutCore2 { std::vector<u8> bytes; u32 mask; };
+    std::vector<OutCore2>    outCore2_;
     // Reliable world-item snapshots / culls queued by the main thread (Phase W1),
     // drained + serialized by the net thread. Guarded by outCs_.
     struct OutWorldItems { u32 ownerId; std::vector<WorldItemEntry> items; };

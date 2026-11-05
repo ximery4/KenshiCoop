@@ -265,6 +265,15 @@ void NetLink::queueTrade(const TradeHeader& hdr, const InvItemEntry* items, unsi
     pushLocked(outCs_, outTrade_, ot);
 }
 
+void NetLink::queueCore2(const std::vector<u8>& body, u32 targetMask) {
+    OutCore2 c;
+    c.mask = targetMask;
+    c.bytes.reserve(body.size() + 1);
+    c.bytes.push_back((u8)PKT_CORE2);
+    c.bytes.insert(c.bytes.end(), body.begin(), body.end());
+    pushLocked(outCs_, outCore2_, c);
+}
+
 void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFaction_, pkt); }
 
 void NetLink::queueTime(const TimePacket& pkt) { pushLocked(outCs_, outTime_, pkt); }
@@ -1045,6 +1054,9 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushVendorCash(vc.ownerId, vc);
                         }
+                    } else if (type == PKT_CORE2) {
+                        if (ev.packet->dataLength > 1 && inbound_)
+                            inbound_->pushCore2(isHost_ ? (u32)(size_t)ev.peer->data : 0u, ev.packet->data + 1, (unsigned)ev.packet->dataLength - 1);
                     } else if (type == PKT_TRADE) {
                         // Trader lock / shop hand-over (protocol 65). NOT relayed:
                         // the host is the hub - it arbitrates REQUESTs and re-sends
@@ -1843,6 +1855,14 @@ void NetLink::threadLoop() {
         EnterCriticalSection(&outCs_);
         cgPkts.swap(outCharGen_);
         LeaveCriticalSection(&outCs_);
+        std::vector<OutCore2> c2Pkts;
+        EnterCriticalSection(&outCs_);
+        c2Pkts.swap(outCore2_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < c2Pkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&c2Pkts[i].bytes[0], c2Pkts[i].bytes.size(), ENET_PACKET_FLAG_RELIABLE);
+            sendOut(out, CH_RELIABLE, c2Pkts[i].mask);
+        }
         for (size_t i = 0; i < cgPkts.size(); ++i) {
             if (cgPkts[i].empty()) continue;
             ENetPacket* out = enet_packet_create(&cgPkts[i][0], cgPkts[i].size(),
