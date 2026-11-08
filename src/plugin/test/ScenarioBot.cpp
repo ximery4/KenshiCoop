@@ -25,6 +25,12 @@
 //   trade_open <hand>          open the trade window with the trader at <hand>
 //   trade_buy <hand>           buy the first loose one-unit stack of that trader's stock
 //   trade_close                close the trade window
+//   machines <radius>          mines / refiners / benches / farms / research stands near the selected member
+//   machine <hand>             one machine's buffers and what its container holds
+//   work <hand> [task]         send the selected member to work that machine or mine
+//   workstate                  the selected member's current task, working=1 while it operates a machine
+//   collect <hand> [sid-part]  move the machine container's contents (ore, crafted goods) into the selected member
+//   feed <hand> <sid> <type> <qty>  move raw material from the selected member into the machine
 //   dump                       log the selected member's full inventory (devtools log)
 //   log <text>                 put "BOT <text>" into the coop log (markers for oracles)
 //   wait <ms>                  hold the command queue
@@ -343,6 +349,123 @@ private:
             char b[160]; _snprintf(b, sizeof(b) - 1, "%s corpse=%u,%u,%u,%u,%u items=%u moved=%d d=%.1f",
                                    moved > 0 ? "OK" : "ERR", cr[best].hand[0], cr[best].hand[1], cr[best].hand[2],
                                    cr[best].hand[3], cr[best].hand[4], n, moved, sqrt(bd));
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "machines")) {
+            // machines [radius]: mines, refiners, benches, farms, research stands near the selected member.
+            // cls: BuildingClassType number (the script tells a mine by out= + mine>0, a bench by in0/in1)
+            if (!haveMe) { reply(id, "ERR no member"); return; }
+            float rad = a1 ? (float)atof(a1) : 150.0f;
+            static engine::ProdRead pr[96];
+            unsigned int n = engine::enumMachinesAround(ctx.gw, e.x, e.y, e.z, rad, pr, 96);   // around the member, not the squad leader
+            unsigned int shown = 0;
+            for (unsigned int i = 0; i < n; ++i) {
+                float dx = pr[i].x - e.x, dz = pr[i].z - e.z, d = sqrtf(dx * dx + dz * dz);
+                if (d > rad) continue;
+                rowf(id, "h=%u,%u,%u,%u,%u d=%.1f pos=%.1f,%.1f,%.1f cls=%d done=%d pow=%d ps=%d mine=%.2f out=%s:%.2f/%d "
+                         "in0=%s:%.2f in1=%s:%.2f sid=%s name=%s",
+                     pr[i].hand[0], pr[i].hand[1], pr[i].hand[2], pr[i].hand[3], pr[i].hand[4], d,
+                     pr[i].x, pr[i].y, pr[i].z, pr[i].classType, pr[i].complete, pr[i].powerOn, pr[i].productionState,
+                     pr[i].miningLevel, pr[i].outSid[0] ? pr[i].outSid : "-", pr[i].outAmount, pr[i].outCap,
+                     pr[i].nInputs > 0 && pr[i].inSid[0][0] ? pr[i].inSid[0] : "-", pr[i].nInputs > 0 ? pr[i].inAmount[0] : -1.0f,
+                     pr[i].nInputs > 1 && pr[i].inSid[1][0] ? pr[i].inSid[1] : "-", pr[i].nInputs > 1 ? pr[i].inAmount[1] : -1.0f,
+                     pr[i].sid, pr[i].name);
+                ++shown;
+            }
+            rowf(id, "total=%u shown=%u", n, shown);
+            reply(id, "END");
+        } else if (!strcmp(cmd, "machine")) {
+            // machine t,c,cs,i,s: one machine's state plus what its container holds (its stock = mined ore / crafted goods)
+            unsigned int mc[5];
+            engine::ProdRead pr;
+            if (!a1 || !parseHand(a1, mc)) { reply(id, "ERR usage: machine t,c,cs,i,s"); return; }
+            memset(&pr, 0, sizeof(pr));
+            if (!engine::readMachineByHand(mc, &pr)) { reply(id, "ERR not a machine here"); return; }
+            rowf(id, "cls=%d done=%d pow=%d ps=%d mine=%.2f out=%s:%.2f/%d in0=%s:%.2f in1=%s:%.2f name=%s",
+                 pr.classType, pr.complete, pr.powerOn, pr.productionState, pr.miningLevel,
+                 pr.outSid[0] ? pr.outSid : "-", pr.outAmount, pr.outCap,
+                 pr.nInputs > 0 && pr.inSid[0][0] ? pr.inSid[0] : "-", pr.nInputs > 0 ? pr.inAmount[0] : -1.0f,
+                 pr.nInputs > 1 && pr.inSid[1][0] ? pr.inSid[1] : "-", pr.nInputs > 1 ? pr.inAmount[1] : -1.0f, pr.name);
+            InvItemEntry mi[64];
+            unsigned int nm = engine::captureContainerContents(ctx.gw, mc, mi, 64, 0);
+            for (unsigned int i = 0; i < nm; ++i)
+                rowf(id, "stock sid=%s qty=%u type=%u", mi[i].stringID, (unsigned int)mi[i].quantity, mi[i].itemType);
+            reply(id, "END");
+        } else if (!strcmp(cmd, "cont")) {
+            // cont t,c,cs,i,s: what ANY container holds (chest, storage, furniture, machine, character) - block5g
+            // container_multi_intent check across windows.
+            unsigned int mc[5];
+            if (!a1 || !parseHand(a1, mc)) { reply(id, "ERR usage: cont t,c,cs,i,s"); return; }
+            if (engine::resolveObjectByHand(mc) == 0) { reply(id, "ERR unresolved"); return; }
+            InvItemEntry mi[96];
+            unsigned int nm = engine::captureContainerContents(ctx.gw, mc, mi, 96, 0);
+            unsigned int units = 0;
+            for (unsigned int i = 0; i < nm; ++i) {
+                units += mi[i].quantity < 1 ? 1u : (unsigned int)mi[i].quantity;
+                rowf(id, "stock sid=%s qty=%u type=%u", mi[i].stringID, (unsigned int)mi[i].quantity, mi[i].itemType);
+            }
+            rowf(id, "entries=%u units=%u", nm, units);
+            reply(id, "END");
+        } else if (!strcmp(cmd, "chests")) {
+            // chests [radius]: containers (storage, furniture with an inventory, machines) around the selected member,
+            // the same census the host uses - block5g
+            if (!haveMe) { reply(id, "ERR no member"); return; }
+            float rad = a1 ? (float)atof(a1) : 150.0f;
+            static engine::ContRead cr2[96];
+            unsigned int n = engine::enumContainersNear(ctx.gw, rad, cr2, 96, false);
+            unsigned int shown = 0;
+            for (unsigned int i = 0; i < n; ++i) {
+                float dx = cr2[i].x - e.x, dz = cr2[i].z - e.z, d = sqrtf(dx * dx + dz * dz);
+                if (d > rad) continue;
+                rowf(id, "h=%u,%u,%u,%u,%u d=%.1f cls=%d inv=%d n=%d qty=%d sid=%s name=%s", cr2[i].hand[0], cr2[i].hand[1],
+                     cr2[i].hand[2], cr2[i].hand[3], cr2[i].hand[4], d, cr2[i].classType, cr2[i].hasInv, cr2[i].nEntries,
+                     cr2[i].qtyTotal, cr2[i].sid, cr2[i].name);
+                ++shown;
+            }
+            rowf(id, "total=%u shown=%u", n, shown);
+            reply(id, "END");
+        } else if (!strcmp(cmd, "work")) {
+            // work t,c,cs,i,s [task]: send the selected member to work that mine/machine (player order,
+            // default task OPERATE_MACHINERY). Re-sending while it already works is harmless but resets the walk.
+            unsigned int mc[5];
+            if (!me || !a1 || !parseHand(a1, mc)) { reply(id, "ERR usage: work t,c,cs,i,s [task]"); return; }
+            int used = 0;
+            int r = engine::orderWorkByHand(me, mc, a2 ? atoi(a2) : 0, &used);
+            char b[96]; _snprintf(b, sizeof(b) - 1, "%s res=%d task=%d", r == 1 ? "OK" : "ERR", r, used);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "workstate")) {
+            // workstate: what the selected member does right now. working=1 while its task is a machine-work task.
+            if (!me) { reply(id, "ERR no member"); return; }
+            int tk = engine::readTaskKey(me);
+            rowf(id, "task=%d working=%d moving=%d bs=%u pos=%.1f,%.1f,%.1f", tk, engine::isMachineWorkTask(tk) ? 1 : 0,
+                 (int)e.cMoving, (unsigned int)e.bodyState, e.x, e.y, e.z);
+            reply(id, "END");
+        } else if (!strcmp(cmd, "collect")) {
+            // collect t,c,cs,i,s [sid-part]: move what the machine's container holds (mined ore, crafted goods) into the
+            // selected member - a container-to-container move like the UI drag. The member must stand near the machine.
+            unsigned int mc[5];
+            if (!haveMe || !a1 || !parseHand(a1, mc)) { reply(id, "ERR usage: collect t,c,cs,i,s [sid-part]"); return; }
+            InvItemEntry mi[64];
+            unsigned int nm = engine::captureContainerContents(ctx.gw, mc, mi, 64, 0);
+            int moved = 0, kinds = 0;
+            for (unsigned int i = 0; i < nm; ++i) {
+                if (a2 && !strstr(mi[i].stringID, a2)) continue;
+                int q = mi[i].quantity < 1 ? 1 : (int)mi[i].quantity;
+                int mv = engine::moveItemBetweenContainers(ctx.gw, mc, mh, mi[i].stringID, mi[i].itemType, q);
+                if (mv > 0) { moved += mv; ++kinds; }
+            }
+            char b[96]; _snprintf(b, sizeof(b) - 1, "%s stacks=%u moved=%d kinds=%d", moved > 0 ? "OK" : "ERR", nm, moved, kinds);
+            b[sizeof(b) - 1] = '\0'; reply(id, b);
+        } else if (!strcmp(cmd, "feed")) {
+            // feed t,c,cs,i,s <sid> <type> <qty>: move qty of sid from the selected member into the machine's container
+            // (raw material for a refiner or bench). Moves what is there, up to qty.
+            char sidS[64]; unsigned int ty = 0; int qn = 0, mc5[5];
+            unsigned int mc[5];
+            if (!haveMe || sscanf(tail, "%d,%d,%d,%d,%d %63s %u %d", &mc5[0], &mc5[1], &mc5[2], &mc5[3], &mc5[4], sidS, &ty, &qn) != 8) {
+                reply(id, "ERR usage: feed t,c,cs,i,s <sid> <type> <qty>"); return; }
+            for (int k = 0; k < 5; ++k) mc[k] = (unsigned int)mc5[k];
+            int mv = engine::moveItemBetweenContainers(ctx.gw, mh, mc, sidS, ty, qn);
+            if (mv < qn) mv += engine::moveItemOutOfNestedContainer(ctx.gw, mh, mc, sidS, ty, qn - mv);
+            char b[64]; _snprintf(b, sizeof(b) - 1, "%s moved=%d", mv > 0 ? "OK" : "ERR", mv);
             b[sizeof(b) - 1] = '\0'; reply(id, b);
         } else if (!strcmp(cmd, "givebag")) {
             // givebag <sid> <type> <qty>: mint qty of sid INSIDE the selected member's backpack (test fixture)

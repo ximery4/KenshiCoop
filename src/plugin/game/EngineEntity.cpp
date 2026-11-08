@@ -819,6 +819,38 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[MAX_INTEREST_ANCH
     return nc;
 }
 
+// FORK 2026-11-08 (block5g, 4-player run on Xim2): the container/corpse census used only the
+// interest centers (one per TAB LEADER + cameras). On a big base a 25-member tab works far from
+// its leader, so the machines and chests the members use were authored by nobody (host APPLY
+// sAuth=-1 cens=0 -> dst-refused/unresolved transfers, П.45/П.47 class). The census now centers on
+// EVERY player character, merged within 120 units, plus the interest anchors. Caller holds SEH.
+// KENSHICOOP_CENSUS_ALL_MEMBERS=0 restores the leader-only centers.
+unsigned int containerCenters(GameWorld* gw, Ogre::Vector3* outC, unsigned int maxOut) {
+    static int allMembers = -1;
+    if (allMembers < 0) { const char* e = getenv("KENSHICOOP_CENSUS_ALL_MEMBERS"); allMembers = (e && e[0] == '0') ? 0 : 1; }
+    Ogre::Vector3 base[MAX_INTEREST_ANCHORS];
+    unsigned int nb = interestCenters(gw, base, 0);
+    unsigned int nc = 0;
+    for (unsigned int i = 0; i < nb && nc < maxOut; ++i) outC[nc++] = base[i];
+    if (!allMembers || nb == 0) return nc;
+    PlayerInterface* pl = gw->player;
+    if (!pl) return nc;
+    const float MERGE_SQ = 120.0f * 120.0f;
+    unsigned int total = pl->playerCharacters.size();
+    for (unsigned int i = 0; i < total && nc < maxOut; ++i) {
+        Character* m = pl->playerCharacters[i];
+        if (!m) continue;
+        Ogre::Vector3 p = m->getPosition();
+        bool closeBy = false;
+        for (unsigned int k = 0; k < nc && !closeBy; ++k) {
+            float dx = outC[k].x - p.x, dy = outC[k].y - p.y, dz = outC[k].z - p.z;
+            closeBy = (dx * dx + dy * dy + dz * dz) <= MERGE_SQ;
+        }
+        if (!closeBy) outC[nc++] = p;
+    }
+    return nc;
+}
+
 // SEH wrapper over interestCenters for callers outside the engine layer
 // (interestCenters itself relies on the caller's SEH frame).
 unsigned int interestAnchors(GameWorld* gw, float out[3 * MAX_INTEREST_ANCHORS],

@@ -13,6 +13,8 @@
 // (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include <set>
+#include <utility>
 
 namespace coop {
 namespace engine {
@@ -963,7 +965,7 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
         // nested ones re-enter the capture hook and would echo this mint back.
         ++g_buildCaptureSuppress;
         Building* bld = g_createBldgFn(
-            gw->theFactory, tmpl, pos, /*town*/0, /*owner*/0, rot, /*cb*/0,
+            gw->theFactory, tmpl, pos, /*town*/0, /*owner*/playerFactionOf(gw), rot, /*cb*/0,
             /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
             /*invisible*/false, completed, /*isFoliage*/false,
             /*floor*/0, /*isOutsideFurniture*/false);
@@ -1250,6 +1252,31 @@ unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
     return n;
 }
 
+// FORK 2026-11-07 (bot_remote): the same census around an ARBITRARY point. enumMachinesNear is anchored on the
+// interest centers (squad leader + camera anchors), so a bot member standing 2 km from the leader saw no
+// machines at all. Returns the count written.
+unsigned int enumMachinesAround(GameWorld* gw, float cx, float cy, float cz, float radius,
+                                ProdRead* out, unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 center(cx, cy, cz);
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, BUILDING, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o) continue;
+            Building* b = static_cast<Building*>(o);
+            if (!isMachineClassType((int)b->classType)) continue;
+            if (!b->_buildState.isComplete) continue;
+            fillProdRead(b, &out[n]);
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
 bool readMachineByHand(const unsigned int mHand[5], ProdRead* out) {
     if (!mHand || !out) return false;
     RootObject* ro = resolveObjectByHand(mHand);
@@ -1350,6 +1377,28 @@ bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amou
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         coop::logLine("[prod] operate SEH-except");
         return false;
+    }
+}
+
+// FORK 2026-11-07 (bot_remote stage 2: mining and production work). Send character `c` to WORK the machine /
+// mine at `fixtureHand` through the PLAYER-ORDER path (what a right-click "operate" gives a squad member:
+// walk there, take the work spot, run OPERATE_MACHINERY). task <= 0 means OPERATE_MACHINERY. Returns
+//   1 ordered, 0 hand does not resolve here, -1 not a machine-class building, -2 construction unfinished,
+//  -3 order refused, -4 fault. *usedTask gets the task id issued.
+int orderWorkByHand(Character* c, const unsigned int fixtureHand[5], int task, int* usedTask) {
+    if (usedTask) *usedTask = 0;
+    if (!c || !fixtureHand) return 0;
+    RootObject* ro = resolveObjectByHand(fixtureHand);
+    if (!ro) return 0;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (!isMachineClassType((int)b->classType)) return -1;
+        if (!b->_buildState.isComplete) return -2;
+        const int t = (task > 0) ? task : (int)OPERATE_MACHINERY;
+        if (usedTask) *usedTask = t;
+        return orderWorkAt(c, ro, t) ? 1 : -3;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -4;
     }
 }
 
@@ -1628,25 +1677,67 @@ static void fillContRead(Building* b, ContRead* r) {
     }
 }
 
+// Once-per-building diagnostic for the census class filter (block5g). Kept out of
+// enumContainersNear: that function's __try frame cannot hold unwindable objects.
+static void censusDiagSkip(RootObject* o, Building* b) {
+    static std::set<std::pair<unsigned int, unsigned int> > seen; // main thread only
+    if (seen.size() >= 400) return;
+    unsigned int dh[5];
+    if (!readObjectHand(o, dh)) return;
+    if (!seen.insert(std::make_pair(dh[3], dh[4])).second) return;
+    GameData* gd = o->getGameData();
+    char db[240]; _snprintf(db, sizeof(db) - 1,
+        "[census] CONT-SKIP class hand=%u.%u.%u.%u.%u cls=%d sid='%s' name='%s' (has inventory, not a container class)",
+        dh[0], dh[1], dh[2], dh[3], dh[4], (int)b->classType,
+        gd ? gd->stringID.c_str() : "", gd ? gd->name.c_str() : "");
+    db[sizeof(db) - 1] = '\0'; coop::logLine(db);
+}
+
 unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                                 unsigned int maxOut, bool includeShops) {
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
     unsigned int n = 0;
     __try {
-        Ogre::Vector3 centers[MAX_INTEREST_ANCHORS];
-        unsigned int nc = interestCenters(gw, centers);
+        Ogre::Vector3 centers[MAX_CONTAINER_CENTERS];
+        unsigned int nc = containerCenters(gw, centers, MAX_CONTAINER_CENTERS);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
             g_npcQuery.clear();
             g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 256, 0);
             unsigned int total = g_npcQuery.size();
+            // FORK 2026-11-08 (block5g, П.47 base chests never synced): say ONCE per building why
+            // an inventory-bearing building is left out, and when the 256-object query saturates.
+            static int diag = -1;
+            if (diag < 0) { const char* e = getenv("KENSHICOOP_CENSUS_DIAG"); diag = (e && e[0] == '0') ? 0 : 1; }
+            if (diag && total >= 256) {
+                static unsigned long satLog = 0;
+                unsigned long t = GetTickCount();
+                if (satLog == 0 || t - satLog > 60000) {
+                    satLog = t;
+                    char sb[128]; _snprintf(sb, sizeof(sb) - 1,
+                        "[census] CONT-QUERY saturated center=%u total=%u (buildings beyond the cap are not seen)", ci, total);
+                    sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+                }
+            }
             for (unsigned int i = 0; i < total && n < maxOut; ++i) {
                 RootObject* o = g_npcQuery[i];
                 if (!o) continue;
                 Building* b = static_cast<Building*>(o);
                 if (!isContainerClassType((int)b->classType)) {
                     unsigned int ow[5]; int fn = 0;
-                    if (!includeShops || !counterOwnerOf(b, ow, &fn)) continue;
+                    bool shop = counterOwnerOf(b, ow, &fn);
+                    // FORK 2026-11-08 (block5g, П.47): storage FURNITURE (mod chests, barrels, safes:
+                    // BCTYPE_USABLE with an inventory) is a chest to the player. It was skipped, so its
+                    // contents never crossed. Shop counters keep their own vendor path.
+                    // KENSHICOOP_CENSUS_USABLE=0 restores the old filter.
+                    static int usableOn = -1;
+                    if (usableOn < 0) { const char* e = getenv("KENSHICOOP_CENSUS_USABLE"); usableOn = (e && e[0] == '0') ? 0 : 1; }
+                    bool usableStore = usableOn && !shop && (int)b->classType == (int)BCTYPE_USABLE &&
+                                       o->getInventory() != 0;
+                    if (!usableStore && (!includeShops || !shop)) {
+                        if (diag && o->getInventory() != 0) censusDiagSkip(o, b);
+                        continue;
+                    }
                 }
                 // Incomplete sites ride protocol 27 until finished.
                 if (!b->_buildState.isComplete) continue;
@@ -1661,6 +1752,16 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
                 ++n;
             }
         }
+        if (n >= maxOut) {
+            static unsigned long capLog = 0;
+            unsigned long t = GetTickCount();
+            if (capLog == 0 || t - capLog > 60000) {
+                capLog = t;
+                char cb[128]; _snprintf(cb, sizeof(cb) - 1,
+                    "[census] CONT-CAP rows=%u max=%u (containers beyond the cap are not synced)", n, maxOut);
+                cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+            }
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
     return n;
 }
@@ -1671,8 +1772,9 @@ unsigned int enumNpcBodiesNear(GameWorld* gw, float radius, CorpseRead* out,
     if (deadOnly && !g_isDeadCharFn) return 0;
     unsigned int n = 0;
     __try {
-        Ogre::Vector3 centers[MAX_INTEREST_ANCHORS];
-        unsigned int nc = interestCenters(gw, centers);
+        Ogre::Vector3 centers[MAX_CONTAINER_CENTERS];
+        unsigned int nc = deadOnly ? containerCenters(gw, centers, MAX_CONTAINER_CENTERS)
+                                   : interestCenters(gw, centers);
         for (unsigned int ci = 0; ci < nc; ++ci) {
             g_npcQuery.clear();
             // Same sphere query captureNpcs makes (it returns Characters as

@@ -661,6 +661,10 @@ Faction* findNearbyNonPlayerFaction(GameWorld* gw);
 // receives the leader count. Caller holds SEH.
 unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[MAX_INTEREST_ANCHORS],
                              unsigned int* nLeaders = 0);
+// block5g: the container/corpse census centers - the interest anchors plus EVERY
+// player character (merged within 120 units). Caller holds SEH.
+const unsigned int MAX_CONTAINER_CENTERS = 48;
+unsigned int containerCenters(GameWorld* gw, Ogre::Vector3* outC, unsigned int maxOut);
 // Case-insensitive substring test on raw C strings (SEH legal).
 bool ciContains(const char* hay, const char* needle);
 // Template scans (reused g_dataScratch; main thread only).

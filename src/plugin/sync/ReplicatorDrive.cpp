@@ -381,9 +381,13 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (dmgGuard_ && !(out.bodyState & BODY_DEAD) && !d.deathLatched &&
             (engine::readBodyState(c) & BODY_DEAD)) {
             if (engine::vetoLocalDeath(c)) {
-                char b[128]; _snprintf(b, sizeof(b) - 1,
-                    "[death] veto hand=%u,%u", out.hIndex, out.hSerial);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ++d.deathVetoN;
+                // 9195 lines in 20 minutes on 04.11.2026 (four bandit copies killed by the other player's fight).
+                if (d.deathVetoN <= 3 || (d.deathVetoN % 100) == 0) {
+                    char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[death] veto hand=%u,%u n=%u", out.hIndex, out.hSerial, d.deathVetoN);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
             }
         }
 
@@ -957,12 +961,20 @@ void Replicator::applyTargets(GameWorld* gw) {
             // FORK 2026-11-02: the owner reports the body DEAD (reliable EVT_DEATH latch or the streamed
             // BODY_DEAD bit): make the copy engine-dead too, instead of leaving it "unconscious" while the
             // owner reads "dead" (lootable corpse, wrong status). A feigned death never sets either.
-            if ((d.deathLatched || (out.bodyState & BODY_DEAD)) && d.fresh &&
-                !(engine::readBodyState(c) & BODY_DEAD) && (now - d.deathApplyMs) >= 1000) {
+            // 04.11.2026: eight bandit copies on the join were killed this way once a second for 13 minutes (2729 lines):
+            // the body did not stay dead, and every kill-and-revive is a visible jump. After 3 tries in a row the retry
+            // slows to 15 s, and the line is logged on the first three and then every 20th.
+            const bool deadHere = (engine::readBodyState(c) & BODY_DEAD) != 0;
+            if (deadHere) d.deathApplyN = 0;
+            if ((d.deathLatched || (out.bodyState & BODY_DEAD)) && d.fresh && !deadHere &&
+                (now - d.deathApplyMs) >= ((d.deathApplyN < 3) ? 1000ul : 15000ul)) {
                 d.deathApplyMs = now;
+                ++d.deathApplyN;
                 bool did = engine::applyRemoteDeath(c);
-                char b[128]; _snprintf(b, sizeof(b) - 1, "[death] APPLY-REMOTE hand=%u,%u ok=%d", out.hIndex, out.hSerial, did ? 1 : 0);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                if (d.deathApplyN <= 3 || (d.deathApplyN % 20) == 0) {
+                    char b[128]; _snprintf(b, sizeof(b) - 1, "[death] APPLY-REMOTE hand=%u,%u ok=%d n=%u", out.hIndex, out.hSerial, did ? 1 : 0, d.deathApplyN);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
             }
             // A ragdoll/KO falls independently on each client (and the join's local
             // AI may have walked the body elsewhere before the down state arrived),
@@ -2911,7 +2923,21 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
                 xlated.sIndex = lh[3]; xlated.sSerial = lh[4];
                 posed = &xlated;
             } else {
-                siteUnresolved = true;
+                // FORK 2026-11-08 (block5g, П.43): a save-resident site is not in the placed-build
+                // maps, but its save-stable hand names the same building here - use it as is.
+                unsigned int rawH[5] = { out.sType, out.sContainer, out.sContainerSerial, out.sIndex, out.sSerial };
+                engine::BuildRead br;
+                if (engine::readBuildingByHand(rawH, &br)) {
+                    if (!d.fixtureXlateLogged) {
+                        d.fixtureXlateLogged = true;
+                        char rb[176]; _snprintf(rb, sizeof(rb) - 1,
+                            "[pose] build-site baked hand=%u,%u site=%u.%u.%u.%u.%u prog=%.3f (save-resident, resolved directly)",
+                            out.hIndex, out.hSerial, rawH[0], rawH[1], rawH[2], rawH[3], rawH[4], br.progress);
+                        rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                    }
+                } else {
+                    siteUnresolved = true;
+                }
             }
         } else {
             // A MINE is a runtime object too, for a different reason: each

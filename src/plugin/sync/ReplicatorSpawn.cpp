@@ -748,7 +748,15 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // proxy body's ACTUAL local position, in the SCENARIO series shape (hand
     // order i,s,t,c,cs like MEMBER/RECV lines) so the spawn_sync oracle can
     // time-pair it with the host's MEMBER series per hand.
-    if (!proxyByKey_.empty() && (now - spawnPosLogMs_) >= 500) {
+    // A real session (no scenario) logged this for every proxy twice a second: 04.11.2026 it was 48% of the lines
+    // of both 90 MB logs. Scenarios and KENSHICOOP_PROXY_TELEMETRY=1 keep the 2 Hz series; a session samples every 20 s.
+    static int proxyTelemetryFast = -1;
+    if (proxyTelemetryFast < 0) {
+        const char* sc = getenv("KENSHICOOP_SCENARIO");
+        const char* pt = getenv("KENSHICOOP_PROXY_TELEMETRY");
+        proxyTelemetryFast = ((sc && sc[0]) || (pt && pt[0] == '1')) ? 1 : 0;
+    }
+    if (!proxyByKey_.empty() && (now - spawnPosLogMs_) >= (proxyTelemetryFast ? 500ul : 20000ul)) {
         spawnPosLogMs_ = now;
         for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
              it != proxyByKey_.end(); ++it) {

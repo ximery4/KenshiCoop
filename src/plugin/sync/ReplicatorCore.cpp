@@ -47,7 +47,7 @@ Replicator::Replicator()
       probeRecruit_(false), probedCount_(0),
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
       nextWorldNetId_(1), worldSeeded_(false), nextNativeTakeId_(1),
-      nextDropId_(1), nextPickupId_(1), nextXferId_(1),
+      nextDropId_(1), nextPickupId_(1), nextXferId_(1), lastPeerXferMs_(0),
       xferScanMs_(0), nextTreatId_(1),
       quietRelapse_(0), crawlPhysRestore_(0),
       sitOrders_(0), detachUses_(0), noDetach_(false),

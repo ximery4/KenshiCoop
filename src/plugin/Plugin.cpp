@@ -747,6 +747,76 @@ void pumpSaveReceive() {
 // PKT_SAVE_REQ (autosave edges are dropped - the host's own autosave already
 // drives a coordinated save). Received BEGIN/FILE/DONE stage + verify +
 // commit the host's folder; the ACK reports the outcome.
+// ---- Save barrier (FORK 2026-11-07; review "flush before every host save") ----
+// A host save taken while a cross-owner move is still in flight (an intent not
+// yet answered, a latch, a deferred diff, a peer intent applied < 3 s ago) can
+// miss that move: on the next load the join's side of it is gone. Delaying the
+// save itself is unsafe - the player often quits right after saving - so the
+// first save stays exactly as it was, and the host saves AGAIN under the same
+// name once the moves have settled (1 s quiet, at most 15 s later), and only
+// while no save transfer is streaming. Manual saves only (autosaves recur
+// anyway). KENSHICOOP_SAVE_BARRIER=0 turns it off.
+std::string   g_barrierName;
+unsigned long g_barrierArmMs = 0, g_barrierQuietMs = 0;
+bool          g_barrierSelf = false;   // the next save edge is our own resave
+unsigned int  g_barrierPending0 = 0;
+
+bool saveBarrierOn() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("KENSHICOOP_SAVE_BARRIER"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v == 1;
+}
+
+void saveBarrierOnEdge(const std::string& name, bool autosave) {
+    if (g_barrierSelf) {               // our own resave came back through the detour
+        g_barrierSelf = false;
+        char b[160]; _snprintf(b, sizeof(b) - 1, "[save] BARRIER resave written name='%s'", name.c_str());
+        b[sizeof(b) - 1] = '\0'; coopLog(b);
+        return;
+    }
+    if (!saveBarrierOn() || autosave || !g_peerPresent || g_bootstrapArmed) return;
+    const unsigned int n = g_repl.xferUnsettled();
+    char b[176]; _snprintf(b, sizeof(b) - 1, "[save] BARRIER check name='%s' unsettled=%u%s",
+                           name.c_str(), n, n ? " -> resave when settled" : "");
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+    if (n == 0) { g_barrierName.clear(); return; }
+    g_barrierName = name;
+    g_barrierArmMs = GetTickCount();
+    g_barrierQuietMs = 0;
+    g_barrierPending0 = n;
+}
+
+void saveBarrierTick() {
+    if (g_barrierName.empty()) return;
+    const unsigned long now = GetTickCount();
+    if (!g_peerPresent) { coopLog("[save] BARRIER dropped (peer left)"); g_barrierName.clear(); return; }
+    const unsigned int n = g_repl.xferUnsettled();
+    if (now - g_barrierArmMs > 15000) {
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[save] BARRIER gave up name='%s' unsettled=%u after 15 s (first save kept)",
+            g_barrierName.c_str(), n);
+        b[sizeof(b) - 1] = '\0'; coopErr(b);
+        g_repl.logXferUnsettled();
+        g_barrierName.clear();
+        return;
+    }
+    if (n != 0) { g_barrierQuietMs = 0; return; }
+    if (g_barrierQuietMs == 0) { g_barrierQuietMs = now; return; }
+    if (now - g_barrierQuietMs < 1000) return;
+    if (coop::savexfer::sending() || coop::savexfer::watching()) return; // never rewrite mid-transfer
+    const std::string name = g_barrierName;
+    g_barrierName.clear();
+    char b[176]; _snprintf(b, sizeof(b) - 1,
+        "[save] BARRIER RESAVE name='%s' (was unsettled=%u, settled after %lu ms)",
+        name.c_str(), g_barrierPending0, now - g_barrierArmMs);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+    g_barrierSelf = true;
+    if (!coop::engine::saveGameAs(name)) {
+        g_barrierSelf = false;
+        coopErr("[save] BARRIER resave FAILED to issue");
+    }
+}
+
 void driveSaveSync() {
     // Local save edges from the detour (max 8 queued per tick).
     coop::engine::SaveEdge edges[8];
@@ -757,6 +827,7 @@ void driveSaveSync() {
             g_savePending = name;
             rosterWrite(name);
             coop::savexfer::armWatch(name);
+            saveBarrierOnEdge(name, edges[i].autosave != 0);
         } else if (edges[i].suppressed && !edges[i].autosave) {
             coop::SaveReqPacket rq;
             memset(&rq, 0, sizeof(rq));
@@ -842,6 +913,7 @@ void driveSaveSync() {
         // Paced chunk pump for an in-flight transfer.
         if (coop::savexfer::sending())
             coop::savexfer::tickSend(g_net, g_net.localId());
+        saveBarrierTick();
 
         // Join commit acknowledgements.
         std::deque<coop::InboundSaveAck> acks;
@@ -2719,6 +2791,32 @@ void titleUpdate_hook(TitleScreen* self) {
     }
 }
 
+// FORK 2026-11-08 (block5g, session 07.11): the game always boots in the HOST role and the
+// MULTIPLAYER panel switches a joiner to JOIN at connect. Every role-dependent switch that was
+// set once at configure time kept the boot role: the join census-authored storage and corpse
+// inventories (storeSync is host-only) - the corpse-stack loss, the 9->18 storage dupe - and
+// lost its combat-hit report, divergence gate and vendor-restock gate. They are re-derived here
+// on every networking start, so the configure-time role no longer matters.
+// KENSHICOOP_ROLE_REAPPLY=0 restores the old behavior.
+static bool g_damageGuardOn = false;
+void applyRoleSettings() {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KENSHICOOP_ROLE_REAPPLY"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (!on) return;
+    const bool host = g_cfg.isHost;
+    g_repl.setStoreSync(g_cfg.storeSync && host);
+    g_repl.setGateAuthority(!host && g_cfg.gateAuthority);
+    if (g_damageGuardOn) g_repl.setReportCombat(!host);
+    if (g_cfg.vendorSync) coop::engine::setVendorRefreshGate(host ? 0 : &vendorRefreshGate);
+    char b[200];
+    _snprintf(b, sizeof(b) - 1,
+              "[role] apply role=%s storeSync=%d gateAuth=%d reportCombat=%d vendorGate=%d machineMirror=%d",
+              host ? "HOST" : "JOIN", (g_cfg.storeSync && host) ? 1 : 0,
+              (!host && g_cfg.gateAuthority) ? 1 : 0, (g_damageGuardOn && !host) ? 1 : 0,
+              (g_cfg.vendorSync && !host) ? 1 : 0, (g_cfg.prodSync && !host) ? 1 : 0);
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
 void startNetworking() {
     // Debug WAN simulation: when configured, hold/drop inbound entity batches so the
     // loopback harness exercises the real-latency path (interp + local enforcement)
@@ -2773,6 +2871,7 @@ void startNetworking() {
     // host already does (see engine::setMachineWorkMirror). Set here, not at
     // configure time, because the in-game panel picks the role at connect.
     coop::engine::setMachineWorkMirror(g_cfg.prodSync && !g_cfg.isHost);
+    applyRoleSettings();
 
     bool ok;
     if (g_cfg.isHost) {
@@ -2799,6 +2898,10 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     g_cfg.isHost    = isHost;
     coop::dev::setRole(isHost);
     coop::logSetTag(isHost ? "HOST" : "JOIN");
+    // FORK 2026-11-07 (review D5): the file keeps its fixed name for the tooling,
+    // so the role is stated in one greppable line.
+    coop::logLine(isHost ? "[log] role=HOST (file name is fixed: KenshiCoop_host.log)"
+                         : "[log] role=JOIN (file name is fixed: KenshiCoop_host.log)");
     g_cfg.transport = useSteam ? "steam" : "udp";
     // Re-read the UDP endpoint (ip/port) from coop_config.json so editing it then
     // hitting Connect works without restarting the game. (It also picks up a
@@ -3108,6 +3211,7 @@ void installEngineDetours() {
     if (g_cfg.damageGuard) {
         if (coop::engine::installDamageGuardHook()) {
             g_repl.setDamageGuard(true);
+            g_damageGuardOn = true;
             // Join-dealt authoritative damage report (protocol 45): only the JOIN
             // reports (the HOST owns + simulates world NPCs, so its own swings land
             // natively). Enabling report mode on the join makes the guard accumulate
@@ -3317,8 +3421,17 @@ void installTitleHook() {
     }
 }
 
+// FORK 2026-11-08 (block5g): KENSHICOOP_TEST_ROLE_SWITCH=1 on a JOIN copy reproduces the real
+// player flow - the game configures as HOST (the default every player boots with) and the
+// session is then started as JOIN through the same coopUiConnect the MULTIPLAYER panel uses.
+static bool g_testRoleSwitch = false;
+
 __declspec(dllexport) void startPlugin() {
     coop::loadConfig(g_cfg);
+    {
+        const char* rs = getenv("KENSHICOOP_TEST_ROLE_SWITCH");
+        if (rs && rs[0] == '1' && !g_cfg.isHost) { g_cfg.isHost = true; g_testRoleSwitch = true; }
+    }
     // The fake clock skew must be armed BEFORE the first log line so every
     // timestamp in this run (and every time-sync packet) shares the skewed clock.
     coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
@@ -3425,7 +3538,10 @@ __declspec(dllexport) void startPlugin() {
             coop::steaminvite::init(&coopUiConnect);
     }
 
-    if (autoStart) {
+    if (autoStart && g_testRoleSwitch) {
+        coopLog("[role] TEST_ROLE_SWITCH: configured as HOST, connecting as JOIN via coopUiConnect");
+        coopUiConnect(false, g_cfg.transport == "steam", 0);
+    } else if (autoStart) {
         startNetworking();
     } else {
         coopLog("KenshiCoop: session DEFERRED - press F2 to host (Steam invite) or join a "

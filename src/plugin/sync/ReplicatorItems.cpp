@@ -58,7 +58,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned long cnow = nowMs();
         if (contCensusMs_ == 0 || (cnow - contCensusMs_) >= 1000) {
             contCensusMs_ = cnow;
-            const unsigned int MAX_CONT = 48;
+            const unsigned int MAX_CONT = 96; // block5g: was 48 (big bases, all-member census)
             static engine::ContRead rows[MAX_CONT]; // main-thread only
             // Protocol 60: with vendor sync the census also takes the SHOP
             // COUNTERS (BF_SHOP furniture of any class) - a shop's stock.
@@ -364,6 +364,27 @@ void Replicator::applyInventories(GameWorld* gw) {
         // any explicitly-registered container OR any squad member we own this tick.
         if (ownedContainers_.count(it->first) != 0) continue;
         if (ownHands_.count(it->first) != 0) continue;
+        // FORK 2026-11-08 (block5g): a census container or corpse is AUTHORED here (the host's
+        // ~1 Hz census). A peer snapshot of it can only come from a peer that wrongly census-
+        // authors too (07.11: the join booted as HOST kept storeSync on) - applying it emptied
+        // the host's Gorillo corpse and doubled a storage. The author's own copy wins; the peer's
+        // moves arrive as transfer intents. KENSHICOOP_CENSUS_GUARD=0 disables.
+        if (storeSync_ && censusContainers_.count(it->first) != 0) {
+            static int guard = -1;
+            if (guard < 0) { const char* e = getenv("KENSHICOOP_CENSUS_GUARD"); guard = (e && e[0] == '0') ? 0 : 1; }
+            if (guard) {
+                static unsigned int skipped = 0;
+                ++skipped;
+                if (skipped <= 5 || (skipped % 100) == 0) {
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[inv] CENSUS-GUARD skip hand=%u,%u,%u,%u,%u from=%u corpse=%d n=%u (we author it)",
+                        it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s,
+                        (unsigned)it->second.ownerId, it->second.corpse ? 1 : 0, skipped);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                continue;
+            }
+        }
         const Key& k = it->first;
         // A mine's container key is the AUTHOR's hand for its own instance of
         // the node's building, which names nothing here - reconciling it
@@ -2207,6 +2228,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         if (appliedXfers_.count(id) != 0) continue; // idempotent (reliable resend / replay)
         appliedXfers_.insert(id);
         if (appliedXfers_.size() > 4096) appliedXfers_.erase(appliedXfers_.begin());
+        lastPeerXferMs_ = now;
         Key sk; sk.t = p.sType; sk.c = p.sContainer; sk.cs = p.sContainerSerial;
         sk.i = p.sIndex; sk.s = p.sSerial;
         Key dk; dk.t = p.dType; dk.c = p.dContainer; dk.cs = p.dContainerSerial;
@@ -2301,10 +2323,12 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         // both copies of the corpse agreed on contents): say WHY nothing moved - source unresolved, item absent
         // from the source, or the destination not resolvable - so the next session names the failing end.
         int diagSrcHas = -1, diagDstHas = -1; // set by the MOVE0 probe below (-1 = not probed)
+        bool diagUnresolved = false;
         if (moved == 0) {
             InvItemEntry dbs[INV_ITEMS_MAX]; InvItemEntry dbd[INV_ITEMS_MAX];
             const bool sRes = engine::resolveObjectByHand(sHand) != 0;
             const bool dRes = engine::resolveObjectByHand(dHand) != 0;
+            diagUnresolved = !sRes || !dRes;
             unsigned int ns = sRes ? engine::captureContainerContents(gw, sHand, dbs, INV_ITEMS_MAX, 0, 0, true) : 0;
             unsigned int nd2 = dRes ? engine::captureContainerContents(gw, dHand, dbd, INV_ITEMS_MAX, 0, 0, true) : 0;
             int srcHas = 0, dstHas = 0;
@@ -2331,6 +2355,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         // the same unit in the same instant (upstream #40) both keep one - a spare item, never a lost one.
         // KENSHICOOP_XFER_LANDED_ACCEPT=0 restores the refusal.
         int noop = 0;
+        bool whyOwnRace = false;
         {
             static int landedOn = -1;
             if (landedOn < 0) { const char* e = getenv("KENSHICOOP_XFER_LANDED_ACCEPT"); landedOn = (e && e[0] == '0') ? 0 : 1; }
@@ -2359,6 +2384,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
                     if (gj != gi->second.end() && gj->second.delta > 0) { ownTakeRecent = true; break; }
                 }
             }
+            whyOwnRace = ownTakeRecent;
             if (landedOn && !ownTakeRecent && moved == 0 && diagSrcHas == 0 && diagDstHas >= (int)p.quantity && dAuth == p.ownerId &&
                 !engine::isContainerItemType(p.itemType)) {
                 noop = (int)p.quantity;
@@ -2460,18 +2486,72 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
         const int ackApplied = applied + noop; // noop: already landed via snapshots, nothing was changed here
         ack.applied     = (u16)((ackApplied < 0) ? 0 : (ackApplied > 65535 ? 65535 : ackApplied));
         ack.requested   = p.quantity;
-        ack.verdict     = (u8)((ackApplied <= 0) ? XFER_ACK_REJECT
+        const u8 base   = (u8)((ackApplied <= 0) ? XFER_ACK_REJECT
                              : (ackApplied >= (int)p.quantity) ? XFER_ACK_ACCEPT
                              : XFER_ACK_PARTIAL);
+        u8 reason = XFER_WHY_NONE;
+        if (base != XFER_ACK_ACCEPT) {
+            if (diagUnresolved)                               reason = XFER_WHY_UNRESOLVED;
+            else if (whyOwnRace)                              reason = XFER_WHY_OWN_RACE;
+            else if (engine::isContainerItemType(p.itemType)) reason = XFER_WHY_CONTAINER;
+            else if (diagSrcHas > 0)                          reason = XFER_WHY_DST_REFUSE;
+            else if (ackApplied > 0)                          reason = XFER_WHY_SRC_SHORT;
+            else                                              reason = XFER_WHY_SRC_EMPTY;
+        }
+        ack.verdict     = (u8)(base | (reason << 2));
         net.queueInvXferAck(ack);
-        char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u sAuth=%d cens=%d own=%d why=%d",
+        char b[260]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u reason=%u sAuth=%d cens=%d own=%d why=%d",
             p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity,
-            moved, fab, (unsigned)ack.verdict, (int)sAuth,
+            moved, fab, (unsigned)base, (unsigned)reason, (int)sAuth,
             (int)(censusContainers_.count(sk) != 0),
             (int)(ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0), fabWhy);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+}
+
+unsigned int Replicator::xferUnsettled() const {
+    unsigned int n = (unsigned int)xferOut_.size() + (unsigned int)xferDefer_.size();
+    for (std::map<Key, std::map<XKey, XferLatch> >::const_iterator i = xferLatch_.begin();
+         i != xferLatch_.end(); ++i) n += (unsigned int)i->second.size();
+    for (std::map<Key, std::map<XKey, XferPend> >::const_iterator i = xferPend_.begin();
+         i != xferPend_.end(); ++i)
+        for (std::map<XKey, XferPend>::const_iterator j = i->second.begin(); j != i->second.end(); ++j)
+            if (j->second.delta != 0) ++n;
+    if (lastPeerXferMs_ != 0 && nowMs() - lastPeerXferMs_ < 3000) ++n;
+    return n;
+}
+
+// FORK 2026-11-08 (block5g): name what keeps the save barrier from settling (07.11: unsettled=3
+// for 15 s, which entries was unknown). One line per entry, at most 12.
+void Replicator::logXferUnsettled() const {
+    unsigned long now = nowMs();
+    unsigned int shown = 0;
+    char b[224];
+    for (std::map<u32, XferOut>::const_iterator i = xferOut_.begin(); i != xferOut_.end() && shown < 12; ++i, ++shown) {
+        _snprintf(b, sizeof(b) - 1, "[save] UNSETTLED out id=%u", i->first);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    for (std::map<Key, unsigned long>::const_iterator i = xferDefer_.begin(); i != xferDefer_.end() && shown < 12; ++i, ++shown) {
+        _snprintf(b, sizeof(b) - 1, "[save] UNSETTLED defer hand=%u,%u,%u,%u,%u age=%lu ms",
+                  i->first.t, i->first.c, i->first.cs, i->first.i, i->first.s, i->second ? now - i->second : 0UL);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    for (std::map<Key, std::map<XKey, XferLatch> >::const_iterator i = xferLatch_.begin(); i != xferLatch_.end() && shown < 12; ++i)
+        for (std::map<XKey, XferLatch>::const_iterator j = i->second.begin(); j != i->second.end() && shown < 12; ++j, ++shown) {
+            _snprintf(b, sizeof(b) - 1, "[save] UNSETTLED latch hand=%u,%u,%u,%u,%u sid='%s'",
+                      i->first.t, i->first.c, i->first.cs, i->first.i, i->first.s, j->first.first.c_str());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    for (std::map<Key, std::map<XKey, XferPend> >::const_iterator i = xferPend_.begin(); i != xferPend_.end() && shown < 12; ++i)
+        for (std::map<XKey, XferPend>::const_iterator j = i->second.begin(); j != i->second.end() && shown < 12; ++j) {
+            if (j->second.delta == 0) continue;
+            ++shown;
+            _snprintf(b, sizeof(b) - 1, "[save] UNSETTLED pend hand=%u,%u,%u,%u,%u sid='%s' delta=%d",
+                      i->first.t, i->first.c, i->first.cs, i->first.i, i->first.s, j->first.first.c_str(), j->second.delta);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    if (lastPeerXferMs_ != 0 && now - lastPeerXferMs_ < 3000) coop::logLine("[save] UNSETTLED recent peer transfer (<3 s)");
 }
 
 void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
@@ -2522,6 +2602,7 @@ void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
         // already holds the real one). The owner said they never left the source,
         // so removing them cannot lose a real item.
         int refused = (int)a.requested - (int)a.applied;
+        int removedOwn = -1; // FORK block5g: what the ROLLBACK actually took out of our own destination
         if (takeSrc && !x.dstPeer && refused > 0) {
             if (refused > x.qty) refused = x.qty;
             unsigned int dh[5] = { x.dst.t, x.dst.c, x.dst.cs, x.dst.i, x.dst.s };
@@ -2531,18 +2612,63 @@ void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
             int removed = engine::removeItemsFromContainerBySid(gw, dh, x.key.first.c_str(),
                                                                 x.key.second, refused);
             xferRebase(gw, x.dst); // our own removal is not a new transfer
+            removedOwn = removed;
             char rb[224]; _snprintf(rb, sizeof(rb) - 1,
                 "[xfer] ROLLBACK id=%u sid='%s' refused=%d removed=%d dst=%u,%u,%u,%u,%u",
                 a.xferId, x.key.first.c_str(), refused, removed,
                 x.dst.t, x.dst.c, x.dst.cs, x.dst.i, x.dst.s);
             rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
         }
-        const char* vn = (a.verdict == XFER_ACK_ACCEPT)  ? "accept"
-                       : (a.verdict == XFER_ACK_PARTIAL) ? "partial" : "reject";
-        char b[224]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] ACK id=%u from=%u verdict=%s applied=%u/%u waitedMs=%lu sid='%s'",
+        // 04.11.2026 (the Kat session, observer CHECK: the mine at 0,2069,11111,650 held 1866 x1 on the host and
+        // none on her screen for 420 checks, i.e. 75 minutes). A peer end is put back by its owner's snapshots,
+        // but a container the owner stopped re-sending (a mine the host had walked away from) never gets one,
+        // so the units her take removed from our copy stayed gone here although the owner kept them. The owner
+        // has just said they never left, so give them back ourselves: the owner's next snapshot then agrees.
+        if (takeSrc && x.srcPeer && a.requested > a.applied) {
+            int back = (int)a.requested - (int)a.applied;
+            if (back > x.qty) back = x.qty;
+            // FORK 2026-11-08 (block5g, PC B review 2.3/2.5). Two invariants, KENSHICOOP_RESTORE_CAP=0 disables:
+            //  (a) the owner said the SOURCE does not hold the units (src-empty / src-short): our copy of the
+            //      source showed a ghost - putting it back re-creates the ghost (Kat: 4 copper re-appeared on
+            //      Стаерфас after each of 6 rejects). The owner's snapshots carry the real source state.
+            //  (b) when the units landed in OUR destination, give back no more than the rollback took out of
+            //      it (22:41:37: removed=4, restored=5 - one unit created from nothing).
+            static int capOn = -1;
+            if (capOn < 0) { const char* e = getenv("KENSHICOOP_RESTORE_CAP"); capOn = (e && e[0] == '0') ? 0 : 1; }
+            if (capOn) {
+                const u8 why = xferVerdictReason(a.verdict);
+                int before = back;
+                if (why == XFER_WHY_SRC_EMPTY || why == XFER_WHY_SRC_SHORT) back = 0;
+                else if (removedOwn >= 0 && back > removedOwn) back = removedOwn;
+                if (back != before) {
+                    char cb[200]; _snprintf(cb, sizeof(cb) - 1,
+                        "[xfer] RESTORE-CAP id=%u sid='%s' back=%d->%d reason=%u removedOwn=%d",
+                        a.xferId, x.key.first.c_str(), before, back, (unsigned)why, removedOwn);
+                    cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+                }
+            }
+            unsigned int sh[5] = { x.src.t, x.src.c, x.src.cs, x.src.i, x.src.s };
+            int added = (back > 0)
+                ? engine::addItemsToContainerBySid(gw, sh, x.key.first.c_str(), x.key.second, back, 0, "", "")
+                : 0;
+            if (isGearType(x.key.second))
+                wdSuppress_[std::make_pair(x.src, x.key.first)] = now + 10000;
+            xferRebase(gw, x.src);
+            char sb[200]; _snprintf(sb, sizeof(sb) - 1,
+                "[xfer] RESTORE-SRC id=%u sid='%s' refused=%d back=%d added=%d src=%u,%u,%u,%u,%u",
+                a.xferId, x.key.first.c_str(), back, back, added, x.src.t, x.src.c, x.src.cs, x.src.i, x.src.s);
+            sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+        }
+        const u8 vb = xferVerdictBase(a.verdict);
+        const char* vn = (vb == XFER_ACK_ACCEPT)  ? "accept"
+                       : (vb == XFER_ACK_PARTIAL) ? "partial" : "reject";
+        static const char* const WHY[] = { "-", "src-empty", "src-short", "dst-refused",
+                                           "unresolved", "own-race", "container" };
+        const u8 vr = xferVerdictReason(a.verdict);
+        char b[256]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] ACK id=%u from=%u verdict=%s applied=%u/%u waitedMs=%lu sid='%s' reason=%s",
             a.xferId, a.ownerId, vn, (unsigned)a.applied, (unsigned)a.requested,
-            now - x.sentMs, x.key.first.c_str());
+            now - x.sentMs, x.key.first.c_str(), vr < 7 ? WHY[vr] : "?");
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         if (x.srcSettled && x.dstSettled) xferOut_.erase(o);
     }

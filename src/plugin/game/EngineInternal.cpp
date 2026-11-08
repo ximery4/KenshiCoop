@@ -809,6 +809,15 @@ static Inventory*     g_pendRemInv   = 0; // last remove's source inventory (mai
 static Item*          g_pendRemItem  = 0; // last item removed onto the cursor
 static unsigned int   g_pendRemOwnerHand[5] = { 0, 0, 0, 0, 0 }; // its owner-char hand
 static bool           g_havePendRemOwner = false;                 // hand above is valid
+// FORK 2026-11-08 (block5g, PC B review 2.4): the cached source lived forever, so a LATER unrelated add
+// (our own reconcile, a ground pickup) was classified with the last window's character (13 stale srcH in
+// one session). It now pairs only with the next add, within 250 ms. KENSHICOOP_STALE_SRC_FIX=0 disables.
+static unsigned long  g_pendRemMs = 0;
+static int staleSrcFix() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("KENSHICOOP_STALE_SRC_FIX"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
 
 // KENSHICOOP_INV_DUMP diagnostic gate (read once). When on, EVERY squad<->squad
 // drag logs a "[xfer] DRAG" line (src/dst owner class + block decision) - the A1
@@ -851,6 +860,7 @@ Item* __fastcall removeDontDestroy_hook(Inventory* self, Item* it, int howmany,
             // pointer alone let cross-squad drags slip through unclassified. The cached
             // hand makes the source reliable regardless of the pointer.
             g_havePendRemOwner = ownerHandOfInventory(self, g_pendRemOwnerHand);
+            g_pendRemMs = GetTickCount();
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { g_havePendRemOwner = false; }
     }
@@ -866,6 +876,9 @@ bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
         bool haveSrc = false, haveDst = false;
         unsigned int dstHand[5] = { 0, 0, 0, 0, 0 };
         unsigned int srcHand[5] = { 0, 0, 0, 0, 0 };
+        if (staleSrcFix() && g_havePendRemOwner && GetTickCount() - g_pendRemMs > 250) {
+            g_havePendRemOwner = false; g_pendRemInv = 0; g_pendRemItem = 0;
+        }
         __try {
             haveDst = ownerHandOfInventory(self, dstHand);
             // Source (in priority): the owner hand cached at the paired remove this

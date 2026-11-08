@@ -315,7 +315,19 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         Key lk; lk.t = e.sType; lk.c = e.sContainer; lk.cs = e.sContainerSerial;
         lk.i = e.sIndex; lk.s = e.sSerial;
         Key wk;
-        if (!buildKeyForLocalHand(lk, wk)) continue;
+        if (!buildKeyForLocalHand(lk, wk)) {
+            // FORK 2026-11-08 (block5g, П.43): a save-resident site our builder works on. Its
+            // hand is save-stable (the peer resolves it directly), but its PROGRESS never
+            // crossed - "built on the host, a site on the join". Track it for publishBuilds.
+            if (bakedSites_.find(lk) == bakedSites_.end() && bakedSites_.size() < 64) {
+                bakedSites_[lk];
+                char tb[176]; _snprintf(tb, sizeof(tb) - 1,
+                    "[build] BAKED-SITE track hand=%u,%u site=%u.%u.%u.%u.%u (save-resident site, progress streams)",
+                    e.hIndex, e.hSerial, lk.t, lk.c, lk.cs, lk.i, lk.s);
+                tb[sizeof(tb) - 1] = '\0'; coop::logLine(tb);
+            }
+            continue;
+        }
         if (wk.t == lk.t && wk.c == lk.c && wk.cs == lk.cs &&
             wk.i == lk.i && wk.s == lk.s)
             continue; // we placed it: local hand already is the wire key

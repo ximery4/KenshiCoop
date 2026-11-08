@@ -1,8 +1,8 @@
 ﻿KenshiCoop v0.58.1 - co-op mod
 ==============================
 
-NOTE: the KenshiCoop.dll in this folder is the fork's block5c build (protocol 165, SHA256 372E88FB54904F0705D575486D013B0C518EFF2949FBFF7F6F349B9704B800AD),
-see docs/FORK_BLOCK5C.md. Both players must use the same build.
+NOTE: the KenshiCoop.dll in this folder is the fork's block5g build (protocol 165, SHA256 1B628199A309DCA97BE9AF83BD1F87C32FF26A1FA94FE45C0B5BCB72EAE2907D),
+see docs/FORK_BLOCK5G.md. All players must use the same build (the host refuses a different one).
 
 This zip contains ONE folder: "KenshiCoop". That folder IS the mod.
 

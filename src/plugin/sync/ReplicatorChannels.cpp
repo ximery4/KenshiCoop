@@ -1626,7 +1626,7 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
 // Seats and beds are save-baked and deliberately outside it - restricting what
 // is ANNOUNCED is what keeps the furniture protocols on their existing path.
 static const float FIXTURE_CENSUS_RADIUS = 100.0f; // matches prod/store census
-static const unsigned int FIXTURE_MAX_ROWS = 48;
+static const unsigned int FIXTURE_MAX_ROWS = 96; // block5g: was 48 (big bases)
 
 void Replicator::publishFixtures(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
@@ -1954,6 +1954,81 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
+
+    // 2b. FORK 2026-11-08 (block5g, П.43): save-resident sites our builders worked on. Same
+    // change gate as section 2; the row is flagged BAKED (bit 0x80 of `complete`) and keyed by the
+    // save-stable hand. KENSHICOOP_BAKED_SITES=0 disables.
+    static int bakedOn = -1;
+    if (bakedOn < 0) { const char* e = getenv("KENSHICOOP_BAKED_SITES"); bakedOn = (e && e[0] == '0') ? 0 : 1; }
+    if (bakedOn) {
+        for (std::map<Key, BakedSite>::iterator it = bakedSites_.begin(); it != bakedSites_.end(); ++it) {
+            BakedSite& bs = it->second;
+            if (bs.done) continue;
+            unsigned int h[5] = { it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s };
+            engine::BuildRead cur;
+            if (!engine::readBuildingByHand(h, &cur)) continue;
+            float dp = cur.progress - bs.lastProg;
+            bool changed = (dp > EPS || dp < -EPS) || (cur.complete != bs.lastComplete);
+            if (!sync::gateShouldSend(changed, now, bs.lastSendMs, 0, RESEND_MS, false)) continue;
+            bs.lastProg = cur.progress; bs.lastComplete = cur.complete; bs.lastSendMs = now;
+            BuildStatePacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type     = (u8)PKT_BUILD_STATE;
+            pkt.ownerId  = ownerId;
+            pkt.seq      = buildSeqOut_++;
+            for (unsigned int q = 0; q < 5; ++q) pkt.key[q] = h[q];
+            pkt.progress = cur.progress;
+            pkt.complete = (u8)((cur.complete ? 1 : 0) | 0x80);
+            net.queueBuildState(pkt);
+            if (cur.complete) bs.done = true;
+            if (changed) {
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                          "[build] STATE-SEND baked key=%u.%u.%u.%u.%u prog=%.3f complete=%u seq=%u",
+                          h[0], h[1], h[2], h[3], h[4], cur.progress, cur.complete ? 1u : 0u, pkt.seq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    // 3. FORK 2026-11-08 (block5g, session 07.11 "build resets"): a building the PEER placed and
+    // OUR character builds progressed only here - the placer kept re-sending its own 0.000 every
+    // 10 s and the progress fell back. When our proxy is ahead of what the placer last told us,
+    // send the progress back under the placer's key; the placer applies it monotonically.
+    // KENSHICOOP_BUILD_BACKFLOW=0 disables.
+    static int backflow = -1;
+    if (backflow < 0) { const char* e = getenv("KENSHICOOP_BUILD_BACKFLOW"); backflow = (e && e[0] == '0') ? 0 : 1; }
+    if (!backflow) return;
+    for (std::map<PeerBuildKey, PeerBuild>::iterator it = peerBuilds_.begin();
+         it != peerBuilds_.end(); ++it) {
+        PeerBuild& pb = it->second;
+        if (!pb.minted || pb.removed || pb.backDone) continue;
+        engine::BuildRead cur;
+        if (!engine::readBuildingByHand(pb.localHand, &cur)) continue;
+        // Only progress the placer has NOT told us about is ours to report (an echo of the
+        // placer's own rows would be pure noise), and at most once per sample.
+        bool ahead = cur.progress > pb.lastRecvProg + EPS && cur.progress > pb.lastBackProg + EPS;
+        bool doneHere = cur.complete && pb.lastRecvComplete == 0;
+        if (!ahead && !doneHere) continue;
+        pb.lastBackProg = cur.progress; pb.lastBackMs = now;
+        BuildStatePacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type     = (u8)PKT_BUILD_STATE;
+        pkt.ownerId  = ownerId;
+        pkt.seq      = buildSeqOut_++;
+        const Key& pk = it->first.second; // the placer's key
+        pkt.key[0] = pk.t; pkt.key[1] = pk.c; pkt.key[2] = pk.cs; pkt.key[3] = pk.i; pkt.key[4] = pk.s;
+        pkt.progress = cur.progress;
+        pkt.complete = (u8)(cur.complete ? 1 : 0);
+        net.queueBuildState(pkt);
+        if (cur.complete) pb.backDone = true;
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] STATE-BACK key=%u.%u.%u.%u.%u prog=%.3f complete=%u seq=%u",
+                  pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
+                  cur.progress, pkt.complete, pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
 }
 
 void Replicator::applyBuilds(const SyncContext& ctx) {
@@ -2031,14 +2106,60 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         const BuildStatePacket& p = it->pkt;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
+        if ((p.complete & 0x80) != 0) {
+            // FORK 2026-11-08 (block5g, П.43): a save-resident site. The hand is save-stable;
+            // never touch a session object that happens to share it. Monotonic like STATE-BACK.
+            if (ownBuilds_.count(k) != 0 || mintByLocal_.count(k) != 0) continue;
+            unsigned int h[5] = { k.t, k.c, k.cs, k.i, k.s };
+            engine::BuildRead own;
+            if (!engine::readBuildingByHand(h, &own)) continue;
+            if (own.complete) continue;
+            bool doneRow = (p.complete & 1) != 0;
+            bool rise = p.progress > own.progress + 0.005f;
+            if (!rise && !doneRow) continue;
+            engine::BuildRead post;
+            bool ok = engine::writeBuildProgressByHand(h, rise ? p.progress : own.progress, doneRow, &post);
+            char bb[208];
+            _snprintf(bb, sizeof(bb) - 1,
+                      "[build] STATE-RECV baked key=%u.%u.%u.%u.%u from=%u prog=%.3f complete=%d ok=%d "
+                      "localProg=%.3f->%.3f localComplete=%d",
+                      h[0], h[1], h[2], h[3], h[4], (unsigned)it->ownerId, p.progress, doneRow ? 1 : 0,
+                      ok ? 1 : 0, own.progress, post.progress, post.complete);
+            bb[sizeof(bb) - 1] = '\0'; coop::logLine(bb);
+            continue;
+        }
         std::map<PeerBuildKey, PeerBuild>::iterator f =
             peerBuilds_.find(PeerBuildKey(it->ownerId, k)); // sender = placer
-        if (f == peerBuilds_.end() || !f->second.minted)
-            continue; // mint refused or key unknown - skip silently
+        if (f == peerBuilds_.end()) {
+            // FORK 2026-11-08 (block5g): a STATE-BACK row - the sender built OUR placement on its
+            // proxy. Apply it monotonically: progress only rises, completion only latches on.
+            std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(k);
+            if (ob == ownBuilds_.end() || ob->second.removed) continue;
+            engine::BuildRead own;
+            if (!engine::readBuildingByHand(ob->second.hand, &own)) continue;
+            if (own.complete) continue;
+            bool rise = p.progress > own.progress + 0.005f;
+            if (!rise && !p.complete) continue;
+            engine::BuildRead post;
+            bool ok = engine::writeBuildProgressByHand(ob->second.hand,
+                                                       rise ? p.progress : own.progress,
+                                                       p.complete != 0, &post);
+            char bb[208];
+            _snprintf(bb, sizeof(bb) - 1,
+                      "[build] STATE-BACK-RECV key=%u.%u.%u.%u.%u from=%u prog=%.3f complete=%u ok=%d "
+                      "localProg=%.3f->%.3f localComplete=%d",
+                      p.key[0], p.key[1], p.key[2], p.key[3], p.key[4], (unsigned)it->ownerId,
+                      p.progress, p.complete, ok ? 1 : 0, own.progress, post.progress, post.complete);
+            bb[sizeof(bb) - 1] = '\0'; coop::logLine(bb);
+            continue;
+        }
+        if (!f->second.minted)
+            continue; // mint refused - skip silently
         PeerBuild& pb = f->second;
         if (pb.removed) continue; // tombstoned (REMOVE already applied)
         if (!sync::gateSeqAccept(pb.seqSeen, p.seq)) continue; // stale/dup row
         pb.seqSeen = p.seq;
+        pb.lastRecvProg = p.progress; pb.lastRecvComplete = p.complete ? 1 : 0;
         engine::BuildRead cur;
         if (engine::readBuildingByHand(pb.localHand, &cur)) {
             float d = cur.progress - p.progress;
@@ -2046,6 +2167,11 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
             if (progClose && cur.complete == (int)p.complete)
                 continue; // already converged (resend)
             if (cur.complete) continue; // completion is latched locally
+            // FORK 2026-11-08 (block5g): never pull our proxy BACK - our builder is ahead of the
+            // placer's row (it is on its way via STATE-BACK). KENSHICOOP_BUILD_BACKFLOW=0 disables.
+            static int mono = -1;
+            if (mono < 0) { const char* e = getenv("KENSHICOOP_BUILD_BACKFLOW"); mono = (e && e[0] == '0') ? 0 : 1; }
+            if (mono && d > 0.005f && !p.complete) continue;
         }
         engine::BuildRead post;
         // The placer's own isComplete drives completion here - see the note on

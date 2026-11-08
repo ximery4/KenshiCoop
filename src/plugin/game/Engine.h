@@ -2213,6 +2213,9 @@ unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
                               unsigned int maxOut);
 // SEH-guarded single-machine read by local hand. Returns false when the hand
 // does not resolve locally or is not a machine-class building.
+// Same census around an arbitrary point (bot_remote): enumMachinesNear is anchored on the interest centers.
+unsigned int enumMachinesAround(GameWorld* gw, float cx, float cy, float cz, float radius,
+                                ProdRead* out, unsigned int maxOut);
 bool readMachineByHand(const unsigned int mHand[5], ProdRead* out);
 // SEH-guarded machine write through the engine's own levers. All fields are
 // optional (sentinel = leave untouched):
@@ -2238,6 +2241,10 @@ bool writeMachineByHand(const unsigned int mHand[5], int wantPower,
 // ordered worker's output rides the same call). Returns false on resolve
 // failure / fault.
 bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amount);
+// FORK 2026-11-07 (bot_remote "work"): order `c` to work the machine/mine at `fixtureHand` the way a player's
+// right-click does. task <= 0 = OPERATE_MACHINERY. 1 ordered, 0 unresolved, -1 not a machine, -2 unfinished,
+// -3 refused, -4 fault. *usedTask = the task id issued.
+int orderWorkByHand(Character* c, const unsigned int fixtureHand[5], int task, int* usedTask);
 // Probe convenience (prod_probe / store_probe): place a COMPLETABLE building
 // template leader-relative (fwd/side) as a construction site + queue the
 // protocol-27 build edge (so the peer mints a proxy when buildSync is on); the

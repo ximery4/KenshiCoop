@@ -381,6 +381,25 @@ static bool addWithRearrange(Inventory* inv, Item* it, int qty) {
     if (!on) return false;
     if (!rearrangeSections(inv)) return false;
     bool ok = inv->tryAddItem(it, qty);
+    // 04.11.2026 (Kat's copy of Starfam took 1 of 5 mine pieces): the author holds 6 in the bag and 4 loose, but our
+    // copy's loose grid had no block for them even after auto-arrange. The bag the character wears has room by
+    // construction (the author put the rest there), so try the worn containers before refusing.
+    if (!ok) {
+        static int bagOn = -1;
+        if (bagOn < 0) { const char* e = getenv("KENSHICOOP_ADD_TO_BAGS"); bagOn = (e && e[0] == '0') ? 0 : 1; }
+        if (bagOn) {
+            InvItemEntry cur[INV_ITEMS_MAX];
+            Item* curItems[INV_ITEMS_MAX];
+            unsigned int n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
+            for (unsigned int i = 0; i < n && !ok; ++i) {
+                if (!curItems[i] || curItems[i] == it) continue;
+                Inventory* sub = 0;
+                __try { sub = curItems[i]->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { sub = 0; }
+                if (!sub || sub == inv) continue;
+                __try { ok = sub->tryAddItem(it, qty); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+            }
+        }
+    }
     ++g_rearrangeAdds;
     if (g_rearrangeAdds <= 20 || (g_rearrangeAdds % 50) == 0) {
         char b[140]; _snprintf(b, sizeof(b) - 1,
@@ -1487,11 +1506,39 @@ int removeItemsFromContainerBySid(GameWorld* gw, const unsigned int cHand[5],
     InvItemEntry cur[INV_ITEMS_MAX];
     Item* curItems[INV_ITEMS_MAX];
     unsigned int n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX);
+    // FORK 2026-11-06 block5e (live session 05.11: the processor held ONE stack of 6 building materials, a peer
+    // intent took 2 [SRC-ONLY], the host's copy then held 0 and the owner's snapshot wiped the other 4 -
+    // 7 of 9 lost on the client's side). removeItemAutoDestroy(it, howmany) frees the whole stack on this build,
+    // not only `howmany` units. Count the (sid,type) total before and after and put back what was destroyed
+    // beyond what was asked for (see "[inv] OVER-REMOVE"). KENSHICOOP_REMOVE_GUARD=0 turns it off.
+    static int guardOn = -1;
+    if (guardOn < 0) { const char* e = getenv("KENSHICOOP_REMOVE_GUARD"); guardOn = (e && e[0] == '0') ? 0 : 1; }
+    int before = 0;
+    for (unsigned int i = 0; i < n; ++i)
+        if (curItems[i] && cur[i].itemType == typeCat && strcmp(cur[i].stringID, sid) == 0) {
+            before += (cur[i].quantity < 1) ? 1 : (int)cur[i].quantity;
+        }
     int removed = removeByKey(inv, curItems, cur, n, sid, typeCat, qty, /*wantEquipped=*/0);
     if (removed < qty) {
         // removeByKey destroyed the stacks it took: re-read before the worn pass.
         n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX);
         removed += removeByKey(inv, curItems, cur, n, sid, typeCat, qty - removed, 1);
+    }
+    if (guardOn && removed > 0 && !isContainerItemType(typeCat)) {
+        InvItemEntry c2[INV_ITEMS_MAX]; Item* c2Items[INV_ITEMS_MAX];
+        unsigned int n2 = readInvItems(inv, c2, c2Items, INV_ITEMS_MAX);
+        int after = 0;
+        for (unsigned int i = 0; i < n2; ++i)
+            if (c2Items[i] && c2[i].itemType == typeCat && strcmp(c2[i].stringID, sid) == 0)
+                after += (c2[i].quantity < 1) ? 1 : (int)c2[i].quantity;
+        int lost = (before - removed) - after;   // units destroyed beyond the request
+        if (lost > 0 && lost <= before) {
+            bool ok = createItemAndAdd(gw, inv, sid, typeCat, lost, 0, /*equip=*/false);
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[inv] OVER-REMOVE sid='%s' asked=%d removed=%d before=%d after=%d restored=%d ok=%d",
+                sid, qty, removed, before, after, lost, ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
     }
     return removed;
 }

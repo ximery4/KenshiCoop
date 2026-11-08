@@ -47,6 +47,14 @@ class Replicator {
 public:
     Replicator();
 
+    // FORK 2026-11-07 (save barrier, review "flush before every host save"): how
+    // many cross-owner moves are still in flight here - unanswered intents,
+    // reconcile latches, unpaired detector pends, deferred local diffs - plus 1
+    // while a peer intent was applied in the last 3 s (the peer may have more
+    // queued). 0 means a save taken now holds every move both sides agreed on.
+    unsigned int xferUnsettled() const;   // ReplicatorItems.cpp
+    void logXferUnsettled() const;        // ReplicatorItems.cpp (block5g barrier diagnostics)
+
     // Stage 1/2 stream only the squad leader; later stages stream the whole squad.
     void setLeaderOnly(bool v) { leaderOnly_ = v; }
 
@@ -1027,6 +1035,8 @@ private:
         bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
         unsigned long koUpSinceMs;    // FORK: first tick the owner stream read upright under a KO latch (0 = not counting)
         unsigned long deathApplyMs;   // FORK: last tick applyRemoteDeath ran on this copy (throttle)
+        unsigned int  deathVetoN;     // local deaths vetoed on this copy (log throttle, 04.11.2026)
+        unsigned int  deathApplyN;    // applies in a row that did not leave the body dead (back-off, 04.11.2026)
         unsigned int  bedExitN;       // FORK 2026-11-03: consecutive bed fast-exits that did not take (see ReplicatorDrive)
         unsigned long bedExitFirstMs; // FORK: start of the current fast-exit streak
         unsigned long bedExitLogMs;   // FORK: last fast-exit log line (throttle)
@@ -1186,7 +1196,7 @@ private:
                    taskTick(0), taskRetries(0), fixtureXlateLogged(false),
                    taskNoneTick(0), taskLapseTick(0), taskLapses(0),
                    detached(false), downApplied(false),
-                   koLatched(false), deathLatched(false), koUpSinceMs(0), deathApplyMs(0), bedExitN(0), bedExitFirstMs(0), bedExitLogMs(0), carriedDown(false),
+                   koLatched(false), deathLatched(false), koUpSinceMs(0), deathApplyMs(0), deathApplyN(0), deathVetoN(0), bedExitN(0), bedExitFirstMs(0), bedExitLogMs(0), carriedDown(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
@@ -2115,6 +2125,7 @@ private:
         bool          dstSettled;
     };
     std::map<u32, XferOut>                    xferOut_;
+    unsigned long                             lastPeerXferMs_; // save barrier: last peer intent applied
     // Undo one intent's contribution to a peer end's reconcile-suppression
     // latch (protocol 50). See the definition for why every verdict does this.
     void releaseXferLatch(const Key& k, const XKey& key, int delta);
@@ -2541,9 +2552,19 @@ private:
         unsigned int localHand[5];
         int minted; u32 seqSeen;
         bool removed; // proxy destroyed on a REMOVE: tombstone (rows skip)
-        PeerBuild() : minted(0), seqSeen(0), removed(false) { memset(localHand, 0, sizeof(localHand)); }
+        // FORK 2026-11-08 (block5g): progress made HERE (our builder on the proxy) flows back to
+        // the placer; lastBackProg/lastBackMs gate that reverse STATE row.
+        float lastBackProg; unsigned long lastBackMs; bool backDone;
+        float lastRecvProg; int lastRecvComplete; // the placer's latest row
+        PeerBuild() : minted(0), seqSeen(0), removed(false), lastBackProg(-1.0f), lastBackMs(0), backDone(false),
+                      lastRecvProg(0.0f), lastRecvComplete(0) { memset(localHand, 0, sizeof(localHand)); }
     };
     std::map<Key, OwnBuild>  ownBuilds_;
+    // FORK 2026-11-08 (block5g, П.43): save-resident construction sites our builders work on.
+    // Their STATE rows carry BUILD_STATE_BAKED in `complete` and the save-stable hand as key.
+    struct BakedSite { float lastProg; int lastComplete; unsigned long lastSendMs; bool done;
+                       BakedSite() : lastProg(-1.0f), lastComplete(-1), lastSendMs(0), done(false) {} };
+    std::map<Key, BakedSite> bakedSites_;
     // Keyed (placer id, placer key): runtime hands are allocated per client, so
     // two joins' placements can carry the same 5-tuple. Rows whose wire packet
     // names no placer (prod, inventory, build doors, poses) resolve through

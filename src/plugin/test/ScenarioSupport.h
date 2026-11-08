@@ -82,6 +82,7 @@ Scenario* makeProbeScenario(const std::string& name);     // ScenarioProbes.cpp
 Scenario* makeBuildingScenario(const std::string& name);  // ScenarioBuildings.cpp
 Scenario* makeSessionScenario(const std::string& name);   // ScenarioSession.cpp
 Scenario* makeBotScenario(const std::string& name);       // ScenarioBot.cpp (FORK: bot_remote)
+Scenario* makeFuncScenario(const std::string& name);      // ScenarioFunc.cpp (narrow tests of single functions)
 
 } // namespace coop
 

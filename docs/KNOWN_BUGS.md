@@ -74,3 +74,10 @@ loss.
 See `FORK_BLOCK5C.md`: what worked in a 76-minute two-PC Steam session and what did not (building copies without an owner
 faction, a refused transfer not returning the units to the source copy, copies refusing items that the author holds in a bag,
 enemy copies killed and revived by the local fight, frozen knock-out timer on copies, buildings from a save not synchronised).
+
+## Fork block 5g (2026-11-08)
+
+See `FORK_BLOCK5G.md`: the joining player's game kept host-only settings after the role switch at connect (container census,
+combat reports, trader restock gate), which caused doubled storage counts and lost corpse stacks; fixed together with storage
+furniture sync, census around all characters and construction progress backflow. Open: worker copies lagging 1-2 units, the
+"follow" order panel, ranged copies running into melee, dismantling buildings from a save.

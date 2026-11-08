@@ -1886,6 +1886,14 @@ void Replicator::censusFreezeDivergedAi(Character* c, const Key& k, float drift)
     const unsigned long HOLD_MS = 20000;
     unsigned long now = nowMs();
     bool over = (drift > censusParkDist_); // censusParkDist_ > 0 implied (drift >= 0)
+    // Test lever for the two-mode copy (docs/HYBRID_ZONES_20261104.md, check 2): the AI of every copy stays off, not
+    // only the AI of a copy that has already drifted.
+    static int puppetAll = -1;
+    if (puppetAll < 0) {
+        const char* e = getenv("KENSHICOOP_PUPPET_ALL");
+        puppetAll = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (puppetAll == 1) over = true;
     std::map<Key, unsigned long>::iterator it = censusFrozen_.find(k);
     bool wasFrozen = (it != censusFrozen_.end());
     // A body whose park is FUTILE (3 parks in a row left it where it stood, see parkDivergedCopy) can

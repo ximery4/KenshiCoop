@@ -49,6 +49,167 @@ void netErr(const char* msg) {
     coop::logErrLine(buf);
 }
 
+// ---- Build fingerprint (FORK 2026-11-07, review D3/K2) ----------------------
+// Eight different builds all reported "v0.58.1 / proto v165", so the handshake
+// could not tell block5c from block5e, and nothing compared the host's mod list
+// with the join's. The HELLO (join -> host) and WELCOME (host -> join) now carry
+// a tail after their fixed struct (old builds ignore trailing bytes):
+//   0xB1, u16 len, "dll=<fnv32 of KenshiCoop.dll> mods=<fnv32> n=<count>|m1|m2|..."
+// The host REJECTS a join whose DLL hash differs or that sends no tail (an older
+// build with the same protocol number). A different mod list is NOT rejected (an
+// optional kit mod must not block a session) but both lists' differences are
+// logged as "[build] MODS DIFF". KENSHICOOP_BUILD_CHECK=0 logs without rejecting.
+const unsigned char FP_MARK = 0xB1;
+
+unsigned int fnv32(const unsigned char* p, size_t n, unsigned int h = 2166136261u) {
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+struct BuildFp {
+    unsigned int dll, mods, n;
+    std::string list;   // "|m1|m2|..." in load order, lower-case
+    bool ok;
+    BuildFp() : dll(0), mods(0), n(0), ok(false) {}
+};
+
+const BuildFp& localFp() {
+    static BuildFp fp;
+    if (fp.ok) return fp;
+    fp.ok = true;
+    HMODULE self = 0;
+    char path[MAX_PATH] = { 0 };
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&fnv32, &self) &&
+        GetModuleFileNameA(self, path, MAX_PATH)) {
+        FILE* f = std::fopen(path, "rb");
+        if (f) {
+            unsigned char buf[65536];
+            unsigned int h = 2166136261u;
+            size_t r;
+            while ((r = std::fread(buf, 1, sizeof(buf), f)) > 0) h = fnv32(buf, r, h);
+            std::fclose(f);
+            fp.dll = h;
+        }
+    }
+    FILE* m = std::fopen("data\\mods.cfg", "rb");
+    if (m) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), m)) {
+            size_t L = std::strlen(line);
+            while (L > 0 && (line[L - 1] == '\n' || line[L - 1] == '\r' || line[L - 1] == ' ')) line[--L] = '\0';
+            size_t s0 = 0;
+            if (L >= 3 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB &&
+                (unsigned char)line[2] == 0xBF) s0 = 3; // UTF-8 BOM
+            if (L <= s0) continue;
+            std::string nm(line + s0);
+            for (size_t k = 0; k < nm.size(); ++k)
+                if (nm[k] >= 'A' && nm[k] <= 'Z') nm[k] = (char)(nm[k] - 'A' + 'a');
+            fp.list += "|"; fp.list += nm;
+            ++fp.n;
+        }
+        std::fclose(m);
+        fp.mods = fnv32((const unsigned char*)fp.list.data(), fp.list.size());
+    }
+    char b[160];
+    _snprintf(b, sizeof(b) - 1, "[build] local dll=%08X mods=%08X n=%u (data\\mods.cfg%s)",
+              fp.dll, fp.mods, fp.n, m ? "" : " NOT FOUND");
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+    return fp;
+}
+
+// Tail bytes to append after the fixed HELLO/WELCOME struct.
+std::string fpTail() {
+    const BuildFp& fp = localFp();
+    char head[64];
+    _snprintf(head, sizeof(head) - 1, "dll=%08X mods=%08X n=%u", fp.dll, fp.mods, fp.n);
+    head[sizeof(head) - 1] = '\0';
+    std::string body(head);
+    body += fp.list;
+    if (body.size() > 1800) body.resize(1800);
+    std::string t;
+    t += (char)FP_MARK;
+    t += (char)(body.size() & 0xFF);
+    t += (char)((body.size() >> 8) & 0xFF);
+    t += body;
+    return t;
+}
+
+// Parse a peer tail starting at p (n bytes). Returns false when absent/malformed.
+bool parseFp(const unsigned char* p, size_t n, BuildFp* out) {
+    if (n < 3 || p[0] != FP_MARK) return false;
+    size_t L = (size_t)p[1] | ((size_t)p[2] << 8);
+    if (n < 3 + L) return false;
+    std::string body((const char*)p + 3, L);
+    unsigned int d = 0, mo = 0, c = 0;
+    if (std::sscanf(body.c_str(), "dll=%8X mods=%8X n=%u", &d, &mo, &c) != 3) return false;
+    out->dll = d; out->mods = mo; out->n = c; out->ok = true;
+    size_t bar = body.find('|');
+    out->list = (bar == std::string::npos) ? std::string() : body.substr(bar);
+    return true;
+}
+
+// "only-ours=a,b only-peer=c" on the two mod lists.
+std::string modsDiff(const std::string& ours, const std::string& peer) {
+    std::string onlyO, onlyP;
+    size_t i = 0;
+    while (i < ours.size()) {
+        size_t j = ours.find('|', i + 1);
+        std::string m = ours.substr(i, (j == std::string::npos ? ours.size() : j) - i) + "|";
+        if ((peer + "|").find(m) == std::string::npos) { onlyO += m.substr(1, m.size() - 2); onlyO += ","; }
+        if (j == std::string::npos) break;
+        i = j;
+    }
+    i = 0;
+    while (i < peer.size()) {
+        size_t j = peer.find('|', i + 1);
+        std::string m = peer.substr(i, (j == std::string::npos ? peer.size() : j) - i) + "|";
+        if ((ours + "|").find(m) == std::string::npos) { onlyP += m.substr(1, m.size() - 2); onlyP += ","; }
+        if (j == std::string::npos) break;
+        i = j;
+    }
+    if (onlyO.empty() && onlyP.empty()) return "same set, different order";
+    return "only-ours=" + onlyO + " only-peer=" + onlyP;
+}
+
+bool buildCheckOn() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("KENSHICOOP_BUILD_CHECK"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v == 1;
+}
+
+// Log the comparison; returns true when the peer must be refused (DLL mismatch / no tail).
+bool fpCompare(const char* who, const unsigned char* tail, size_t n, bool quiet = false) {
+    const BuildFp& me = localFp();
+    BuildFp peer;
+    bool have = parseFp(tail, n, &peer);
+    char b[400];
+    if (quiet) return have ? (peer.dll != me.dll && buildCheckOn()) : buildCheckOn();
+    if (!have) {
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] %s sent NO build fingerprint (an older KenshiCoop build with the same "
+                  "protocol number); ours dll=%08X%s", who, me.dll,
+                  buildCheckOn() ? " - rejecting" : " (KENSHICOOP_BUILD_CHECK=0: allowed)");
+        b[sizeof(b) - 1] = '\0'; coop::logErrLine(b);
+        return buildCheckOn();
+    }
+    bool dllBad = peer.dll != me.dll;
+    _snprintf(b, sizeof(b) - 1, "[build] %s dll=%08X mods=%08X n=%u | ours dll=%08X mods=%08X n=%u -> dll %s, mods %s",
+              who, peer.dll, peer.mods, peer.n, me.dll, me.mods, me.n,
+              dllBad ? "MISMATCH" : "same", peer.mods == me.mods ? "same" : "DIFFER");
+    b[sizeof(b) - 1] = '\0';
+    if (dllBad || peer.mods != me.mods) coop::logErrLine(b); else coop::logLine(b);
+    if (peer.mods != me.mods && peer.n > 0 && me.n > 0) {
+        std::string d = modsDiff(me.list, peer.list);
+        std::string line = std::string("[build] MODS DIFF ") + d;
+        if (line.size() > 900) line.resize(900);
+        coop::logErrLine(line.c_str());
+    }
+    return dllBad && buildCheckOn();
+}
+
 // Monotonic ms clock for the batch send stamp (v35). QPC, not GetTickCount:
 // the receiver reconstructs snapshot SPACING from consecutive stamps, and
 // GetTickCount's ~15 ms granularity would re-introduce the very quantization
@@ -707,12 +868,14 @@ void NetLink::threadLoop() {
                         // Introduce ourselves: protocol version + identity token.
                         unsigned nameLen = (unsigned)identity_.size();
                         if (nameLen > 63) nameLen = 63;
-                        ENetPacket* out = enet_packet_create(0, sizeof(HelloPacket) + nameLen,
+                        const std::string tail = fpTail();
+                        ENetPacket* out = enet_packet_create(0, sizeof(HelloPacket) + nameLen + tail.size(),
                                                              ENET_PACKET_FLAG_RELIABLE);
                         HelloPacket h;
                         h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION; h.nameLen = (u8)nameLen;
                         std::memcpy(out->data, &h, sizeof(h));
                         if (nameLen > 0) std::memcpy(out->data + sizeof(h), identity_.data(), nameLen);
+                        std::memcpy(out->data + sizeof(h) + nameLen, tail.data(), tail.size());
                         recordSend(out, 0, CH_RELIABLE);
                         enet_peer_send(ev.peer, CH_RELIABLE, out);
                         netLog("connected to host; sent HELLO");
@@ -744,7 +907,26 @@ void NetLink::threadLoop() {
                             if (h.nameLen > 0 && len >= sizeof(h) + h.nameLen)
                                 ident.assign((const char*)ev.packet->data + sizeof(h), h.nameLen);
                             u32 id = 0;
-                            if (h.version != PROTOCOL_VERSION) {
+                            const size_t tailAt = sizeof(h) + h.nameLen;
+                            // A refused join reconnects every ~2 s: log the first 3 refusals, then every 30th.
+                            static unsigned long fpRejects = 0;
+                            const bool fpQuiet = fpRejects >= 3 && (fpRejects % 30) != 0;
+                            const bool fpBad = h.version == PROTOCOL_VERSION &&
+                                fpCompare("join", ev.packet->data + (tailAt < len ? tailAt : len),
+                                          tailAt < len ? len - tailAt : 0, fpQuiet);
+                            if (fpBad) {
+                                ++fpRejects;
+                                if (!fpQuiet) {
+                                    char rb[200];
+                                    _snprintf(rb, sizeof(rb) - 1,
+                                              "build mismatch: the join runs a different KenshiCoop.dll; rejecting "
+                                              "(refusal #%lu; see [build] lines; KENSHICOOP_BUILD_CHECK=0 to allow)",
+                                              fpRejects);
+                                    rb[sizeof(rb) - 1] = '\0';
+                                    netErr(rb);
+                                }
+                                enet_peer_disconnect(ev.peer, 0);
+                            } else if (h.version != PROTOCOL_VERSION) {
                                 char b[128];
                                 _snprintf(b, sizeof(b) - 1,
                                           "protocol mismatch: peer v%u, ours v%u; rejecting",
@@ -770,8 +952,11 @@ void NetLink::threadLoop() {
                                 ev.peer->data = (void*)(size_t)id;
                                 WelcomePacket w;
                                 w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
+                                const std::string wt = fpTail();
                                 ENetPacket* out =
-                                    enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
+                                    enet_packet_create(0, sizeof(w) + wt.size(), ENET_PACKET_FLAG_RELIABLE);
+                                std::memcpy(out->data, &w, sizeof(w));
+                                std::memcpy(out->data + sizeof(w), wt.data(), wt.size());
                                 recordSend(out, id, CH_RELIABLE);
                                 enet_peer_send(ev.peer, CH_RELIABLE, out);
                                 // Roster: the other joins learn the newcomer, and the
@@ -804,6 +989,11 @@ void NetLink::threadLoop() {
                                 b[sizeof(b) - 1] = '\0';
                                 netErr(b);
                             } else {
+                                const unsigned wl = (unsigned)ev.packet->dataLength;
+                                // Log-only on the join: the host already refused a bad DLL;
+                                // a WELCOME without a tail means the HOST runs an older build.
+                                fpCompare("host", ev.packet->data + sizeof(w),
+                                          wl > sizeof(w) ? wl - sizeof(w) : 0);
                                 InterlockedExchange(&myId_, (LONG)w.playerId);
                                 char b[96];
                                 _snprintf(b, sizeof(b) - 1,

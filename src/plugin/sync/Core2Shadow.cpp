@@ -87,13 +87,14 @@ struct State {
     unsigned long nextScanMs, nextHashMs, nextPathMs, nextCheckMs, nextHelloMs;
     unsigned long scans, moves, created, destroyed, qtyChanges, cellChanges, logged, pairedCopies;
     unsigned long intervalMs;
+    unsigned long collisionsLogged;
     bool started;
     Link link;
     core2::HostSession* host;
     core2::ClientSession* client;
     State() : nextScanMs(0), nextHashMs(0), nextPathMs(0), nextCheckMs(0), nextHelloMs(0), scans(0), moves(0),
               created(0), destroyed(0), qtyChanges(0), cellChanges(0), logged(0), pairedCopies(0), intervalMs(2000),
-              started(false), host(0), client(0) {}
+              collisionsLogged(0), started(false), host(0), client(0) {}
 };
 
 State* g_s = 0;
@@ -252,13 +253,31 @@ void scanAll(State& s, GameWorld* gw, unsigned long nowMs) {
     const unsigned int np = engine::listPlayerChars(gw, g_chars, MAX_CHARS);
     bool trunc = false;
     const unsigned int nn = engine::listNpcsWide(gw, BUILD_RADIUS, g_chars + np, g_states, MAX_CHARS - np, &trunc);
+    // FORK 2026-11-07 (review D1): the serial alone is not unique - a nomad
+    // (hand 1,576171904) and a pet goat (hand 9,576171904) shared "c.576171904",
+    // so two inventories merged into one book container. The plain serial key
+    // stays (a squad move changes the index, not the serial), but a second
+    // object hitting an already-used key this scan gets ".<index>" appended.
+    // Player characters are listed first, so they always keep the plain key.
+    std::map<std::string, void*> usedKey;
     for (unsigned int i = 0; i < np + nn; ++i) {
         RootObject* ro = reinterpret_cast<RootObject*>(g_chars[i]);
         if (!ro || !engine::readObjectHand(ro, hd)) continue;
-        // Keyed by serial: a squad move changes the index and keeps the serial.
         char key[48];
         _snprintf(key, sizeof(key) - 1, "c.%u", hd[4]);
         key[sizeof(key) - 1] = '\0';
+        std::map<std::string, void*>::iterator uk = usedKey.find(key);
+        if (uk != usedKey.end() && uk->second != (void*)ro) {
+            _snprintf(key, sizeof(key) - 1, "c.%u.%u", hd[4], hd[3]);
+            key[sizeof(key) - 1] = '\0';
+            // block5g (PC B review 2.8): the same key was logged 20 times every 2 s; once per key now.
+            static std::set<std::string> collidedKeys;
+            if (s.collisionsLogged < 20 && collidedKeys.insert(key).second) {
+                ++s.collisionsLogged;
+                logf("[c2] KEY-COLLISION key=%s serial=%u index=%u type=%u", key, hd[4], hd[3], hd[0]);
+            }
+        }
+        usedKey[key] = (void*)ro;
         scanObject(s, ro, key, hashNow, alive, fresh);
         ++objects;
     }
@@ -291,11 +310,29 @@ void scanAll(State& s, GameWorld* gw, unsigned long nowMs) {
     s.started = true;
 }
 
+// 04.11.2026: the two machines place the same things into stacks differently (1+3 here, 4 there), which the
+// per-stack comparison counted as a content difference: 342 of 1181 "content" lines in the Kat session were only that.
+// Totals per template tell the two apart.
+static bool sameTotals(const std::multiset<std::string>& a, const std::multiset<std::string>& b) {
+    std::map<std::string, long> sum;
+    for (std::multiset<std::string>::const_iterator i = a.begin(); i != a.end(); ++i) {
+        const size_t c = i->rfind(':');
+        sum[i->substr(0, c)] += (c == std::string::npos) ? 1 : atol(i->c_str() + c + 1);
+    }
+    for (std::multiset<std::string>::const_iterator i = b.begin(); i != b.end(); ++i) {
+        const size_t c = i->rfind(':');
+        sum[i->substr(0, c)] -= (c == std::string::npos) ? 1 : atol(i->c_str() + c + 1);
+    }
+    for (std::map<std::string, long>::const_iterator i = sum.begin(); i != sum.end(); ++i)
+        if (i->second != 0) return false;
+    return true;
+}
+
 // Join: is the host's book, as received, the same as what this game shows?
 void checkAgainstHost(State& s, unsigned long nowMs) {
     if (nowMs < s.nextCheckMs) return;
     s.nextCheckMs = nowMs + CHECK_MS;
-    unsigned int same = 0, differ = 0, unknownHere = 0, shown = 0, layoutOnly = 0;
+    unsigned int same = 0, differ = 0, unknownHere = 0, shown = 0, layoutOnly = 0, stacksOnly = 0;
     const std::map<ContainerId, core2::ContainerMeta>& metas = s.client->metas();
     std::map<std::string, ContainerId> byLabel;
     for (std::map<ContainerId, core2::ContainerMeta>::const_iterator m = metas.begin(); m != metas.end(); ++m)
@@ -319,7 +356,9 @@ void checkAgainstHost(State& s, unsigned long nowMs) {
                 there.insert(one);
             }
             const bool sameThings = here == there;
+            const bool sameTotal = !sameThings && sameTotals(here, there);
             if (sameThings) ++layoutOnly;
+            else if (sameTotal) ++stacksOnly;
             if (shown < 8) {
                 ++shown;
                 std::string onlyHere, onlyHost;
@@ -333,7 +372,7 @@ void checkAgainstHost(State& s, unsigned long nowMs) {
                     if (onlyHost.size() < 160) { onlyHost += *h; onlyHost += ' '; }
                 char line[520];
                 _snprintf(line, sizeof(line) - 1, "[c2net] DIFF key=%s kind=%s n=%u/%u onlyHere=[%s] onlyHost=[%s]",
-                    c->first.c_str(), sameThings ? "layout" : "content", (unsigned)here.size(), (unsigned)there.size(), onlyHere.c_str(), onlyHost.c_str());
+                    c->first.c_str(), sameThings ? "layout" : (sameTotal ? "stacks" : "content"), (unsigned)here.size(), (unsigned)there.size(), onlyHere.c_str(), onlyHost.c_str());
                 line[sizeof(line) - 1] = '\0';
                 coop::logLine(line);
             }
@@ -342,9 +381,9 @@ void checkAgainstHost(State& s, unsigned long nowMs) {
     char line[260];
     const core2::SessionStats& st = s.client->stats();
     _snprintf(line, sizeof(line) - 1,
-        "[c2net] CHECK same=%u differ=%u layoutOnly=%u notInBook=%u ready=%d viewItems=%u gaps=%llu snapshots=%llu hashFix=%llu pending=%u",
+        "[c2net] CHECK same=%u differ=%u layoutOnly=%u notInBook=%u ready=%d viewItems=%u gaps=%llu snapshots=%llu hashFix=%llu pending=%u stacksOnly=%u",
         same, differ, layoutOnly, unknownHere, s.client->ready() ? 1 : 0, (unsigned)s.client->view().itemCount(),
-        st.gaps, st.snapshots, st.hashMismatch, (unsigned)s.client->pending());
+        st.gaps, st.snapshots, st.hashMismatch, (unsigned)s.client->pending(), stacksOnly);
     line[sizeof(line) - 1] = '\0';
     coop::logLine(line);
 }

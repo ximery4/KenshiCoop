@@ -14,7 +14,7 @@ one shared money pool, game speed, and more - and saves are coordinated: any sav
 either player makes becomes one shared save, streamed to both machines
 automatically.
 
-> **Fork branch `fork-block4`:** inventory/loot, death, trader and squad-move fixes on top of v0.58.1 - see [docs/FORK_BLOCK4.md](docs/FORK_BLOCK4.md) for what is and is not verified.
+> **Fork branch `fork-block5g`:** host-arbitrated item transfers, census, building and production fixes on top of v0.58.1 - see [docs/FORK_BLOCK5G.md](docs/FORK_BLOCK5G.md) (latest) and [docs/FORK_BLOCK4.md](docs/FORK_BLOCK4.md) for what is and is not verified. All players must use the same DLL.
 >
 > **Status: work in progress.** This is a hobby project under active
 > development. Expect rough edges, desyncs, and crashes. Sessions support up

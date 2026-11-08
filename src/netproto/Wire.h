@@ -849,6 +849,20 @@ enum XferAckVerdict {
     XFER_ACK_ACCEPT  = 1,
     XFER_ACK_PARTIAL = 2
 };
+// FORK 2026-11-07 (review D7): a short answer carries WHY in the verdict byte's
+// upper bits (verdict = base | reason << 2); the base is (verdict & 3). Packet
+// size unchanged. Same-build peers only (the HELLO build check enforces that).
+enum XferAckReason {
+    XFER_WHY_NONE       = 0,  // accepted in full
+    XFER_WHY_SRC_EMPTY  = 1,  // our copy of the source holds none of it
+    XFER_WHY_SRC_SHORT  = 2,  // our copy of the source holds fewer than asked
+    XFER_WHY_DST_REFUSE = 3,  // the source holds it, the destination refused the add
+    XFER_WHY_UNRESOLVED = 4,  // source or destination not resolvable here
+    XFER_WHY_OWN_RACE   = 5,  // our own player took the same unit (upstream #40)
+    XFER_WHY_CONTAINER  = 6   // a bag/backpack never fabricates
+};
+inline u8 xferVerdictBase(u8 v)   { return (u8)(v & 3); }
+inline u8 xferVerdictReason(u8 v) { return (u8)(v >> 2); }
 
 // ---- Protocol 60: shared vendor stock ---------------------------------------
 // A shop's goods live in its counters (BF_SHOP furniture owned by the trader's
